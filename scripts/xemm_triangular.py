@@ -10,7 +10,6 @@ from hummingbot.connector.exchange.synthetic_triangular.synthetic_triangular_con
 )
 from hummingbot.core.data_type.common import OrderType
 from hummingbot.core.event.events import OrderFilledEvent
-from hummingbot.strategy_v2.executors.data_types import ConnectorPair
 import scripts.simple_xemm as _simple_xemm
 
 
@@ -102,13 +101,6 @@ class XEMMTriangular(_simple_xemm.SimpleXEMM):
             )
 
         super().__init__(connectors, config)
-
-        # Add rate sources for the real underlying pairs
-        self.market_data_provider.initialize_rate_sources([
-            ConnectorPair(connector_name=config.leg_connector, trading_pair=config.leg1_pair),
-            ConnectorPair(connector_name=config.leg_connector, trading_pair=config.leg2_pair),
-        ])
-
         self._rebalance_counter = 0
 
     def place_buy_order(self, exchange, trading_pair, amount, order_type=OrderType.LIMIT):
