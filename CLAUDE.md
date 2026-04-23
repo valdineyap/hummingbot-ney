@@ -114,8 +114,8 @@ did_fill_order(event)
 
 1. **Branch de trabalho**: `claude/customize-trading-strategies-furbW`
 2. **Não modificar** os executors em `hummingbot/strategy_v2/executors/` — são código upstream
-3. **Scripts customizados** ficam em `scripts/` com prefixo `ney_` quando forem versões próprias (ex: `scripts/ney_xemm.py`)
-4. **Controllers customizados** ficam em `controllers/generic/` com prefixo `ney_`
+3. **Scripts customizados** ficam em `scripts/` com nome descritivo sem prefixo (ex: `scripts/xemm_triangular.py`)
+4. **Controllers customizados** ficam em `controllers/generic/` com nome descritivo sem prefixo
 5. Configurações de instância ficam em `conf/scripts/` (ignoradas no git se contiverem API keys)
 6. **Objetivo de cada mudança**: documentar no commit se aumenta fill rate, reduz latência, ou melhora gestão de inventário
 7. Parâmetros de produção para BTC-BRL:
