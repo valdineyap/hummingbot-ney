@@ -169,8 +169,25 @@ class SyntheticTriangularConnector(ExchangeBase):
                 amount: Decimal,
                 price: Decimal = s_decimal_NaN,
                 is_maker: Optional[bool] = None) -> AddedToCostTradeFee:
-        return self._conn.get_fee(base_currency, quote_currency, order_type, order_side,
-                                  amount, price, is_maker)
+        # leg1 (BTC-USDT): maker fee if LIMIT, taker fee if MARKET
+        leg1_base, leg1_quote = self._leg1.split("-")
+        leg1_is_maker = order_type in (OrderType.LIMIT, OrderType.LIMIT_MAKER)
+        leg1_order_type = OrderType.LIMIT if leg1_is_maker else OrderType.MARKET
+        fee1 = self._conn.get_fee(leg1_base, leg1_quote, leg1_order_type, order_side,
+                                  amount, price, leg1_is_maker)
+
+        # leg2 (USDT-BRL): always fires as MARKET taker regardless of synthetic order_type
+        leg2_base, leg2_quote = self._leg2.split("-")
+        fee2 = self._conn.get_fee(leg2_base, leg2_quote, OrderType.MARKET, order_side,
+                                  amount, price, False)
+
+        # Both legs are on the same exchange so percent_token (e.g. BNB) is identical.
+        # Additive approximation is exact to within (fee1 × fee2) ≈ 0.00001% for 0.1% rates.
+        return AddedToCostTradeFee(
+            percent=fee1.percent + fee2.percent,
+            percent_token=fee1.percent_token,
+            flat_fees=[],
+        )
 
     # ------------------------------------------------------------------
     # Connectivity — delegates to real connector
