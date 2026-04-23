@@ -16,28 +16,23 @@ class SyntheticTriangularConnector(ExchangeBase):
     """
     Virtual connector that composes two real pairs on the same exchange into a synthetic pair.
 
-    Example: BTC-USDT × USDT-BRL → synthetic BTC-BRL on Bybit.
+    Example: BTC-USDT × USDT-BRL → synthetic BTC-BRL on Binance.
 
     Designed to be injected into the strategy's connectors dict so that SimpleXEMM (and any
-    StrategyV2Base script) can treat a triangulated taker as if it were a direct-pair connector.
+    StrategyV2Base script) can treat a triangulated maker as if it were a direct-pair connector.
 
-    Dispatch chain for order placement:
-        strategy.buy("bybit_synthetic", "BTC-BRL", amount, ...)
-          → c_buy_with_specific_market                 (strategy_base.pyx)
-            → market.c_buy(...)                        (Cython vtable dispatch)
-              → ExchangeBase.c_buy → self.buy(...)     (Python MRO override below)
-                → _conn.buy(leg2, MARKET)              (buy USDT first)
-                → _conn.buy(leg1, MARKET)              (buy BTC with USDT)
+    Order type dispatch:
+        LIMIT / LIMIT_MAKER → _place_maker_limit()
+            Places leg1 (BTC-USDT) as a real LIMIT order and returns the real order ID.
+            leg2 (USDT-BRL) fires as MARKET only after leg1 fills, via complete_maker_fill().
 
-    USDT neutrality:
-        - buy:  leg2 (USDT-BRL) fires before leg1 (BTC-USDT) so USDT is available.
-        - sell: leg1 (BTC-USDT) fires first to receive USDT, then leg2 (USDT-BRL) sells it.
-        - Residual drift is corrected by the rebalancer in xemm_triangular.py.
+        MARKET → _place_taker_market()
+            Fires both legs as MARKET immediately (simple, fire-and-forget).
     """
 
     def __init__(self, real_connector, leg1_pair: str, leg2_pair: str) -> None:
         """
-        :param real_connector: Live ConnectorBase for the taker exchange (e.g. Bybit).
+        :param real_connector: Live ConnectorBase for the exchange (e.g. Binance).
         :param leg1_pair:      Base-to-intermediate pair (e.g. "BTC-USDT").
         :param leg2_pair:      Intermediate-to-quote pair (e.g. "USDT-BRL").
         """
@@ -56,22 +51,10 @@ class SyntheticTriangularConnector(ExchangeBase):
             order_type: OrderType = OrderType.MARKET,
             price: Decimal = s_decimal_NaN,
             **kwargs) -> str:
-        """
-        BUY synthetic (want BTC, pay BRL):
-          leg2: buy USDT-BRL first  → spend BRL, receive USDT
-          leg1: buy BTC-USDT second → spend USDT, receive BTC
-        """
-        amount = Decimal(str(amount))
-        leg1_result = self._conn.get_price_for_volume(self._leg1, True, float(amount))
-        p1 = Decimal(str(leg1_result.result_price))
-        usdt_needed = amount * p1
-
-        leg2_result = self._conn.get_price_for_volume(self._leg2, True, float(usdt_needed))
-        p2 = Decimal(str(leg2_result.result_price))
-
-        leg2_id = self._conn.buy(self._leg2, usdt_needed, OrderType.MARKET, p2)
-        leg1_id = self._conn.buy(self._leg1, amount, OrderType.MARKET, p1)
-        return f"SYN_{leg1_id[:8] if len(leg1_id) >= 8 else leg1_id}"
+        if order_type in (OrderType.LIMIT, OrderType.LIMIT_MAKER):
+            return self._place_maker_limit(is_buy=True, amount=Decimal(str(amount)),
+                                           synthetic_price=Decimal(str(price)))
+        return self._place_taker_market(is_buy=True, amount=Decimal(str(amount)))
 
     def sell(self,
              trading_pair: str,
@@ -79,25 +62,74 @@ class SyntheticTriangularConnector(ExchangeBase):
              order_type: OrderType = OrderType.MARKET,
              price: Decimal = s_decimal_NaN,
              **kwargs) -> str:
-        """
-        SELL synthetic (have BTC, receive BRL):
-          leg1: sell BTC-USDT first → receive USDT
-          leg2: sell USDT-BRL second → receive BRL
-        """
-        amount = Decimal(str(amount))
-        leg1_result = self._conn.get_price_for_volume(self._leg1, False, float(amount))
-        p1 = Decimal(str(leg1_result.result_price))
-        usdt_received = amount * p1
+        if order_type in (OrderType.LIMIT, OrderType.LIMIT_MAKER):
+            return self._place_maker_limit(is_buy=False, amount=Decimal(str(amount)),
+                                           synthetic_price=Decimal(str(price)))
+        return self._place_taker_market(is_buy=False, amount=Decimal(str(amount)))
 
-        leg2_result = self._conn.get_price_for_volume(self._leg2, False, float(usdt_received))
-        p2 = Decimal(str(leg2_result.result_price))
+    def _place_maker_limit(self, is_buy: bool, amount: Decimal, synthetic_price: Decimal) -> str:
+        """
+        Place leg1 (BTC-USDT) as a real LIMIT order.
 
-        leg1_id = self._conn.sell(self._leg1, amount, OrderType.MARKET, p1)
-        self._conn.sell(self._leg2, usdt_received, OrderType.MARKET, p2)
+        Translates the synthetic BTC-BRL price to a real BTC-USDT price:
+            leg1_price = synthetic_brl_price / usdt_brl_mid  (BRL/BTC ÷ BRL/USDT = USDT/BTC)
+
+        Returns the REAL order ID so the strategy tracker can match fill events correctly.
+        leg2 (USDT-BRL) fires later via complete_maker_fill() when leg1 actually fills.
+        """
+        usdt_brl_mid = Decimal(str(self._conn.get_mid_price(self._leg2)))
+        leg1_price = synthetic_price / usdt_brl_mid
+        leg1_price = self._conn.quantize_order_price(self._leg1, leg1_price)
+        amount = self._conn.quantize_order_amount(self._leg1, amount)
+        if is_buy:
+            return self._conn.buy(self._leg1, amount, OrderType.LIMIT, leg1_price)
+        return self._conn.sell(self._leg1, amount, OrderType.LIMIT, leg1_price)
+
+    def _place_taker_market(self, is_buy: bool, amount: Decimal) -> str:
+        """
+        Fire both legs as MARKET orders immediately (taker / hedge path).
+
+        buy:  leg2 (USDT-BRL) first → spend BRL, receive USDT
+              leg1 (BTC-USDT) second → spend USDT, receive BTC
+        sell: leg1 (BTC-USDT) first → receive USDT
+              leg2 (USDT-BRL) second → convert USDT to BRL
+        """
+        if is_buy:
+            leg1_result = self._conn.get_price_for_volume(self._leg1, True, float(amount))
+            p1 = Decimal(str(leg1_result.result_price))
+            usdt_needed = amount * p1
+            leg2_result = self._conn.get_price_for_volume(self._leg2, True, float(usdt_needed))
+            p2 = Decimal(str(leg2_result.result_price))
+            self._conn.buy(self._leg2, usdt_needed, OrderType.MARKET, p2)
+            leg1_id = self._conn.buy(self._leg1, amount, OrderType.MARKET, p1)
+        else:
+            leg1_result = self._conn.get_price_for_volume(self._leg1, False, float(amount))
+            p1 = Decimal(str(leg1_result.result_price))
+            usdt_received = amount * p1
+            leg2_result = self._conn.get_price_for_volume(self._leg2, False, float(usdt_received))
+            p2 = Decimal(str(leg2_result.result_price))
+            leg1_id = self._conn.sell(self._leg1, amount, OrderType.MARKET, p1)
+            self._conn.sell(self._leg2, usdt_received, OrderType.MARKET, p2)
         return f"SYN_{leg1_id[:8] if len(leg1_id) >= 8 else leg1_id}"
 
+    def complete_maker_fill(self, is_buy: bool, btc_amount: Decimal, btc_usdt_fill_price: Decimal):
+        """
+        Called by the script's did_fill_order when a LIMIT leg1 order fills.
+
+        Fires leg2 (USDT-BRL) as MARKET to neutralize the USDT position:
+          buy fill:  BTC-USDT LIMIT filled → spent USDT → BUY USDT-BRL to replenish
+          sell fill: BTC-USDT LIMIT filled → received USDT → SELL USDT-BRL to convert
+        """
+        usdt_amount = Decimal(str(btc_amount)) * Decimal(str(btc_usdt_fill_price))
+        mid = Decimal(str(self._conn.get_mid_price(self._leg2)))
+        if is_buy:
+            return self._conn.buy(self._leg2, usdt_amount, OrderType.MARKET, mid)
+        return self._conn.sell(self._leg2, usdt_amount, OrderType.MARKET, mid)
+
     def cancel(self, trading_pair: str, client_order_id: str):
-        pass  # MARKET orders do not need cancellation
+        if isinstance(client_order_id, str) and client_order_id.startswith("SYN_"):
+            return  # MARKET bundle — already filled, nothing to cancel
+        self._conn.cancel(self._leg1, client_order_id)  # real LIMIT order
 
     # ------------------------------------------------------------------
     # Price queries — used by SimpleXEMM for spread calculation
