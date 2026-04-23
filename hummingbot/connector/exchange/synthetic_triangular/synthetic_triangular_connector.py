@@ -36,10 +36,12 @@ class SyntheticTriangularConnector(ExchangeBase):
         :param leg1_pair:      Base-to-intermediate pair (e.g. "BTC-USDT").
         :param leg2_pair:      Intermediate-to-quote pair (e.g. "USDT-BRL").
         """
-        super().__init__()
+        # Set before super().__init__() because ConnectorBase.__init__ calls
+        # self.display_name → self.name → self._conn during initialisation.
         self._conn = real_connector
         self._leg1 = leg1_pair
         self._leg2 = leg2_pair
+        super().__init__()
 
     # ------------------------------------------------------------------
     # Order placement — Python-level, called by ExchangeBase.c_buy / c_sell
@@ -203,6 +205,12 @@ class SyntheticTriangularConnector(ExchangeBase):
 
     @property
     def name(self) -> str:
+        # Must match the underlying exchange name so BudgetChecker can resolve fee schema
+        # via TradeFeeSchemaLoader.configured_schema_for_exchange → AllConnectorSettings.
+        return self._conn.name
+
+    @property
+    def display_name(self) -> str:
         return f"synthetic({self._conn.name}:{self._leg1}×{self._leg2})"
 
     # ------------------------------------------------------------------

@@ -11,10 +11,10 @@ from hummingbot.connector.exchange.synthetic_triangular.synthetic_triangular_con
 from hummingbot.core.data_type.common import OrderType
 from hummingbot.core.event.events import OrderFilledEvent
 from hummingbot.strategy_v2.executors.data_types import ConnectorPair
-from scripts.simple_xemm import SimpleXEMM, SimpleXEMMConfig
+import scripts.simple_xemm as _simple_xemm
 
 
-class XEMMTriangularConfig(SimpleXEMMConfig):
+class XEMMTriangularConfig(_simple_xemm.SimpleXEMMConfig):
     """
     Extends SimpleXEMMConfig for triangulated XEMM with one synthetic side.
 
@@ -68,7 +68,7 @@ class XEMMTriangularConfig(SimpleXEMMConfig):
         return markets
 
 
-class XEMMTriangular(SimpleXEMM):
+class XEMMTriangular(_simple_xemm.SimpleXEMM):
     """
     Cross-exchange market making with one triangulated side.
 
@@ -111,16 +111,23 @@ class XEMMTriangular(SimpleXEMM):
 
         self._rebalance_counter = 0
 
+    def place_buy_order(self, exchange, trading_pair, amount, order_type=OrderType.LIMIT):
+        if exchange.endswith("_synthetic"):
+            order_type = OrderType.MARKET
+        super().place_buy_order(exchange, trading_pair, amount, order_type)
+
+    def place_sell_order(self, exchange, trading_pair, amount, order_type=OrderType.LIMIT):
+        if exchange.endswith("_synthetic"):
+            order_type = OrderType.MARKET
+        super().place_sell_order(exchange, trading_pair, amount, order_type)
+
     def did_fill_order(self, event: OrderFilledEvent):
         """
-        If the MAKER side is synthetic, the LIMIT leg1 (BTC-USDT) just filled —
-        complete the synthetic by firing leg2 (USDT-BRL) MARKET before super()
-        places the taker hedge.
+        If the MAKER side is synthetic, the LIMIT leg1 just filled —
+        complete the synthetic by firing leg2 MARKET before super() places the taker hedge.
 
-        If the TAKER side is synthetic (default), the maker is a real direct pair
-        and SimpleXEMM.did_fill_order will call place_*_order on the synthetic
-        taker, which fires both legs atomically via _place_taker_market — no
-        completion step needed here.
+        If the TAKER side is synthetic (default), place_sell/buy_order above forces MARKET,
+        so _place_taker_market fires both legs atomically — no completion step needed here.
         """
         maker = self.connectors[self.config.maker_connector]
         if isinstance(maker, SyntheticTriangularConnector):
@@ -140,12 +147,14 @@ class XEMMTriangular(SimpleXEMM):
 
     def _maybe_rebalance_usdt(self):
         """
-        Corrects residual USDT drift accumulated from bid-ask slippage across hedge cycles.
-        Fires a single MARKET order on the intermediate pair to bring USDT back to target.
+        Corrects residual drift in the intermediate asset accumulated from bid-ask slippage.
+        The intermediate asset is the quote of leg1 (e.g. ETH in BTC-ETH, USDT in BTC-USDT).
+        Fires a single MARKET order on leg2 to bring the intermediate back to target.
         """
+        intermediate_asset = self.config.leg1_pair.split("-")[1]
         conn = self.connectors[self.config.leg_connector]
-        usdt = Decimal(str(conn.get_available_balance("USDT")))
-        drift = usdt - self.config.usdt_rebalance_target
+        balance = Decimal(str(conn.get_available_balance(intermediate_asset)))
+        drift = balance - self.config.usdt_rebalance_target
 
         if abs(drift) <= self.config.usdt_rebalance_threshold:
             return
@@ -153,12 +162,16 @@ class XEMMTriangular(SimpleXEMM):
         mid = Decimal(str(conn.get_mid_price(self.config.leg2_pair)))
 
         if drift > Decimal("0"):
-            # Excess USDT → sell USDT for BRL
+            # Excess intermediate → sell via leg2
             self.sell(self.config.leg_connector, self.config.leg2_pair,
                       drift, OrderType.MARKET, mid)
-            self.logger().info(f"USDT rebalance SELL {drift:.4f} ({self.config.leg2_pair}) — balance={usdt:.4f}")
+            self.logger().info(
+                f"Intermediate rebalance SELL {drift:.4f} {intermediate_asset} ({self.config.leg2_pair})"
+                f" — balance={balance:.4f}")
         else:
-            # Deficit USDT → buy USDT with BRL
+            # Deficit intermediate → buy via leg2
             self.buy(self.config.leg_connector, self.config.leg2_pair,
                      abs(drift), OrderType.MARKET, mid)
-            self.logger().info(f"USDT rebalance BUY {abs(drift):.4f} ({self.config.leg2_pair}) — balance={usdt:.4f}")
+            self.logger().info(
+                f"Intermediate rebalance BUY {abs(drift):.4f} {intermediate_asset} ({self.config.leg2_pair})"
+                f" — balance={balance:.4f}")
