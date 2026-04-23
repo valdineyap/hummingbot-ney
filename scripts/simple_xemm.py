@@ -147,19 +147,15 @@ class SimpleXEMM(StrategyV2Base):
     def did_fill_order(self, event: OrderFilledEvent):
         # Only handle fills for our tracked maker orders
         if event.order_id == self.active_buy_order_id:
-            self.logger().info(f"Filled maker buy order at price {event.price:.6f} for amount {event.amount:.2f}")
+            self.logger().info(f"Filled maker buy order at price {event.price:.6f} for amount {event.amount:.6f}")
+            self.active_buy_order_id = None
             # Hedge by selling on taker
             self.place_sell_order(self.config.taker_connector, self.config.taker_trading_pair, event.amount)
-            # Cancel any remaining amount and clear the order ID so a new order can be placed
-            self.cancel(self.config.maker_connector, self.config.maker_trading_pair, event.order_id)
-            self.active_buy_order_id = None
         elif event.order_id == self.active_sell_order_id:
-            self.logger().info(f"Filled maker sell order at price {event.price:.6f} for amount {event.amount:.2f}")
+            self.logger().info(f"Filled maker sell order at price {event.price:.6f} for amount {event.amount:.6f}")
+            self.active_sell_order_id = None
             # Hedge by buying on taker
             self.place_buy_order(self.config.taker_connector, self.config.taker_trading_pair, event.amount)
-            # Cancel any remaining amount and clear the order ID so a new order can be placed
-            self.cancel(self.config.maker_connector, self.config.maker_trading_pair, event.order_id)
-            self.active_sell_order_id = None
 
     def place_buy_order(self, exchange: str, trading_pair: str, amount: Decimal, order_type: OrderType = OrderType.LIMIT):
         buy_result = self.connectors[exchange].get_price_for_volume(trading_pair, True, amount)
