@@ -16,78 +16,90 @@ from scripts.simple_xemm import SimpleXEMM, SimpleXEMMConfig
 
 class XEMMTriangularConfig(SimpleXEMMConfig):
     """
-    Extends SimpleXEMMConfig for triangulated maker on Binance.
+    Extends SimpleXEMMConfig for triangulated XEMM with one synthetic side.
 
-    Roles:
-      - maker_connector / maker_trading_pair: synthetic BTC-BRL (injected, not registered)
-      - taker_connector / taker_trading_pair: real BTC-BRL on Bybit (direct pair)
-      - leg_connector:  exchange hosting the real sub-legs (e.g. "binance")
-      - leg1_pair:      base-to-intermediate pair (e.g. "BTC-USDT") — placed as LIMIT
-      - leg2_pair:      intermediate-to-quote pair (e.g. "USDT-BRL") — placed as MARKET on fill
+    The synthetic connector is role-agnostic — set it as either maker_connector
+    or taker_connector. Defaults below put it as the TAKER (Bybit synthetic),
+    with a real direct pair on the maker side (Binance BTC-BRL).
 
-    The framework creates taker_connector and leg_connector as real connectors.
-    The maker_connector (binance_synthetic) is injected in __init__ as a SyntheticTriangularConnector.
+    Roles (defaults):
+      - maker_connector / maker_trading_pair: real BTC-BRL on Binance (LIMIT)
+      - taker_connector / taker_trading_pair: synthetic BTC-BRL on Bybit (MARKET, fire-and-forget)
+      - leg_connector:  exchange hosting the real sub-legs (e.g. "bybit")
+      - leg1_pair:      base-to-intermediate pair (e.g. "BTC-USDT")
+      - leg2_pair:      intermediate-to-quote pair (e.g. "USDT-BRL")
+
+    The framework creates the real connectors (maker_connector and leg_connector).
+    The synthetic side (whichever points to "*_synthetic") is injected in __init__.
     """
     script_file_name: str = os.path.basename(__file__)
 
-    maker_connector: str = Field("binance_synthetic", json_schema_extra={
-        "prompt": "Synthetic connector name for the maker side", "prompt_on_new": True})
+    maker_connector: str = Field("binance", json_schema_extra={
+        "prompt": "Maker connector (real direct pair, e.g. binance)", "prompt_on_new": True})
     maker_trading_pair: str = Field("BTC-BRL", json_schema_extra={
-        "prompt": "Synthetic trading pair for the maker side", "prompt_on_new": True})
-    taker_connector: str = Field("bybit", json_schema_extra={
-        "prompt": "Real exchange for the taker side (direct BTC-BRL pair)", "prompt_on_new": True})
+        "prompt": "Maker trading pair (e.g. BTC-BRL)", "prompt_on_new": True})
+    taker_connector: str = Field("bybit_synthetic", json_schema_extra={
+        "prompt": "Taker connector (synthetic name, e.g. bybit_synthetic)", "prompt_on_new": True})
     taker_trading_pair: str = Field("BTC-BRL", json_schema_extra={
-        "prompt": "Real trading pair for the taker side", "prompt_on_new": True})
+        "prompt": "Taker trading pair (synthetic, e.g. BTC-BRL)", "prompt_on_new": True})
 
-    leg_connector: str = Field("binance", json_schema_extra={
-        "prompt": "Real exchange hosting both maker sub-legs (e.g. binance)", "prompt_on_new": True})
+    leg_connector: str = Field("bybit", json_schema_extra={
+        "prompt": "Real exchange hosting both synthetic sub-legs (e.g. bybit)", "prompt_on_new": True})
     leg1_pair: str = Field("BTC-USDT", json_schema_extra={
-        "prompt": "Maker sub-leg 1: base-to-intermediate pair (e.g. BTC-USDT)", "prompt_on_new": True})
+        "prompt": "Synthetic sub-leg 1: base-to-intermediate pair (e.g. BTC-USDT)", "prompt_on_new": True})
     leg2_pair: str = Field("USDT-BRL", json_schema_extra={
-        "prompt": "Maker sub-leg 2: intermediate-to-quote pair (e.g. USDT-BRL)", "prompt_on_new": True})
+        "prompt": "Synthetic sub-leg 2: intermediate-to-quote pair (e.g. USDT-BRL)", "prompt_on_new": True})
 
-    usdt_rebalance_target: Decimal = Field(Decimal("60"), json_schema_extra={
-        "prompt": "Target USDT buffer on maker exchange (raised to cover LIMIT reservation)", "prompt_on_new": True})
-    usdt_rebalance_threshold: Decimal = Field(Decimal("10"), json_schema_extra={
+    usdt_rebalance_target: Decimal = Field(Decimal("10"), json_schema_extra={
+        "prompt": "Target USDT buffer on the synthetic exchange", "prompt_on_new": True})
+    usdt_rebalance_threshold: Decimal = Field(Decimal("2"), json_schema_extra={
         "prompt": "USDT drift tolerance before rebalancing", "prompt_on_new": True})
     usdt_rebalance_interval: int = Field(60, json_schema_extra={
         "prompt": "Ticks between USDT balance checks (~60 s at 1 s/tick)", "prompt_on_new": True})
 
     def update_markets(self, markets):
-        markets[self.taker_connector] = markets.get(self.taker_connector, set()) | {self.taker_trading_pair}
+        # Register the real direct-pair side (maker by default) and the leg exchange.
+        # The synthetic side is injected in __init__ and must NOT be registered here.
+        if not self.maker_connector.endswith("_synthetic"):
+            markets[self.maker_connector] = markets.get(self.maker_connector, set()) | {self.maker_trading_pair}
+        if not self.taker_connector.endswith("_synthetic"):
+            markets[self.taker_connector] = markets.get(self.taker_connector, set()) | {self.taker_trading_pair}
         markets[self.leg_connector] = markets.get(self.leg_connector, set()) | {self.leg1_pair, self.leg2_pair}
-        # maker_connector ("binance_synthetic") is NOT registered here — it is injected in __init__
         return markets
 
 
 class XEMMTriangular(SimpleXEMM):
     """
-    Cross-exchange market making with a triangulated maker hedge.
+    Cross-exchange market making with one triangulated side.
 
-    Maker side → synthetic BTC-BRL on Binance (two real sub-legs):
-        BTC-USDT LIMIT order (maker, tracked by strategy)
-        USDT-BRL MARKET order (fires in did_fill_order after BTC-USDT fills)
+    Default config: synthetic is the TAKER on Bybit (BTC-USDT × USDT-BRL → BTC-BRL),
+    fired as MARKET fire-and-forget when the maker fills on Binance.
 
-    Taker side → real BTC-BRL MARKET order on Bybit (direct pair, simple hedge)
+    Swapping roles is purely a config change — point maker_connector to the
+    "*_synthetic" name to make the maker side triangulated instead. The
+    did_fill_order override below detects which side is synthetic at runtime.
 
-    SimpleXEMM (parent) is completely unmodified — it sees only two connectors with
-    equal trading pairs and does not know about the triangulation.
-
-    This class only:
-      1. Injects SyntheticTriangularConnector as the maker connector before super().__init__
-      2. Overrides did_fill_order() to complete the synthetic maker fill before taker hedge
-      3. Wraps on_tick() to run the USDT rebalancer after SimpleXEMM's tick
+    SimpleXEMM (parent) is completely unmodified — it sees only two connectors
+    with equal trading pairs and does not know about the triangulation.
     """
 
     def __init__(self, connectors: Dict[str, ConnectorBase], config: XEMMTriangularConfig):
-        # Inject the synthetic connector BEFORE super().__init__ so that
-        # StrategyV2Base.add_markets() includes it in _sb_markets.
+        # Inject the synthetic connector (whichever side is "*_synthetic") BEFORE
+        # super().__init__ so that StrategyV2Base.add_markets() includes it in _sb_markets.
         synthetic = SyntheticTriangularConnector(
             connectors[config.leg_connector],
             config.leg1_pair,
             config.leg2_pair,
         )
-        connectors[config.maker_connector] = synthetic
+        if config.maker_connector.endswith("_synthetic"):
+            connectors[config.maker_connector] = synthetic
+        elif config.taker_connector.endswith("_synthetic"):
+            connectors[config.taker_connector] = synthetic
+        else:
+            raise ValueError(
+                "Neither maker_connector nor taker_connector ends with '_synthetic'. "
+                "One side must be the synthetic name (e.g. 'bybit_synthetic')."
+            )
 
         super().__init__(connectors, config)
 
@@ -101,15 +113,21 @@ class XEMMTriangular(SimpleXEMM):
 
     def did_fill_order(self, event: OrderFilledEvent):
         """
-        When a maker LIMIT order fills (BTC-USDT on Binance), complete the synthetic:
-          - Fire USDT-BRL MARKET to neutralize the intermediate USDT position.
-          - Then call super() so SimpleXEMM places the taker hedge on Bybit.
+        If the MAKER side is synthetic, the LIMIT leg1 (BTC-USDT) just filled —
+        complete the synthetic by firing leg2 (USDT-BRL) MARKET before super()
+        places the taker hedge.
+
+        If the TAKER side is synthetic (default), the maker is a real direct pair
+        and SimpleXEMM.did_fill_order will call place_*_order on the synthetic
+        taker, which fires both legs atomically via _place_taker_market — no
+        completion step needed here.
         """
-        synthetic = self.connectors[self.config.maker_connector]
-        if event.order_id == self.active_buy_order_id:
-            synthetic.complete_maker_fill(True, event.amount, event.price)
-        elif event.order_id == self.active_sell_order_id:
-            synthetic.complete_maker_fill(False, event.amount, event.price)
+        maker = self.connectors[self.config.maker_connector]
+        if isinstance(maker, SyntheticTriangularConnector):
+            if event.order_id == self.active_buy_order_id:
+                maker.complete_maker_fill(True, event.amount, event.price)
+            elif event.order_id == self.active_sell_order_id:
+                maker.complete_maker_fill(False, event.amount, event.price)
         super().did_fill_order(event)
 
     def on_tick(self):
