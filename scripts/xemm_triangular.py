@@ -8,7 +8,7 @@ from hummingbot.connector.connector_base import ConnectorBase
 from hummingbot.connector.exchange.synthetic_triangular.synthetic_triangular_connector import (
     SyntheticTriangularConnector,
 )
-from hummingbot.core.data_type.common import OrderType
+from hummingbot.core.data_type.common import OrderType, TradeType
 from hummingbot.core.event.events import OrderFilledEvent
 import scripts.simple_xemm as _simple_xemm
 
@@ -129,8 +129,78 @@ class XEMMTriangular(_simple_xemm.SimpleXEMM):
                 maker.complete_maker_fill(False, event.amount, event.price)
         super().did_fill_order(event)
 
+    def _log_triangular_prices(self):
+        """Log synthetic price breakdown (leg1 × leg2) and fee split every 60 ticks."""
+        try:
+            conn = self.connectors[self.config.leg_connector]
+            amt = self.config.order_amount
+
+            # Leg prices
+            leg1_buy = conn.get_price_for_volume(self.config.leg1_pair, True, float(amt))
+            leg1_sell = conn.get_price_for_volume(self.config.leg1_pair, False, float(amt))
+            leg1_mid = conn.get_mid_price(self.config.leg1_pair)
+
+            leg1_buy_p = Decimal(str(leg1_buy.result_price))
+            leg1_sell_p = Decimal(str(leg1_sell.result_price))
+            usdt_buy_notional = amt * leg1_buy_p
+            usdt_sell_notional = amt * leg1_sell_p
+
+            leg2_buy = conn.get_price_for_volume(self.config.leg2_pair, True, float(usdt_buy_notional))
+            leg2_sell = conn.get_price_for_volume(self.config.leg2_pair, False, float(usdt_sell_notional))
+            leg2_mid = conn.get_mid_price(self.config.leg2_pair)
+
+            leg2_buy_p = Decimal(str(leg2_buy.result_price))
+            leg2_sell_p = Decimal(str(leg2_sell.result_price))
+
+            syn_buy = leg1_buy_p * leg2_buy_p
+            syn_sell = leg1_sell_p * leg2_sell_p
+            syn_mid = Decimal(str(leg1_mid)) * Decimal(str(leg2_mid))
+            syn_spread_pct = (syn_buy - syn_sell) / syn_mid * Decimal("100") if syn_mid else Decimal("0")
+
+            # Fee breakdown for synthetic taker
+            syn_conn = self.connectors.get(self.config.taker_connector) or self.connectors.get(self.config.maker_connector)
+            base, quote = self.config.leg1_pair.split("-")
+            leg1_fee = conn.get_fee(base, quote, OrderType.MARKET, TradeType.SELL, amt, leg1_sell_p, False)
+            int_asset = self.config.leg1_pair.split("-")[1]
+            leg2_base, leg2_quote = self.config.leg2_pair.split("-")
+            leg2_fee = conn.get_fee(leg2_base, leg2_quote, OrderType.MARKET, TradeType.SELL,
+                                    usdt_sell_notional, leg2_sell_p, False)
+
+            # Bid-ask spread of each leg in bps
+            leg1_spread_bps = (leg1_buy_p - leg1_sell_p) / Decimal(str(leg1_mid)) * Decimal("10000") if leg1_mid else Decimal("0")
+            leg2_spread_bps = (leg2_buy_p - leg2_sell_p) / Decimal(str(leg2_mid)) * Decimal("10000") if leg2_mid else Decimal("0")
+            syn_spread_bps = (syn_buy - syn_sell) / syn_mid * Decimal("10000") if syn_mid else Decimal("0")
+
+            # Compare synthetic mid to maker (direct) mid
+            maker_ob = self.connectors[self.config.maker_connector].get_order_book(self.config.maker_trading_pair)
+            maker_best_bid = Decimal(str(maker_ob.get_price(False)))
+            maker_best_ask = Decimal(str(maker_ob.get_price(True)))
+            maker_mid = (maker_best_bid + maker_best_ask) / Decimal("2")
+            syn_vs_direct_bps = (syn_mid - maker_mid) / maker_mid * Decimal("10000") if maker_mid else Decimal("0")
+
+            self.logger().info(
+                f"[TRI PRICES] "
+                f"{self.config.leg1_pair}: mid={float(leg1_mid):.4f} bid={float(leg1_sell_p):.4f} ask={float(leg1_buy_p):.4f} spread={float(leg1_spread_bps):.2f}bps | "
+                f"{self.config.leg2_pair}: mid={float(leg2_mid):.5f} bid={float(leg2_sell_p):.5f} ask={float(leg2_buy_p):.5f} spread={float(leg2_spread_bps):.2f}bps | "
+                f"synthetic: mid={float(syn_mid):.2f} bid={float(syn_sell):.2f} ask={float(syn_buy):.2f} spread={float(syn_spread_bps):.2f}bps | "
+                f"direct BTC-BRL: bid={float(maker_best_bid):.2f} ask={float(maker_best_ask):.2f} mid={float(maker_mid):.2f} | "
+                f"synthetic_vs_direct={float(syn_vs_direct_bps):.1f}bps"
+            )
+            self.logger().info(
+                f"[TRI FEES] leg1_fee={float(leg1_fee.percent * 100):.4f}% "
+                f"leg2_fee={float(leg2_fee.percent * 100):.4f}% "
+                f"total_taker_fee={float((leg1_fee.percent + leg2_fee.percent) * 100):.4f}% "
+                f"intermediate={int_asset} notional≈{float(usdt_sell_notional):.4f}"
+            )
+        except Exception as e:
+            self.logger().warning(f"[TRI PRICES] Error: {e}")
+
     def on_tick(self):
         super().on_tick()  # full SimpleXEMM logic: prices, maker orders, cancels, hedges
+
+        # Log triangular price breakdown every 60 ticks
+        if self._tick_counter % 60 == 1:
+            self._log_triangular_prices()
 
         self._rebalance_counter += 1
         if self._rebalance_counter >= self.config.usdt_rebalance_interval:

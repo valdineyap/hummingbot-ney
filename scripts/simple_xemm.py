@@ -56,6 +56,8 @@ class SimpleXEMM(StrategyV2Base):
         # Track our active maker order IDs
         self.active_buy_order_id = None
         self.active_sell_order_id = None
+        self._fee_diag_logged = False
+        self._tick_counter = 0
         # Initialize rate sources for market data provider
         self.market_data_provider.initialize_rate_sources([
             ConnectorPair(connector_name=config.maker_connector, trading_pair=config.maker_trading_pair),
@@ -71,7 +73,41 @@ class SimpleXEMM(StrategyV2Base):
                 return True
         return False
 
+    def _log_fee_diagnostic(self):
+        """Log actual fee rates from both connectors once on startup."""
+        try:
+            base, quote = self.config.maker_trading_pair.split("-")
+            maker_conn = self.connectors[self.config.maker_connector]
+            taker_conn = self.connectors[self.config.taker_connector]
+
+            maker_fee = maker_conn.get_fee(base, quote, OrderType.LIMIT, TradeType.BUY,
+                                           self.config.order_amount, Decimal("0"), True)
+            taker_fee = taker_conn.get_fee(base, quote, OrderType.MARKET, TradeType.BUY,
+                                           self.config.order_amount, Decimal("0"), False)
+
+            total_fee_pct = (maker_fee.percent + taker_fee.percent) * Decimal("100")
+            target_pct = self.config.target_profitability * Decimal("100")
+            min_pct = self.config.min_profitability * Decimal("100")
+
+            self.logger().info(
+                f"[FEE DIAG] maker={self.config.maker_connector} fee={float(maker_fee.percent * 100):.4f}% "
+                f"| taker={self.config.taker_connector} fee={float(taker_fee.percent * 100):.4f}% "
+                f"| total_fee={float(total_fee_pct):.4f}% "
+                f"| target_profit={float(target_pct):.4f}% "
+                f"| min_profit={float(min_pct):.4f}% "
+                f"| net_after_fees={float(target_pct - total_fee_pct):.4f}%"
+            )
+        except Exception as e:
+            self.logger().warning(f"[FEE DIAG] Could not compute fees: {e}")
+
     def on_tick(self):
+        self._tick_counter += 1
+
+        # Log fee diagnostic once on startup
+        if not self._fee_diag_logged and self.ready_to_trade:
+            self._log_fee_diagnostic()
+            self._fee_diag_logged = True
+
         taker_buy_result = self.connectors[self.config.taker_connector].get_price_for_volume(self.config.taker_trading_pair, True, self.config.order_amount)
         taker_sell_result = self.connectors[self.config.taker_connector].get_price_for_volume(self.config.taker_trading_pair, False, self.config.order_amount)
 
@@ -92,6 +128,24 @@ class SimpleXEMM(StrategyV2Base):
                                            order_side=TradeType.BUY, amount=Decimal(buy_order_amount), price=maker_buy_price)
                 buy_order_adjusted = self.connectors[self.config.maker_connector].budget_checker.adjust_candidate(buy_order, all_or_none=False)
                 if buy_order_adjusted.amount > 0:
+                    taker_sell_price = float(taker_sell_result.result_price)
+                    maker_price = float(buy_order_adjusted.price)
+                    gross_spread_pct = (taker_sell_price - maker_price) / maker_price * 100
+                    # Top of maker orderbook
+                    maker_ob = self.connectors[self.config.maker_connector].get_order_book(self.config.maker_trading_pair)
+                    maker_best_bid = maker_ob.get_price(False)
+                    maker_best_ask = maker_ob.get_price(True)
+                    maker_mid = (maker_best_bid + maker_best_ask) / 2
+                    dist_from_best_bid_bps = (maker_best_bid - maker_price) / maker_mid * 10000
+                    dist_from_mid_bps = (maker_mid - maker_price) / maker_mid * 10000
+                    synthetic_vs_maker_bps = (taker_sell_price - maker_mid) / maker_mid * 10000
+                    self.logger().info(
+                        f"[BUY ORDER] maker_buy={maker_price:.2f} | "
+                        f"maker_book: best_bid={maker_best_bid:.2f} best_ask={maker_best_ask:.2f} mid={maker_mid:.2f} | "
+                        f"dist_from_bid={dist_from_best_bid_bps:.1f}bps dist_from_mid={dist_from_mid_bps:.1f}bps | "
+                        f"taker_sell(synthetic)={taker_sell_price:.2f} synthetic_vs_maker_mid={synthetic_vs_maker_bps:.1f}bps | "
+                        f"gross_spread={gross_spread_pct:.4f}% amount={float(buy_order_adjusted.amount):.6f}"
+                    )
                     self.active_buy_order_id = self.buy(self.config.maker_connector, self.config.maker_trading_pair,
                                                         buy_order_adjusted.amount, buy_order_adjusted.order_type, buy_order_adjusted.price)
 
@@ -108,6 +162,24 @@ class SimpleXEMM(StrategyV2Base):
                                             order_side=TradeType.SELL, amount=Decimal(sell_order_amount), price=maker_sell_price)
                 sell_order_adjusted = self.connectors[self.config.maker_connector].budget_checker.adjust_candidate(sell_order, all_or_none=False)
                 if sell_order_adjusted.amount > 0:
+                    taker_buy_price = float(taker_buy_result.result_price)
+                    maker_price = float(sell_order_adjusted.price)
+                    gross_spread_pct = (maker_price - taker_buy_price) / maker_price * 100
+                    # Top of maker orderbook
+                    maker_ob = self.connectors[self.config.maker_connector].get_order_book(self.config.maker_trading_pair)
+                    maker_best_bid = maker_ob.get_price(False)
+                    maker_best_ask = maker_ob.get_price(True)
+                    maker_mid = (maker_best_bid + maker_best_ask) / 2
+                    dist_from_best_ask_bps = (maker_price - maker_best_ask) / maker_mid * 10000
+                    dist_from_mid_bps = (maker_price - maker_mid) / maker_mid * 10000
+                    synthetic_vs_maker_bps = (taker_buy_price - maker_mid) / maker_mid * 10000
+                    self.logger().info(
+                        f"[SELL ORDER] maker_sell={maker_price:.2f} | "
+                        f"maker_book: best_bid={maker_best_bid:.2f} best_ask={maker_best_ask:.2f} mid={maker_mid:.2f} | "
+                        f"dist_from_ask={dist_from_best_ask_bps:.1f}bps dist_from_mid={dist_from_mid_bps:.1f}bps | "
+                        f"taker_buy(synthetic)={taker_buy_price:.2f} synthetic_vs_maker_mid={synthetic_vs_maker_bps:.1f}bps | "
+                        f"gross_spread={gross_spread_pct:.4f}% amount={float(sell_order_adjusted.amount):.6f}"
+                    )
                     self.active_sell_order_id = self.sell(self.config.maker_connector, self.config.maker_trading_pair,
                                                           sell_order_adjusted.amount, sell_order_adjusted.order_type, sell_order_adjusted.price)
 
@@ -147,12 +219,32 @@ class SimpleXEMM(StrategyV2Base):
     def did_fill_order(self, event: OrderFilledEvent):
         # Only handle fills for our tracked maker orders
         if event.order_id == self.active_buy_order_id:
-            self.logger().info(f"Filled maker buy order at price {event.price:.6f} for amount {event.amount:.6f}")
+            # Get current taker sell price for slippage calculation
+            taker_sell_result = self.connectors[self.config.taker_connector].get_price_for_volume(
+                self.config.taker_trading_pair, False, event.amount)
+            taker_hedge_price = float(taker_sell_result.result_price)
+            fill_price = float(event.price)
+            gross_pnl_pct = (taker_hedge_price - fill_price) / fill_price * 100
+            self.logger().info(
+                f"[FILL BUY] maker_fill={fill_price:.2f} taker_hedge_sell={taker_hedge_price:.2f} "
+                f"gross_pnl={gross_pnl_pct:.4f}% amount={float(event.amount):.6f} "
+                f"fee_paid={event.trade_fee}"
+            )
             self.active_buy_order_id = None
             # Hedge by selling on taker
             self.place_sell_order(self.config.taker_connector, self.config.taker_trading_pair, event.amount)
         elif event.order_id == self.active_sell_order_id:
-            self.logger().info(f"Filled maker sell order at price {event.price:.6f} for amount {event.amount:.6f}")
+            # Get current taker buy price for slippage calculation
+            taker_buy_result = self.connectors[self.config.taker_connector].get_price_for_volume(
+                self.config.taker_trading_pair, True, event.amount)
+            taker_hedge_price = float(taker_buy_result.result_price)
+            fill_price = float(event.price)
+            gross_pnl_pct = (fill_price - taker_hedge_price) / fill_price * 100
+            self.logger().info(
+                f"[FILL SELL] maker_fill={fill_price:.2f} taker_hedge_buy={taker_hedge_price:.2f} "
+                f"gross_pnl={gross_pnl_pct:.4f}% amount={float(event.amount):.6f} "
+                f"fee_paid={event.trade_fee}"
+            )
             self.active_sell_order_id = None
             # Hedge by buying on taker
             self.place_buy_order(self.config.taker_connector, self.config.taker_trading_pair, event.amount)
