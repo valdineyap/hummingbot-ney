@@ -1,0 +1,54 @@
+# PMM Lead-Lag Skew — Fase 1 config
+# BTC-BRL on Binance Spot (Hummingbot V2)
+#
+# Fase 1: PMM puro, sem skew, sem regime filter, sem lead-lag.
+# Ajustar para Fases 2–5 conforme roadmap em §6 do plano.
+
+controller_name: pmm_lead_lag_skew
+id: pmm_btc_brl
+
+# ── Connector ──────────────────────────────────────────────────────────────
+connector_name: binance
+trading_pair: BTC-BRL
+leverage: 1
+
+# ── Capital e níveis (Fase 1) ─────────────────────────────────────────────
+total_amount_quote: 200          # R$200 inicial; aumentar gradualmente após validação
+buy_spreads:  [0.0010, 0.0020]  # 10 bps e 20 bps
+sell_spreads: [0.0010, 0.0020]
+buy_amounts_pct:  [50, 50]       # 50% cada nível
+sell_amounts_pct: [50, 50]
+
+# ── Executor ──────────────────────────────────────────────────────────────
+# Testar 15s, 30s, 60s — ver §8.3 do plano; 60s é ponto de partida.
+executor_refresh_time: 60
+cooldown_time: 15
+
+# ── Triple barrier — PMM puro (sem SL/TP) ────────────────────────────────
+stop_loss: null
+take_profit: null
+time_limit: null
+
+# ── Rebalance spot ────────────────────────────────────────────────────────
+# MARKET rebalance fura o breakeven (taker=4bps) — desabilitado.
+position_rebalance_threshold_pct: 0.25
+skip_rebalance: true
+
+# ── Inventário (Fase 2) ──────────────────────────────────────────────────
+target_inventory_base_pct: 0.5
+inv_soft_band: 0.10
+inv_hard_band: 0.20
+inv_kill:      0.40
+max_net_position_quote: 60       # ~30% de R$200
+
+# ── Skew (Fase 3) ────────────────────────────────────────────────────────
+w_inv: 1.0
+w_lead: 0.0                      # lead-lag desligado até Fase 5
+skew_max_bps: 0.0                # 0 em Fase 1; Fase3=2, teto=8
+min_maker_distance_bps: 1
+min_requote_bps: 1
+
+# ── Lead-lag (Fase 5) ────────────────────────────────────────────────────
+basis_deadband_bps: 3
+max_leader_staleness_sec: 5
+max_usdt_brl_staleness_sec: 15
