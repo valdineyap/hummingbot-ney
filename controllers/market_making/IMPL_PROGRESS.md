@@ -50,14 +50,32 @@ Commits: `5d6b1efc` (initial), `1992a90a` (gap fixes vs §2.2/2.3/2.4)
 - [x] CSV escreve header + linhas
 - [x] band ordering enforced
 
-## ⏳ Próximas fases
+## ✅ Fase 3 — Skew por inventário + volatilidade — em andamento
 
-### Fase 3 — Skew por inventário + vol
-- [ ] σ rolante via candles BTC-BRL (HistoricalVolatility)
-- [ ] s_vol → spread_multiplier
-- [ ] w_inv=1.0, skew_max_bps=2 (Fase 3 inicial)
-- [ ] min_requote_bps freio de churn
-- [ ] force_requote_bps recotação imediata em delta grande
+### Phase 3 A — volatilidade
+- [x] compute_volatility_from_prices() — σ de log-returns puro
+- [x] CandlesConfig + get_candles_config() (BTC-BRL 1m)
+- [x] _compute_vol_from_candles() (σ_short = 30 candles, σ_ref = 360 candles)
+- [x] vol_state real → spread_multiplier propagado para order_params
+
+### Phase 3 B — skew ativo
+- [x] skew_max_bps=2 default (Fase 3); teto absoluto 8
+- [x] compute_order_params combina vol_mult * regime_mult (§5.3)
+
+### Phase 3 C — freios de churn (§5.7)
+- [x] min_requote_bps em executors_to_refresh (suprime refresh natural com delta < 1bps)
+- [x] force_requote_bps em executors_to_early_stop (cancela orders staled em mercado rápido)
+
+### Phase 3 D — clamp de distância (§5.6)
+- [x] _clamp_to_mid no get_executor_config (bid nunca ≥ mid, ask nunca ≤ mid)
+
+### Phase 3 E — testes
+- [x] 5 testes vol (constant, increasing, capped, fallback)
+- [x] 3 testes clamp (buy/sell cross + safe stay)
+- [x] 1 teste skew long → ref < mid
+- [x] 5 testes requote brakes (min skip/allow, force stop/no-stop/skip-trading)
+
+## ⏳ Próximas fases
 
 ### Fase 4 — Regime + kill switch
 - [ ] L1/L1.5/L2/L3 state machine

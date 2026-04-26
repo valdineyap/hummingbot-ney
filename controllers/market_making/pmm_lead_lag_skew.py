@@ -10,17 +10,19 @@ Phase 5: lead-lag micro pause + synthetic fair_brl.
 import csv
 import os
 from decimal import Decimal
-from typing import Dict, List, Tuple
+from typing import Dict, List, Optional, Tuple
 
 from pydantic import Field, field_validator
 from pydantic_core.core_schema import ValidationInfo
 
-from hummingbot.core.data_type.common import PriceType
+from hummingbot.core.data_type.common import PriceType, TradeType
+from hummingbot.data_feed.candles_feed.data_types import CandlesConfig
 from hummingbot.strategy_v2.controllers.market_making_controller_base import (
     MarketMakingControllerBase,
     MarketMakingControllerConfigBase,
 )
 from hummingbot.strategy_v2.executors.position_executor.data_types import PositionExecutorConfig
+from hummingbot.strategy_v2.models.executor_actions import ExecutorAction, StopExecutorAction
 
 from controllers.market_making.pmm_lead_lag_utils import (
     compute_inventory_state,
@@ -31,6 +33,7 @@ from controllers.market_making.pmm_lead_lag_utils import (
     compute_size_factors,
     compute_skew_state,
     compute_vol_state,
+    compute_volatility_from_prices,
 )
 
 
@@ -125,11 +128,45 @@ class PMMLeadLagSkewConfig(MarketMakingControllerConfigBase):
         json_schema_extra={"prompt": "Lead-lag signal weight (0 until Phase 5): ", "is_updatable": True},
     )
     skew_max_bps: float = Field(
-        default=0.0, ge=0.0,
-        json_schema_extra={"prompt": "Max skew in bps (0=disabled, Phase3=2, teto=8): ", "is_updatable": True},
+        default=2.0, ge=0.0,
+        json_schema_extra={"prompt": "Max skew in bps (Phase3=2, teto=8): ", "is_updatable": True},
     )
     min_maker_distance_bps: float = Field(default=1.0, gt=0.0)
-    min_requote_bps: float = Field(default=1.0, ge=0.0)
+    min_requote_bps: float = Field(
+        default=1.0, ge=0.0,
+        json_schema_extra={"prompt": "Min bps delta to refresh order (churn brake): ", "is_updatable": True},
+    )
+    force_requote_bps: float = Field(
+        default=15.0, gt=0.0,
+        json_schema_extra={"prompt": "Force-requote when delta >= bps (escape stale orders): ", "is_updatable": True},
+    )
+
+    # ── Volatility (Phase 3) ──────────────────────────────────────────────
+    candles_connector: Optional[str] = Field(
+        default=None,
+        json_schema_extra={"prompt": "Candles connector (blank = same as connector_name): "},
+    )
+    candles_trading_pair: Optional[str] = Field(
+        default=None,
+        json_schema_extra={"prompt": "Candles pair (blank = same as trading_pair): "},
+    )
+    candles_interval: str = Field(default="1m")
+    vol_short_length: int = Field(default=30, gt=1)   # ~30 minutes at 1m
+    vol_ref_length: int = Field(default=360, gt=30)   # ~6 hours at 1m
+
+    @field_validator("candles_connector", mode="before")
+    @classmethod
+    def _candles_connector_default(cls, v, info: ValidationInfo):
+        if v is None or v == "":
+            return info.data.get("connector_name")
+        return v
+
+    @field_validator("candles_trading_pair", mode="before")
+    @classmethod
+    def _candles_trading_pair_default(cls, v, info: ValidationInfo):
+        if v is None or v == "":
+            return info.data.get("trading_pair")
+        return v
 
     # ── Lead-lag (Phase 5) ───────────────────────────────────────────────
     basis_deadband_bps: float = Field(default=3.0, ge=0.0)
@@ -153,6 +190,8 @@ class PMMLeadLagSkewController(MarketMakingControllerBase):
     """
 
     def __init__(self, config: PMMLeadLagSkewConfig, *args, **kwargs):
+        # max_records must be set before super().__init__ if used in get_candles_config
+        self.max_records = max(config.vol_ref_length, config.vol_short_length) + 50
         super().__init__(config, *args, **kwargs)
         self.config = config
         # Hysteresis state for one-sided mode (§2.4)
@@ -161,6 +200,38 @@ class PMMLeadLagSkewController(MarketMakingControllerBase):
         # CSV signals logger (lazy init: opened on first write)
         self._csv_path: str = os.path.join(self.config.csv_log_dir, "signals.csv")
         self._csv_initialized: bool = False
+
+    # ── Candles config (Phase 3) ─────────────────────────────────────────
+
+    def get_candles_config(self) -> List[CandlesConfig]:
+        """Subscribe to BTC-BRL 1m candles for volatility computation."""
+        return [CandlesConfig(
+            connector=self.config.candles_connector,
+            trading_pair=self.config.candles_trading_pair,
+            interval=self.config.candles_interval,
+            max_records=self.max_records,
+        )]
+
+    def _compute_vol_from_candles(self):
+        """
+        Read close prices from candles_df and return (sigma_short, sigma_ref).
+        Both are 0.0 when not enough history → spread_multiplier defaults to 1.0.
+        """
+        try:
+            df = self.market_data_provider.get_candles_df(
+                connector_name=self.config.candles_connector,
+                trading_pair=self.config.candles_trading_pair,
+                interval=self.config.candles_interval,
+                max_records=self.max_records,
+            )
+        except Exception:
+            return 0.0, 0.0
+        if df is None or len(df) < self.config.vol_short_length + 1:
+            return 0.0, 0.0
+        closes = df["close"].astype(float).tolist()
+        sigma_short = compute_volatility_from_prices(closes[-self.config.vol_short_length:])
+        sigma_ref = compute_volatility_from_prices(closes[-self.config.vol_ref_length:])
+        return sigma_short, sigma_ref
 
     # ── Balance fetching (Phase 2) ───────────────────────────────────────
 
@@ -207,8 +278,14 @@ class PMMLeadLagSkewController(MarketMakingControllerBase):
         )
         mid_dec = Decimal(str(mid_price))
 
-        # Phase 4 stubs — neutral
-        vol_state = compute_vol_state(1.0, 1.0)
+        # Phase 3 — volatility from candles
+        sigma_short, sigma_ref = self._compute_vol_from_candles()
+        if sigma_short > 0 and sigma_ref > 0:
+            vol_state = compute_vol_state(sigma_short, sigma_ref)
+        else:
+            vol_state = compute_vol_state(1.0, 1.0)  # neutral until enough history
+
+        # Phase 5 stub — neutral
         lead_state = compute_lead_state(mid_dec, mid_dec, self.config.basis_deadband_bps)
 
         # Phase 2 — live balances
@@ -249,6 +326,7 @@ class PMMLeadLagSkewController(MarketMakingControllerBase):
             mid_price=mid_dec,
             skew_state=skew_state,
             regime_state=regime_state,
+            vol_state=vol_state,
             side_perms=side_perms,
         )
 
@@ -309,9 +387,10 @@ class PMMLeadLagSkewController(MarketMakingControllerBase):
 
     def get_executor_config(self, level_id: str, price: Decimal, amount: Decimal):
         """
-        Create PositionExecutorConfig for a given level, applying inventory size_factor.
-        Returns None when size_factor=0 (adversa side beyond hard_band — see §2.3),
-        which causes the base controller to skip this level entirely.
+        Create PositionExecutorConfig for a given level, applying inventory size_factor
+        and §5.6 distance clamp (orders must not cross mid).
+
+        Returns None when size_factor=0 (adversa side beyond hard_band).
         """
         trade_type = self.get_trade_type_from_level_id(level_id)
         size_factors: Dict[str, float] = self.processed_data.get(
@@ -320,17 +399,95 @@ class PMMLeadLagSkewController(MarketMakingControllerBase):
         size_factor = Decimal(str(size_factors.get(trade_type.name.lower(), 1.0)))
         if size_factor == Decimal("0"):
             return None
+
+        clamped_price = self._clamp_to_mid(price, trade_type)
         return PositionExecutorConfig(
             timestamp=self.market_data_provider.time(),
             level_id=level_id,
             connector_name=self.config.connector_name,
             trading_pair=self.config.trading_pair,
-            entry_price=price,
+            entry_price=clamped_price,
             amount=amount * size_factor,
             triple_barrier_config=self.config.triple_barrier_config,
             leverage=self.config.leverage,
             side=trade_type,
         )
+
+    def _clamp_to_mid(self, order_price: Decimal, trade_type: TradeType) -> Decimal:
+        """
+        §5.6 — never let bid >= mid or ask <= mid (would auto-cross to taker).
+        Pulls back to mid * (1 ± min_maker_distance_bps / 10000).
+        """
+        mid = self.processed_data.get("mid_price")
+        if mid is None or mid <= 0:
+            return order_price
+        margin = mid * Decimal(str(self.config.min_maker_distance_bps)) / Decimal("10000")
+        if trade_type == TradeType.BUY and order_price >= mid:
+            return mid - margin
+        if trade_type == TradeType.SELL and order_price <= mid:
+            return mid + margin
+        return order_price
+
+    # ── Quote churn brakes (§5.7, Phase 3) ───────────────────────────────
+
+    def _delta_bps_for_executor(self, executor) -> Optional[Decimal]:
+        """Compute |new_price − executor.entry_price| / entry_price in bps."""
+        custom_info = getattr(executor, "custom_info", None) or {}
+        level_id = custom_info.get("level_id")
+        if not level_id or level_id == "position_rebalance":
+            return None
+        try:
+            new_price, _ = self.get_price_and_amount(level_id)
+        except Exception:
+            return None
+        current = getattr(getattr(executor, "config", None), "entry_price", None)
+        if current is None or current <= 0:
+            return None
+        try:
+            return abs(Decimal(str(new_price)) - Decimal(str(current))) / Decimal(str(current)) * Decimal("10000")
+        except Exception:
+            return None
+
+    def executors_to_refresh(self) -> List[ExecutorAction]:
+        """
+        Add the min_requote_bps brake on top of the base time-based refresh: an
+        aged executor whose new price differs by < min_requote_bps stays in place
+        (§5.7) — avoids churn when the signal barely moved.
+        """
+        base_actions = super().executors_to_refresh()
+        if self.config.min_requote_bps <= 0:
+            return base_actions
+        threshold = Decimal(str(self.config.min_requote_bps))
+        executor_by_id = {e.id: e for e in self.executors_info}
+        keep: List[ExecutorAction] = []
+        for action in base_actions:
+            executor = executor_by_id.get(getattr(action, "executor_id", None))
+            if executor is None:
+                keep.append(action)
+                continue
+            delta_bps = self._delta_bps_for_executor(executor)
+            if delta_bps is None or delta_bps >= threshold:
+                keep.append(action)
+        return keep
+
+    def executors_to_early_stop(self) -> List[ExecutorAction]:
+        """
+        Force-stop executors whose new price differs by ≥ force_requote_bps,
+        even before their refresh time — protects against stale orders being
+        sniped in fast markets (§5.7).
+        """
+        actions = list(super().executors_to_early_stop())
+        threshold = Decimal(str(self.config.force_requote_bps))
+        for executor in self.executors_info:
+            if not executor.is_active or executor.is_trading:
+                continue
+            delta_bps = self._delta_bps_for_executor(executor)
+            if delta_bps is not None and delta_bps >= threshold:
+                actions.append(StopExecutorAction(
+                    controller_id=self.config.id,
+                    executor_id=executor.id,
+                ))
+        return actions
 
     # ── CSV logging (Phase 2) ─────────────────────────────────────────────
 

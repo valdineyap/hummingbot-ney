@@ -310,5 +310,187 @@ class TestPMMLeadLagSkewControllerPhase2(IsolatedAsyncioWrapperTestCase):
         self.assertIn("inv_pct", lines[0])
 
 
+class TestPMMLeadLagSkewControllerPhase3(IsolatedAsyncioWrapperTestCase):
+    """Phase 3: vol from candles, skew active, requote brakes, distance clamp."""
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp(prefix="pmm_test_logs_")
+        self.config = _make_config(
+            csv_log_enabled=False,
+            csv_log_dir=self.tmpdir,
+            skew_max_bps=2.0,    # Phase 3 default
+            min_requote_bps=1.0,
+            force_requote_bps=15.0,
+        )
+        self.mock_market_data_provider = MagicMock(spec=MarketDataProvider)
+        self.mock_market_data_provider.time = MagicMock(return_value=1234567890.0)
+        self.mock_actions_queue = AsyncMock(spec=asyncio.Queue)
+        self.controller = PMMLeadLagSkewController(
+            config=self.config,
+            market_data_provider=self.mock_market_data_provider,
+            actions_queue=self.mock_actions_queue,
+        )
+        # Default: balances on connector
+        self.mock_market_data_provider.connectors = {
+            "binance": _make_mock_connector("0.0005", "200"),
+        }
+        # Default: no candles → fall back to neutral vol
+        self.mock_market_data_provider.get_candles_df = MagicMock(return_value=None)
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    # ── Volatility ───────────────────────────────────────────────────────
+
+    async def test_vol_neutral_when_no_candles(self):
+        """No candles_df → spread_multiplier = 1 (neutral fallback)."""
+        self.mock_market_data_provider.get_price_by_type = MagicMock(return_value=Decimal("400000"))
+        await self.controller.update_processed_data()
+        self.assertEqual(self.controller.processed_data["spread_multiplier"], Decimal("1"))
+        self.assertAlmostEqual(self.controller.processed_data["vol_ratio"], 1.0)
+
+    async def test_vol_high_short_expands_spread(self):
+        """σ_short > σ_ref → vol_ratio > 1 → spread_multiplier > 1."""
+        import pandas as pd
+        # 360 close prices: first 330 calm, last 30 volatile
+        calm = [100000.0 + (i % 3) for i in range(330)]
+        wild = [100000.0 + 1000 * (1 if i % 2 else -1) for i in range(30)]
+        df = pd.DataFrame({"close": calm + wild})
+        self.mock_market_data_provider.get_candles_df = MagicMock(return_value=df)
+        self.mock_market_data_provider.get_price_by_type = MagicMock(return_value=Decimal("100000"))
+
+        await self.controller.update_processed_data()
+        self.assertGreater(self.controller.processed_data["vol_ratio"], 1.0)
+        self.assertGreaterEqual(self.controller.processed_data["spread_multiplier"], Decimal("1"))
+
+    async def test_vol_capped_at_3(self):
+        """Even with extreme σ_short, multiplier capped at 3.0."""
+        import pandas as pd
+        calm = [100000.0] * 360
+        wild = [100000.0 + 5000 * (1 if i % 2 else -1) for i in range(30)]
+        df = pd.DataFrame({"close": calm[:330] + wild})
+        self.mock_market_data_provider.get_candles_df = MagicMock(return_value=df)
+        self.mock_market_data_provider.get_price_by_type = MagicMock(return_value=Decimal("100000"))
+
+        await self.controller.update_processed_data()
+        self.assertLessEqual(self.controller.processed_data["spread_multiplier"], Decimal("3.0"))
+
+    # ── §5.6 Distance clamp ──────────────────────────────────────────────
+
+    async def test_buy_price_clamped_below_mid(self):
+        """A buy price >= mid must be pulled back to mid - margin."""
+        self.mock_market_data_provider.get_price_by_type = MagicMock(return_value=Decimal("400000"))
+        await self.controller.update_processed_data()
+
+        cfg = self.controller.get_executor_config(
+            "buy_0", price=Decimal("400100"), amount=Decimal("0.0001"),
+        )
+        self.assertIsNotNone(cfg)
+        self.assertLess(cfg.entry_price, Decimal("400000"))
+
+    async def test_sell_price_clamped_above_mid(self):
+        """A sell price <= mid must be pushed up to mid + margin."""
+        self.mock_market_data_provider.get_price_by_type = MagicMock(return_value=Decimal("400000"))
+        await self.controller.update_processed_data()
+
+        cfg = self.controller.get_executor_config(
+            "sell_0", price=Decimal("399900"), amount=Decimal("0.0001"),
+        )
+        self.assertIsNotNone(cfg)
+        self.assertGreater(cfg.entry_price, Decimal("400000"))
+
+    async def test_clamp_does_not_alter_safe_prices(self):
+        """A buy price already < mid is left alone."""
+        self.mock_market_data_provider.get_price_by_type = MagicMock(return_value=Decimal("400000"))
+        await self.controller.update_processed_data()
+
+        safe_buy = Decimal("399000")
+        cfg = self.controller.get_executor_config("buy_0", price=safe_buy, amount=Decimal("0.0001"))
+        self.assertEqual(cfg.entry_price, safe_buy)
+
+    # ── Skew with skew_max_bps=2 ─────────────────────────────────────────
+
+    async def test_long_inventory_shifts_reference_below_mid(self):
+        """Long base + skew_max_bps>0 → reference < mid (sell-favoring)."""
+        self.mock_market_data_provider.connectors = {
+            "binance": _make_mock_connector("0.001", "100"),  # heavily long
+        }
+        self.mock_market_data_provider.get_price_by_type = MagicMock(return_value=Decimal("400000"))
+        await self.controller.update_processed_data()
+        ref = self.controller.processed_data["reference_price"]
+        mid = self.controller.processed_data["mid_price"]
+        self.assertLess(ref, mid)
+
+    # ── Requote brakes (§5.7) ────────────────────────────────────────────
+
+    def _make_executor(self, executor_id, level_id, entry_price, *, is_active=True, is_trading=False, age_sec=120):
+        """Build a minimal mock ExecutorInfo with the fields used by the brakes."""
+        executor = MagicMock()
+        executor.id = executor_id
+        executor.is_active = is_active
+        executor.is_trading = is_trading
+        executor.timestamp = self.mock_market_data_provider.time() - age_sec
+        executor.config = MagicMock()
+        executor.config.entry_price = entry_price
+        executor.custom_info = {"level_id": level_id}
+        return executor
+
+    async def test_min_requote_brake_skips_small_delta(self):
+        """When new price differs by < min_requote_bps from current, refresh is skipped."""
+        self.mock_market_data_provider.get_price_by_type = MagicMock(return_value=Decimal("400000"))
+        await self.controller.update_processed_data()
+
+        # New price for buy_0 = ref * (1 - 0.0010) = 400000 * 0.999 = 399600
+        # Set executor at 399599.99 → delta < 1 bps → must skip
+        executor = self._make_executor("e1", "buy_0", Decimal("399599.99"))
+        self.controller.executors_info = [executor]
+        actions = self.controller.executors_to_refresh()
+        self.assertEqual(len(actions), 0, "Small delta should suppress refresh")
+
+    async def test_min_requote_brake_allows_large_delta(self):
+        """When new price differs by >= min_requote_bps, refresh proceeds."""
+        self.mock_market_data_provider.get_price_by_type = MagicMock(return_value=Decimal("400000"))
+        await self.controller.update_processed_data()
+
+        # entry far from new price → delta >> 1 bps → refresh
+        executor = self._make_executor("e1", "buy_0", Decimal("390000"))
+        self.controller.executors_info = [executor]
+        actions = self.controller.executors_to_refresh()
+        self.assertEqual(len(actions), 1)
+
+    async def test_force_requote_brake_stops_stale_executor_early(self):
+        """Executor whose new price differs by >= force_requote_bps is force-stopped."""
+        self.mock_market_data_provider.get_price_by_type = MagicMock(return_value=Decimal("400000"))
+        await self.controller.update_processed_data()
+
+        # entry at 380000 vs new ~399600 → delta ≈ 515 bps >> 15
+        executor = self._make_executor("e1", "buy_0", Decimal("380000"), age_sec=5)
+        self.controller.executors_info = [executor]
+        actions = self.controller.executors_to_early_stop()
+        self.assertEqual(len(actions), 1)
+        self.assertEqual(actions[0].executor_id, "e1")
+
+    async def test_force_requote_does_not_stop_fresh_executor(self):
+        """Executor whose new price is close → no early stop."""
+        self.mock_market_data_provider.get_price_by_type = MagicMock(return_value=Decimal("400000"))
+        await self.controller.update_processed_data()
+
+        # delta ~0 → no early stop
+        executor = self._make_executor("e1", "buy_0", Decimal("399600"), age_sec=5)
+        self.controller.executors_info = [executor]
+        actions = self.controller.executors_to_early_stop()
+        self.assertEqual(len(actions), 0)
+
+    async def test_force_requote_skips_trading_executor(self):
+        """Executors that are trading (in flight) are never early-stopped."""
+        self.mock_market_data_provider.get_price_by_type = MagicMock(return_value=Decimal("400000"))
+        await self.controller.update_processed_data()
+
+        executor = self._make_executor("e1", "buy_0", Decimal("380000"), is_trading=True)
+        self.controller.executors_info = [executor]
+        actions = self.controller.executors_to_early_stop()
+        self.assertEqual(len(actions), 0)
+
+
 if __name__ == "__main__":
     unittest.main()

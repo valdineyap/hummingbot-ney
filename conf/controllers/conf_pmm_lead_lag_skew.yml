@@ -45,9 +45,17 @@ max_net_position_quote: 60       # ~30% de R$200 — hard cap absoluto em BRL
 # ── Skew (Fase 3) ────────────────────────────────────────────────────────
 w_inv: 1.0
 w_lead: 0.0                      # lead-lag desligado até Fase 5
-skew_max_bps: 0.0                # 0 em Fase 1; Fase3=2, teto=8
+skew_max_bps: 2                  # Fase3=2; subir para 4 com evidência empírica; teto absoluto=8
 min_maker_distance_bps: 1
-min_requote_bps: 1
+min_requote_bps: 1               # piso para refresh natural (evita churn)
+force_requote_bps: 15            # teto para escape de ordem stale em mercado rápido
+
+# ── Volatilidade (Fase 3) ────────────────────────────────────────────────
+candles_connector: binance       # blank → mesmo connector_name
+candles_trading_pair: BTC-BRL    # blank → mesmo trading_pair
+candles_interval: 1m
+vol_short_length: 30             # 30 minutos para σ de curto prazo
+vol_ref_length:   360            # 6h para σ de referência
 
 # ── Lead-lag (Fase 5) ────────────────────────────────────────────────────
 basis_deadband_bps: 3

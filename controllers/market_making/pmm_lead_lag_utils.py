@@ -169,6 +169,37 @@ def compute_vol_state(
     return VolState(vol_ratio=ratio, spread_multiplier=mult)
 
 
+def compute_volatility_from_prices(prices) -> float:
+    """
+    Compute σ of log returns from a sequence of prices.
+    Returns 0.0 when input is empty, too short, or contains non-positive values.
+    Used by the controller to derive σ_short and σ_ref from candles.
+    """
+    if prices is None:
+        return 0.0
+    try:
+        seq = list(prices)
+    except TypeError:
+        return 0.0
+    if len(seq) < 2:
+        return 0.0
+    log_returns = []
+    prev = None
+    for p in seq:
+        try:
+            x = float(p)
+        except (TypeError, ValueError):
+            return 0.0
+        if prev is not None and prev > 0 and x > 0:
+            log_returns.append(math.log(x / prev))
+        prev = x
+    if len(log_returns) < 2:
+        return 0.0
+    mean = sum(log_returns) / len(log_returns)
+    var = sum((r - mean) ** 2 for r in log_returns) / (len(log_returns) - 1)
+    return math.sqrt(var)
+
+
 def compute_lead_state(
     mid_brl: Decimal,
     fair_brl: Decimal,
@@ -259,20 +290,24 @@ def compute_order_params(
     mid_price: Decimal,
     skew_state: SkewState,
     regime_state: RegimeState,
+    vol_state: VolState,
     side_perms: SidePermissions,
 ) -> OrderParams:
     """
-    Combine skew and regime into final order parameters.
+    Combine skew, vol and regime into final order parameters (plan §5.3).
 
     ref_adj = mid * (1 - price_shift_bps / 10000)
     shift > 0 → ref < mid → lower bids + lower asks → sell-favoring.
-    shift < 0 → ref > mid → higher bids + higher asks → defensive (e.g. leader moved up).
+    shift < 0 → ref > mid → higher bids + higher asks → defensive.
+
+    spread_multiplier = vol_multiplier * regime_multiplier
+      vol_multiplier in [1.0, 3.0]; regime_multiplier = 1.0 (normal) or 1.5 (degraded).
     """
     ref_adj = mid_price * (Decimal("1") - skew_state.price_shift_bps / Decimal("10000"))
-    spread_mult = Decimal(str(regime_state.spread_multiplier))
+    combined_mult = Decimal(str(vol_state.spread_multiplier)) * Decimal(str(regime_state.spread_multiplier))
     return OrderParams(
         reference_price=ref_adj,
-        spread_multiplier=spread_mult,
+        spread_multiplier=combined_mult,
         price_shift_bps=skew_state.price_shift_bps,
         buy_enabled=side_perms.buy_enabled,
         sell_enabled=side_perms.sell_enabled,

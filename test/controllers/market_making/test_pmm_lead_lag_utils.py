@@ -19,6 +19,7 @@ from controllers.market_making.pmm_lead_lag_utils import (
     compute_size_factors,
     compute_skew_state,
     compute_vol_state,
+    compute_volatility_from_prices,
 )
 
 
@@ -239,39 +240,74 @@ class TestComputeOrderParams(unittest.TestCase):
     def _make_regime(self, mult=1.0):
         return RegimeState(regime="normal", spread_multiplier=mult)
 
+    def _make_vol(self, mult=1.0):
+        return VolState(vol_ratio=mult, spread_multiplier=mult)
+
     def _make_perms(self, buy=True, sell=True):
         return SidePermissions(buy_enabled=buy, sell_enabled=sell)
 
+    def _call(self, mid, shift=0.0, regime_mult=1.0, vol_mult=1.0, buy=True, sell=True):
+        return compute_order_params(
+            mid_price=mid,
+            skew_state=self._make_skew(shift),
+            regime_state=self._make_regime(regime_mult),
+            vol_state=self._make_vol(vol_mult),
+            side_perms=self._make_perms(buy, sell),
+        )
+
     def test_zero_shift_ref_equals_mid(self):
         mid = Decimal("350000")
-        params = compute_order_params(mid, self._make_skew(0.0), self._make_regime(), self._make_perms())
+        params = self._call(mid, shift=0.0)
         self.assertEqual(params.reference_price, mid)
 
     def test_positive_shift_lowers_reference(self):
         """shift > 0 → ref < mid (sell-favoring)."""
         mid = Decimal("350000")
-        params = compute_order_params(mid, self._make_skew(4.0), self._make_regime(), self._make_perms())
+        params = self._call(mid, shift=4.0)
         self.assertLess(params.reference_price, mid)
 
     def test_negative_shift_raises_reference(self):
         """shift < 0 → ref > mid (defensive)."""
         mid = Decimal("350000")
-        params = compute_order_params(mid, self._make_skew(-4.0), self._make_regime(), self._make_perms())
+        params = self._call(mid, shift=-4.0)
         self.assertGreater(params.reference_price, mid)
 
-    def test_regime_multiplier_propagates(self):
-        params = compute_order_params(
-            Decimal("350000"), self._make_skew(), self._make_regime(mult=1.5), self._make_perms()
-        )
-        self.assertEqual(params.spread_multiplier, Decimal("1.5"))
+    def test_combined_spread_multiplier_is_vol_times_regime(self):
+        """§5.3 — final spread_multiplier = vol_mult * regime_mult."""
+        params = self._call(Decimal("350000"), regime_mult=1.5, vol_mult=2.0)
+        self.assertEqual(params.spread_multiplier, Decimal("2.0") * Decimal("1.5"))
 
     def test_side_permissions_propagate(self):
-        params = compute_order_params(
-            Decimal("350000"), self._make_skew(), self._make_regime(),
-            self._make_perms(buy=False, sell=True)
-        )
+        params = self._call(Decimal("350000"), buy=False, sell=True)
         self.assertFalse(params.buy_enabled)
         self.assertTrue(params.sell_enabled)
+
+
+class TestComputeVolatilityFromPrices(unittest.TestCase):
+    """Phase 3 — σ of log returns from price arrays."""
+
+    def test_constant_prices_zero_volatility(self):
+        self.assertEqual(compute_volatility_from_prices([100.0] * 30), 0.0)
+
+    def test_empty_returns_zero(self):
+        self.assertEqual(compute_volatility_from_prices([]), 0.0)
+        self.assertEqual(compute_volatility_from_prices(None), 0.0)
+        self.assertEqual(compute_volatility_from_prices([100.0]), 0.0)
+
+    def test_non_positive_prices_returns_zero(self):
+        self.assertEqual(compute_volatility_from_prices([100, 0, 100]), 0.0)
+        self.assertEqual(compute_volatility_from_prices([100, -1, 100]), 0.0)
+
+    def test_increasing_volatility(self):
+        """Larger swings → larger σ."""
+        small = [100.0 + i * 0.01 for i in range(30)]
+        large = [100.0 + i * 1.0 for i in range(30)]
+        sigma_small = compute_volatility_from_prices(small)
+        sigma_large = compute_volatility_from_prices(large)
+        self.assertLess(sigma_small, sigma_large)
+
+    def test_handles_non_numeric_gracefully(self):
+        self.assertEqual(compute_volatility_from_prices(["foo", "bar"]), 0.0)
 
 
 class TestLeadAndRegimeStubs(unittest.TestCase):
