@@ -25,10 +25,11 @@ from hummingbot.strategy_v2.executors.position_executor.data_types import Positi
 from hummingbot.strategy_v2.models.executor_actions import ExecutorAction, StopExecutorAction
 
 from controllers.market_making.pmm_lead_lag_utils import (
+    RegimeState,
+    SkewState,
     compute_inventory_state,
     compute_lead_state,
     compute_order_params,
-    compute_regime_state,
     compute_side_permissions,
     compute_size_factors,
     compute_skew_state,
@@ -173,6 +174,45 @@ class PMMLeadLagSkewConfig(MarketMakingControllerConfigBase):
     max_leader_staleness_sec: float = Field(default=5.0, gt=0.0)
     max_usdt_brl_staleness_sec: float = Field(default=15.0, gt=0.0)
 
+    # ── Regime + kill switch (Phase 4) ───────────────────────────────────
+    vol_degraded_threshold_mult: float = Field(
+        default=3.0, gt=0.0,
+        json_schema_extra={"prompt": "Vol ratio threshold to enter degraded (e.g. 3.0): ", "is_updatable": True},
+    )
+    vol_pause_threshold_mult: float = Field(
+        default=5.0, gt=0.0,
+        json_schema_extra={"prompt": "Vol ratio threshold to enter paused (e.g. 5.0): ", "is_updatable": True},
+    )
+    pause_basis_bps: float = Field(
+        default=30.0, gt=0.0,
+        json_schema_extra={"prompt": "|basis_bps| above this triggers paused (e.g. 30): ", "is_updatable": True},
+    )
+    pause_release_sec: float = Field(
+        default=60.0, gt=0.0,
+        json_schema_extra={"prompt": "Dwell seconds before exiting paused (e.g. 60): ", "is_updatable": True},
+    )
+    safe_mode_entry_sec: float = Field(
+        default=120.0, gt=0.0,
+        json_schema_extra={"prompt": "Sustained L1 seconds to enter safe mode (e.g. 120): ", "is_updatable": True},
+    )
+    safe_thrash_window_sec: float = Field(
+        default=600.0, gt=0.0,
+        json_schema_extra={"prompt": "Window for thrash detection in seconds (e.g. 600): ", "is_updatable": True},
+    )
+    max_session_drawdown_quote: Decimal = Field(
+        default=Decimal("10"),
+        json_schema_extra={"prompt": "Max session drawdown in quote (BRL) before kill: ", "is_updatable": True},
+    )
+    critical_error_threshold: int = Field(default=5, gt=0)
+
+    @field_validator("vol_pause_threshold_mult")
+    @classmethod
+    def _pause_gt_degraded(cls, v: float, info: ValidationInfo) -> float:
+        deg = info.data.get("vol_degraded_threshold_mult")
+        if deg is not None and v <= deg:
+            raise ValueError(f"vol_pause_threshold_mult ({v}) must be > vol_degraded_threshold_mult ({deg})")
+        return v
+
     # ── Logging (Phase 2) ─────────────────────────────────────────────────
     csv_log_dir: str = Field(
         default="logs/pmm_lead_lag",
@@ -200,6 +240,17 @@ class PMMLeadLagSkewController(MarketMakingControllerBase):
         # CSV signals logger (lazy init: opened on first write)
         self._csv_path: str = os.path.join(self.config.csv_log_dir, "signals.csv")
         self._csv_initialized: bool = False
+        # Phase 4 — regime state machine (§4.3)
+        # `_last_l2_time` uses -inf so the very first tick (when now is 0 in tests)
+        # cannot be inside the dwell window from a non-existent L2 entry.
+        self._l1_entry_time: Optional[float] = None
+        self._safe_entry_time: Optional[float] = None
+        self._last_l2_time: float = float("-inf")
+        self._l2_timestamps: List[float] = []
+        self._is_killed: bool = False
+        self._regime_cause: str = ""
+        self._seen_executor_ids: set = set()
+        self._session_pnl: float = 0.0
 
     # ── Candles config (Phase 3) ─────────────────────────────────────────
 
@@ -263,6 +314,131 @@ class PMMLeadLagSkewController(MarketMakingControllerBase):
             return Decimal("0"), Decimal("0")
         return base, quote
 
+    # ── Regime helpers (Phase 4) ─────────────────────────────────────────
+
+    def _update_session_pnl(self) -> None:
+        """
+        Accumulate net_pnl_quote from completed executors. Tracks executor IDs
+        in _seen_executor_ids to avoid double-counting across update_processed_data
+        ticks.
+        """
+        for executor in self.executors_info:
+            ex_id = getattr(executor, "id", None)
+            if ex_id is None or ex_id in self._seen_executor_ids:
+                continue
+            if not getattr(executor, "is_done", False):
+                continue
+            try:
+                pnl = float(getattr(executor, "net_pnl_quote", 0.0) or 0.0)
+            except (TypeError, ValueError):
+                pnl = 0.0
+            self._session_pnl += pnl
+            self._seen_executor_ids.add(ex_id)
+
+    def _trigger_kill(self, reason: str) -> None:
+        """Latch the kill switch — only logs CRITICAL once per kill event."""
+        if not self._is_killed:
+            self._is_killed = True
+            self._regime_cause = reason
+            try:
+                self.logger().critical(f"[PMM Lead-Lag] Kill switch triggered: {reason}")
+            except Exception:
+                pass
+
+    def _record_l2_transition(self, now: float) -> None:
+        """Track L2 entries within the thrash window for safe-mode escalation."""
+        self._l2_timestamps.append(now)
+        cutoff = now - self.config.safe_thrash_window_sec
+        self._l2_timestamps = [t for t in self._l2_timestamps if t >= cutoff]
+
+    def _l2_transitions_in_window(self, window_sec: float, now: float) -> int:
+        cutoff = now - window_sec
+        return sum(1 for t in self._l2_timestamps if t >= cutoff)
+
+    def _evaluate_regime(self, vol_state, inv_state, basis_bps: float, now: float) -> str:
+        """
+        Plan §4 — five-level state machine: normal | degraded | safe | paused | killed.
+
+        L3 latches; L2 has dwell of pause_release_sec; safe (L1.5) has dwell of
+        2 × pause_release_sec; L1 (degraded) escalates to L1.5 after sustained
+        time or thrash detection.
+
+        Mutates self._regime_cause for telemetry and self._{l1,safe,l2}_* state.
+        """
+        c = self.config
+
+        # L3 — kill (latching)
+        if self._is_killed:
+            return "killed"
+        try:
+            max_dd = float(c.max_session_drawdown_quote)
+        except (TypeError, ValueError):
+            max_dd = 0.0
+        if max_dd > 0 and self._session_pnl < -max_dd:
+            self._trigger_kill(f"session_pnl={self._session_pnl:.2f} < -{max_dd:.2f}")
+            return "killed"
+        if inv_state.in_kill:
+            self._trigger_kill(f"|delta|={abs(inv_state.delta):.3f} >= inv_kill={c.inv_kill}")
+            return "killed"
+        if self.processed_data.get("over_max_net_position", False):
+            try:
+                exp = float(self.processed_data.get("net_exposure_quote", 0))
+                cap = float(c.max_net_position_quote)
+            except (TypeError, ValueError):
+                exp, cap = 0.0, 0.0
+            self._trigger_kill(f"net_exposure={exp:.2f} > max_net_position={cap:.2f}")
+            return "killed"
+
+        # L2 — paused (vol or basis)
+        l2_vol = vol_state.vol_ratio > c.vol_pause_threshold_mult
+        l2_basis = abs(basis_bps) > c.pause_basis_bps
+        if l2_vol or l2_basis:
+            if l2_vol:
+                self._regime_cause = f"vol_ratio={vol_state.vol_ratio:.2f}>{c.vol_pause_threshold_mult}"
+            else:
+                self._regime_cause = f"|basis|={abs(basis_bps):.1f}>{c.pause_basis_bps}"
+            self._last_l2_time = now
+            self._record_l2_transition(now)
+            return "paused"
+        if now - self._last_l2_time < c.pause_release_sec:
+            remaining = c.pause_release_sec - (now - self._last_l2_time)
+            self._regime_cause = f"paused_dwell({remaining:.0f}s remaining)"
+            return "paused"
+
+        # Safe-mode dwell — once entered, stays for 2×pause_release_sec
+        if self._safe_entry_time is not None:
+            safe_elapsed = now - self._safe_entry_time
+            if safe_elapsed < 2.0 * c.pause_release_sec:
+                self._regime_cause = f"safe_dwell({safe_elapsed:.0f}s/{2*c.pause_release_sec:.0f}s)"
+                return "safe"
+            # Dwell expired — re-evaluate normally below
+
+        # L1 — degraded
+        l1 = vol_state.vol_ratio > c.vol_degraded_threshold_mult
+        if not l1:
+            self._l1_entry_time = None
+            self._safe_entry_time = None
+            self._regime_cause = ""
+            return "normal"
+
+        if self._l1_entry_time is None:
+            self._l1_entry_time = now
+
+        l1_duration = now - self._l1_entry_time
+        thrash_count = self._l2_transitions_in_window(c.safe_thrash_window_sec, now)
+        self._regime_cause = f"vol_ratio={vol_state.vol_ratio:.2f}>{c.vol_degraded_threshold_mult}"
+
+        if l1_duration > c.safe_mode_entry_sec or thrash_count >= 2:
+            if self._safe_entry_time is None:
+                self._safe_entry_time = now
+            extra = (f"l1_dur={l1_duration:.0f}s" if l1_duration > c.safe_mode_entry_sec
+                     else f"thrash={thrash_count}")
+            self._regime_cause = f"{self._regime_cause} -> safe({extra})"
+            return "safe"
+
+        self._safe_entry_time = None
+        return "degraded"
+
     # ── Data update ───────────────────────────────────────────────────────
 
     async def update_processed_data(self):
@@ -300,16 +476,47 @@ class PMMLeadLagSkewController(MarketMakingControllerBase):
             inv_kill=self.config.inv_kill,
         )
 
-        regime_state = compute_regime_state(vol_state, inv_state)
+        # §2.5 — net exposure in quote (base value at mid). Phase 4 uses this
+        # flag to trigger the kill switch inside _evaluate_regime.
+        net_exposure_quote = base_bal * mid_dec
+        over_max_net_position = net_exposure_quote > self.config.max_net_position_quote
+        # Expose to _evaluate_regime via processed_data BEFORE we evaluate.
+        self.processed_data["over_max_net_position"] = over_max_net_position
+        self.processed_data["net_exposure_quote"] = net_exposure_quote
 
-        # Phase 1: skew = 0 (w_lead=0, skew_max_bps=0 by default)
-        skew_state = compute_skew_state(
-            s_inv=inv_state.s_inv,
-            s_lead_regime=lead_state.s_lead_regime,
-            w_inv=self.config.w_inv,
-            w_lead=self.config.w_lead,
-            skew_max_bps=self.config.skew_max_bps,
+        # Phase 4 — regime state machine (§4.3). Uses inv_state.in_kill,
+        # over_max_net_position and session pnl as kill triggers.
+        self._update_session_pnl()
+        try:
+            now = float(self.market_data_provider.time())
+        except (TypeError, ValueError):
+            now = 0.0
+        regime = self._evaluate_regime(vol_state, inv_state, lead_state.basis_bps, now)
+        _regime_mult_map = {
+            "normal": 1.0, "degraded": 1.5, "safe": 2.5,
+            "paused": 1.0, "killed": 1.0,
+        }
+        regime_state = RegimeState(
+            regime=regime,
+            spread_multiplier=_regime_mult_map.get(regime, 1.0),
         )
+
+        # Phase 4 — zero skew in elevated regimes (safe/paused/killed) so the
+        # bot doesn't keep biasing prices while protective measures are active.
+        if regime in ("safe", "paused", "killed"):
+            skew_state = SkewState(
+                skew_raw=0.0,
+                skew_norm=0.0,
+                price_shift_bps=Decimal("0"),
+            )
+        else:
+            skew_state = compute_skew_state(
+                s_inv=inv_state.s_inv,
+                s_lead_regime=lead_state.s_lead_regime,
+                w_inv=self.config.w_inv,
+                w_lead=self.config.w_lead,
+                skew_max_bps=self.config.skew_max_bps,
+            )
 
         # Side permissions: trigger at inv_hard_cap, release at inv_hard_band (§2.4 hysteresis)
         side_perms = compute_side_permissions(
@@ -336,11 +543,6 @@ class PMMLeadLagSkewController(MarketMakingControllerBase):
             hard_band=self.config.inv_hard_band,
         )
 
-        # §2.5 — net exposure in quote (base value at mid). Phase 2 only flags it;
-        # Phase 4 will trigger kill switch when it exceeds max_net_position_quote.
-        net_exposure_quote = base_bal * mid_dec
-        over_max_net_position = net_exposure_quote > self.config.max_net_position_quote
-
         self.processed_data = {
             "reference_price": order_params.reference_price,
             "spread_multiplier": order_params.spread_multiplier,
@@ -358,6 +560,8 @@ class PMMLeadLagSkewController(MarketMakingControllerBase):
             "basis_bps": lead_state.basis_bps,
             "vol_ratio": vol_state.vol_ratio,
             "regime": regime_state.regime,
+            "regime_cause": self._regime_cause,
+            "session_pnl": self._session_pnl,
             "sides_enabled": {
                 "buy": order_params.buy_enabled,
                 "sell": order_params.sell_enabled,
@@ -374,30 +578,54 @@ class PMMLeadLagSkewController(MarketMakingControllerBase):
     # ── Level selection ───────────────────────────────────────────────────
 
     def get_levels_to_execute(self) -> List[str]:
-        """Filter levels by sides_enabled (Phase 2: driven by inventory bands)."""
+        """
+        Filter levels by sides_enabled (Phase 2) and regime (Phase 4):
+          - paused / killed: no orders.
+          - safe: at most one buy + one sell level (the first of each side).
+          - normal / degraded: full configured ladder, modulo sides_enabled.
+        """
+        regime = self.processed_data.get("regime", "normal")
+        if regime in ("paused", "killed"):
+            return []
         levels = super().get_levels_to_execute()
         sides = self.processed_data.get("sides_enabled", {"buy": True, "sell": True})
-        return [
+        levels = [
             lv for lv in levels
             if (lv.startswith("buy") and sides.get("buy", True)) or
                (lv.startswith("sell") and sides.get("sell", True))
         ]
+        if regime == "safe":
+            buy_levels = [lv for lv in levels if lv.startswith("buy")]
+            sell_levels = [lv for lv in levels if lv.startswith("sell")]
+            return buy_levels[:1] + sell_levels[:1]
+        return levels
 
     # ── Executor config ───────────────────────────────────────────────────
 
     def get_executor_config(self, level_id: str, price: Decimal, amount: Decimal):
         """
-        Create PositionExecutorConfig for a given level, applying inventory size_factor
-        and §5.6 distance clamp (orders must not cross mid).
+        Create PositionExecutorConfig for a given level, applying inventory and
+        regime size factors plus §5.6 distance clamp (orders must not cross mid).
 
-        Returns None when size_factor=0 (adversa side beyond hard_band).
+        Returns None when size_factor=0 (adversa side beyond hard_band) or when
+        the regime is paused/killed.
         """
+        regime = self.processed_data.get("regime", "normal")
+        if regime in ("paused", "killed"):
+            return None
+
         trade_type = self.get_trade_type_from_level_id(level_id)
         size_factors: Dict[str, float] = self.processed_data.get(
             "size_factors", {"buy": 1.0, "sell": 1.0},
         )
         size_factor = Decimal(str(size_factors.get(trade_type.name.lower(), 1.0)))
-        if size_factor == Decimal("0"):
+        # Regime-driven size shrink (§4 table): degraded → 0.5×, safe → 0.25×.
+        regime_sf = {
+            "degraded": Decimal("0.5"),
+            "safe": Decimal("0.25"),
+        }.get(regime, Decimal("1"))
+        size_factor = size_factor * regime_sf
+        if size_factor <= Decimal("0"):
             return None
 
         clamped_price = self._clamp_to_mid(price, trade_type)
@@ -472,32 +700,68 @@ class PMMLeadLagSkewController(MarketMakingControllerBase):
 
     def executors_to_early_stop(self) -> List[ExecutorAction]:
         """
-        Force-stop executors whose new price differs by ≥ force_requote_bps,
-        even before their refresh time — protects against stale orders being
-        sniped in fast markets (§5.7).
+        Combine three early-stop drivers:
+          1. force_requote_bps (§5.7) — stale-order protection in fast markets.
+          2. paused / killed regime (§4) — cancel all active resting orders.
+          3. safe regime (§4) — keep only buy_0 / sell_0 active; cancel deeper.
+
+        Active trading positions (is_trading=True) are never cancelled here —
+        triple-barrier handles them.
         """
-        actions = list(super().executors_to_early_stop())
+        base_actions = list(super().executors_to_early_stop())
         threshold = Decimal(str(self.config.force_requote_bps))
+        regime = self.processed_data.get("regime", "normal")
+        stopped_ids = {getattr(a, "executor_id", None) for a in base_actions}
+        extra: List[ExecutorAction] = []
+
         for executor in self.executors_info:
             if not executor.is_active or executor.is_trading:
                 continue
-            delta_bps = self._delta_bps_for_executor(executor)
-            if delta_bps is not None and delta_bps >= threshold:
-                actions.append(StopExecutorAction(
+            if executor.id in stopped_ids:
+                continue
+
+            # Paused / killed: cancel any resting order.
+            if regime in ("paused", "killed"):
+                extra.append(StopExecutorAction(
                     controller_id=self.config.id,
                     executor_id=executor.id,
                 ))
-        return actions
+                stopped_ids.add(executor.id)
+                continue
+
+            # Safe mode: keep only buy_0 / sell_0; cancel the rest.
+            if regime == "safe":
+                custom_info = getattr(executor, "custom_info", None) or {}
+                level_id = custom_info.get("level_id", "")
+                if level_id and level_id not in ("buy_0", "sell_0", "position_rebalance"):
+                    extra.append(StopExecutorAction(
+                        controller_id=self.config.id,
+                        executor_id=executor.id,
+                    ))
+                    stopped_ids.add(executor.id)
+                    continue
+
+            # Force-requote when price drifted beyond force_requote_bps.
+            delta_bps = self._delta_bps_for_executor(executor)
+            if delta_bps is not None and delta_bps >= threshold:
+                extra.append(StopExecutorAction(
+                    controller_id=self.config.id,
+                    executor_id=executor.id,
+                ))
+                stopped_ids.add(executor.id)
+
+        return base_actions + extra
 
     # ── CSV logging (Phase 2) ─────────────────────────────────────────────
 
     _CSV_COLUMNS = (
-        "ts", "regime", "mid", "ref", "shift_bps", "spread_mult",
+        "ts", "regime", "regime_cause", "mid", "ref", "shift_bps", "spread_mult",
         "base_bal", "quote_bal", "net_exposure_quote", "over_max_net_position",
         "inv_pct", "inv_delta", "s_inv",
         "s_lead_micro", "s_lead_regime", "basis_bps", "vol_ratio",
         "buy_enabled", "sell_enabled",
         "sf_buy", "sf_sell",
+        "session_pnl",
     )
 
     def _csv_log_signals(self) -> None:
@@ -510,6 +774,7 @@ class PMMLeadLagSkewController(MarketMakingControllerBase):
         row = {
             "ts": self.market_data_provider.time(),
             "regime": d.get("regime", "normal"),
+            "regime_cause": d.get("regime_cause", ""),
             "mid": str(d.get("mid_price", "")),
             "ref": str(d.get("reference_price", "")),
             "shift_bps": str(d.get("price_shift_bps", "")),
@@ -529,6 +794,7 @@ class PMMLeadLagSkewController(MarketMakingControllerBase):
             "sell_enabled": d.get("sides_enabled", {}).get("sell", True),
             "sf_buy": d.get("size_factors", {}).get("buy", ""),
             "sf_sell": d.get("size_factors", {}).get("sell", ""),
+            "session_pnl": d.get("session_pnl", 0.0),
         }
         write_header = not self._csv_initialized and not os.path.exists(self._csv_path)
         try:
@@ -547,6 +813,7 @@ class PMMLeadLagSkewController(MarketMakingControllerBase):
         """Return human-readable status lines for the Hummingbot status command."""
         d = self.processed_data
         regime = d.get("regime", "N/A")
+        regime_cause = d.get("regime_cause", "")
         inv_pct = d.get("inv_pct", 0.5)
         sides = d.get("sides_enabled", {"buy": True, "sell": True})
         ref_price = d.get("reference_price", "N/A")
@@ -556,14 +823,17 @@ class PMMLeadLagSkewController(MarketMakingControllerBase):
         sf = d.get("size_factors", {"buy": 1.0, "sell": 1.0})
         net_exp = d.get("net_exposure_quote", Decimal("0"))
         over_cap = d.get("over_max_net_position", False)
-        cap_flag = " ⚠ OVER-CAP" if over_cap else ""
+        cap_flag = " ! OVER-CAP" if over_cap else ""
+        session_pnl = d.get("session_pnl", 0.0)
+        cause_str = f" ({regime_cause})" if regime_cause else ""
         return [
             f"── PMM Lead-Lag Skew ({self.config.trading_pair}) ──────────────────",
-            f"  Regime: {regime:<10}  Vol ratio: {vol_ratio:.2f}x  Spread mult: {spread_mult}",
+            f"  Regime: {regime:<10}{cause_str}  Vol ratio: {vol_ratio:.2f}x  Spread mult: {spread_mult}",
             f"  Ref price: {ref_price}  Shift: {shift_bps} bps",
             f"  Inventory: {inv_pct:.1%}  Buy: {'ON ' if sides.get('buy') else 'OFF'}  Sell: {'ON' if sides.get('sell') else 'OFF'}",
             f"  Size factors  buy: {sf.get('buy'):.2f}  sell: {sf.get('sell'):.2f}",
             f"  Net exposure (quote): {net_exp} / {self.config.max_net_position_quote}{cap_flag}",
+            f"  Session PnL (quote): {session_pnl:.4f}  Killed: {self._is_killed}",
         ]
 
     def get_custom_info(self) -> dict:
@@ -572,6 +842,9 @@ class PMMLeadLagSkewController(MarketMakingControllerBase):
         sf = d.get("size_factors", {"buy": 1.0, "sell": 1.0})
         return {
             "regime": d.get("regime", "normal"),
+            "regime_cause": d.get("regime_cause", ""),
+            "is_killed": self._is_killed,
+            "session_pnl": float(d.get("session_pnl", 0.0)),
             "inv_pct": round(d.get("inv_pct", 0.5), 4),
             "inv_delta": round(d.get("inv_delta", 0.0), 4),
             "s_inv": round(d.get("s_inv", 0.0), 4),

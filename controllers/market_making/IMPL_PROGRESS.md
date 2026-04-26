@@ -75,14 +75,47 @@ Commits: `5d6b1efc` (initial), `1992a90a` (gap fixes vs §2.2/2.3/2.4)
 - [x] 1 teste skew long → ref < mid
 - [x] 5 testes requote brakes (min skip/allow, force stop/no-stop/skip-trading)
 
-## ⏳ Próximas fases
+## ✅ Fase 4 — Regime + kill switch — concluída
 
-### Fase 4 — Regime + kill switch
-- [ ] L1/L1.5/L2/L3 state machine
-- [ ] vol_pause_threshold trigger
-- [ ] adverse_fill_ratio_10s métrica
-- [ ] max_session_drawdown_quote → kill
-- [ ] max_net_position_quote → kill (move flag de Phase 2 para gatilho)
+### Phase 4 A — máquina de regime (§4.3)
+- [x] `_evaluate_regime()` — L1/L1.5/L2/L3 state machine no controller
+- [x] L3 latching: kill por `inv_kill`, `max_net_position_quote`, `max_session_drawdown_quote`
+- [x] L2 paused: vol_ratio > vol_pause OR |basis| > pause_basis_bps
+- [x] L2 dwell: pause_release_sec após cessar condição
+- [x] L1.5 safe: l1_duration > safe_mode_entry_sec OR thrash ≥ 2
+- [x] L1.5 dwell: 2 × pause_release_sec após cessar condição (sticky)
+- [x] L1 degraded: vol_ratio > vol_degraded_threshold_mult
+
+### Phase 4 B — config + state vars
+- [x] PMMLeadLagSkewConfig: 8 novos campos (vol_degraded/pause_threshold_mult, pause_basis_bps, pause_release_sec, safe_mode_entry_sec, safe_thrash_window_sec, max_session_drawdown_quote, critical_error_threshold)
+- [x] field_validator: vol_pause > vol_degraded
+- [x] `__init__`: _l1_entry_time, _safe_entry_time, _last_l2_time(-inf), _l2_timestamps, _is_killed, _regime_cause, _seen_executor_ids, _session_pnl
+- [x] Helpers: _update_session_pnl, _trigger_kill, _record_l2_transition, _l2_transitions_in_window
+
+### Phase 4 C — orquestração no update_processed_data
+- [x] over_max_net_position + net_exposure_quote setados ANTES de _evaluate_regime
+- [x] _update_session_pnl acumula net_pnl_quote de executors completos via _seen_executor_ids
+- [x] regime evaluado ANTES de skew → skew zerado em safe/paused/killed
+- [x] regime → spread_multiplier (normal=1, degraded=1.5, safe=2.5, paused=1, killed=1) via RegimeState
+- [x] processed_data novo: regime_cause, session_pnl
+
+### Phase 4 D — efeitos do regime nos hooks do controller
+- [x] get_levels_to_execute: paused/killed → []; safe → 1 nível por lado
+- [x] get_executor_config: paused/killed → None; degraded → ×0.5; safe → ×0.25
+- [x] executors_to_early_stop: paused/killed → cancela tudo; safe → cancela > buy_0/sell_0; mantém force-requote
+- [x] to_format_status + get_custom_info: regime_cause, session_pnl, is_killed
+- [x] CSV: 23 colunas (adicionadas regime_cause e session_pnl)
+
+### Phase 4 E — testes (22 novos testes)
+- [x] regime states: normal/degraded/paused/safe/killed (10)
+- [x] kill triggers: inv_kill, max_net_position, session_drawdown, latch (4)
+- [x] level filter: paused→[], killed→[], safe→1+1, safe→shift=0 (4)
+- [x] size factors: degraded ×0.5, safe ×0.25 (2)
+- [x] cancel-all: paused/killed/safe(deeper) (3)
+- [x] telemetria: regime_cause, session_pnl, custom_info (2)
+- [x] testes Fase 1-3 atualizados: setUp Phase 3 com max_net_position=10000; vol_capped_at_3 com novo upper bound
+
+## ⏳ Próximas fases
 
 ### Fase 5 — Lead-lag (sintético + micro)
 - [ ] CandlesFeed BTC-USDT + USDT-BRL
