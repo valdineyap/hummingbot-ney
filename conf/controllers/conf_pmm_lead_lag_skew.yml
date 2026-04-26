@@ -36,10 +36,11 @@ skip_rebalance: true
 
 # ── Inventário (Fase 2) ──────────────────────────────────────────────────
 target_inventory_base_pct: 0.5
-inv_soft_band: 0.10
-inv_hard_band: 0.20
-inv_kill:      0.40
-max_net_position_quote: 60       # ~30% de R$200
+inv_soft_band: 0.10              # zona neutra de skew (size factor = 1.0)
+inv_hard_band: 0.20              # size factor adversa = 0; favorável = 1.5; retorno do one-sided
+inv_hard_cap:  0.30              # trigger one-sided (entrada; saída em hard_band — histeresis)
+inv_kill:      0.40              # kill switch L3
+max_net_position_quote: 60       # ~30% de R$200 — hard cap absoluto em BRL
 
 # ── Skew (Fase 3) ────────────────────────────────────────────────────────
 w_inv: 1.0

@@ -119,22 +119,41 @@ def compute_inventory_state(
     )
 
 
-def compute_size_factors(s_inv: float) -> Tuple[float, float]:
+def compute_size_factors(
+    delta: float,
+    soft_band: float,
+    hard_band: float,
+) -> Tuple[float, float]:
     """
-    Return (size_factor_buy, size_factor_sell).
+    Return (size_factor_buy, size_factor_sell) using plan §2.3 zone-based logic.
 
-    When s_inv > 0 (long base) → buy is penalized, sell gets bonus.
-    When s_inv < 0 (short base) → sell is penalized, buy gets bonus.
-    Bonus capped at 1.5x; penalty floored at 0.5x.
+    Convention: delta > 0 (long base) → BUY is the "adversa" side (pushes inventory
+    further out), SELL is "favoravel" (helps reduce inventory).
+
+    Zones:
+      |Δ| ≤ soft   : both factors = 1.0 (neutral zone)
+      soft < |Δ| ≤ hard : adversa decays 1.0→0.2 linearly; favoravel grows 1.0→1.5 capped
+      |Δ| > hard   : adversa = 0.0 (turn off side); favoravel = 1.5
+
+    See §2.3 unit-test invariant: when Δ > 0, size_factor_buy ≤ size_factor_sell.
     """
-    abs_s = abs(s_inv)
-    if s_inv > 0:
-        size_factor_buy = max(0.5, 1.0 - abs_s * 0.5)
-        size_factor_sell = min(1.5, 1.0 + abs_s * 0.5)
+    abs_dev = abs(delta)
+    if abs_dev <= soft_band:
+        return 1.0, 1.0
+
+    if abs_dev <= hard_band:
+        t = (abs_dev - soft_band) / (hard_band - soft_band)
+        sf_adversa = 1.0 - 0.8 * t
+        sf_favoravel = min(1.5, 1.0 + 0.5 * t)
     else:
-        size_factor_buy = min(1.5, 1.0 + abs_s * 0.5)
-        size_factor_sell = max(0.5, 1.0 - abs_s * 0.5)
-    return size_factor_buy, size_factor_sell
+        sf_adversa = 0.0
+        sf_favoravel = 1.5
+
+    if delta > 0:
+        # long base → BUY adversa, SELL favoravel
+        return sf_adversa, sf_favoravel
+    # short base (delta < 0) → SELL adversa, BUY favoravel
+    return sf_favoravel, sf_adversa
 
 
 def compute_vol_state(
@@ -203,30 +222,32 @@ def compute_skew_state(
 
 def compute_side_permissions(
     delta: float,
+    hard_cap: float,
     hard_band: float,
-    hysteresis_pct: float,
     current_buy_enabled: bool,
     current_sell_enabled: bool,
 ) -> SidePermissions:
     """
-    One-sided mode with hysteresis.
+    One-sided mode with asymmetric hysteresis (plan §2.4).
 
-    Shutdown: |delta| >= hard_band.
-    Re-enable: delta must retreat by hysteresis_pct past the hard_band edge.
-    Default hysteresis_pct = hard_band / 2 (set in caller).
+    Trigger:  |delta| > hard_cap   → disable adverse side
+    Release:  |delta| < hard_band  → re-enable both sides
+    Inside the [hard_band, hard_cap] zone, current state is preserved (no flip-flop).
+
+    Plan example: hard_band=0.20, hard_cap=0.30 → enter at 0.30, exit at 0.20.
     """
-    # Buy side: disable when too long, re-enable with hysteresis
-    if delta >= hard_band:
+    # Buy side (adversa when long: delta > 0)
+    if delta > hard_cap:
         buy_enabled = False
-    elif delta < hard_band - hysteresis_pct:
+    elif delta < hard_band:
         buy_enabled = True
     else:
         buy_enabled = current_buy_enabled
 
-    # Sell side: disable when too short, re-enable with hysteresis
-    if delta <= -hard_band:
+    # Sell side (adversa when short: delta < 0)
+    if delta < -hard_cap:
         sell_enabled = False
-    elif delta > -hard_band + hysteresis_pct:
+    elif delta > -hard_band:
         sell_enabled = True
     else:
         sell_enabled = current_sell_enabled

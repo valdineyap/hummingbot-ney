@@ -99,15 +99,14 @@ class TestPMMLeadLagSkewControllerPhase1(IsolatedAsyncioWrapperTestCase):
 
     # E2 — inventory bands: sign correctness
     async def test_inventory_bands_sign_correctness(self):
-        """s_inv > 0 (long base) → size_factor_buy < size_factor_sell."""
+        """delta > 0 (long base) → size_factor_buy < size_factor_sell (§2.3)."""
         self.mock_market_data_provider.get_price_by_type = MagicMock(return_value=Decimal("350000"))
         await self.controller.update_processed_data()
 
-        # Override processed_data with a long-base scenario
         from controllers.market_making.pmm_lead_lag_utils import compute_size_factors
-        sf_buy, sf_sell = compute_size_factors(0.8)  # long base, s_inv=0.8
+        sf_buy, sf_sell = compute_size_factors(delta=0.15, soft_band=0.10, hard_band=0.20)
         self.assertLess(sf_buy, sf_sell,
-                        msg="When long base, buy size must be ≤ sell size (§2.3)")
+                        msg="When long base in linear zone, buy size must be < sell size (§2.3)")
 
     # E3 — side filter: sides_enabled controls which levels get created
     async def test_side_filter_disables_buy_levels(self):

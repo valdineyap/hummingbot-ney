@@ -8,11 +8,12 @@ Phase 4: regime circuit breakers.
 Phase 5: lead-lag micro pause + synthetic fair_brl.
 """
 from decimal import Decimal
-from typing import Dict, List, Optional
+from typing import Dict, List
 
-from pydantic import Field
+from pydantic import Field, field_validator
+from pydantic_core.core_schema import ValidationInfo
 
-from hummingbot.core.data_type.common import OrderType, PriceType, TradeType
+from hummingbot.core.data_type.common import PriceType
 from hummingbot.strategy_v2.controllers.market_making_controller_base import (
     MarketMakingControllerBase,
     MarketMakingControllerConfigBase,
@@ -73,12 +74,40 @@ class PMMLeadLagSkewConfig(MarketMakingControllerConfigBase):
     )
     inv_hard_band: float = Field(
         default=0.20, gt=0.0,
-        json_schema_extra={"prompt": "Hard band for one-sided mode (e.g. 0.20): ", "is_updatable": True},
+        json_schema_extra={"prompt": "Hard band for size shutdown (e.g. 0.20): ", "is_updatable": True},
+    )
+    inv_hard_cap: float = Field(
+        default=0.30, gt=0.0,
+        json_schema_extra={"prompt": "Hard cap triggering one-sided mode (e.g. 0.30): ", "is_updatable": True},
     )
     inv_kill: float = Field(
         default=0.40, gt=0.0,
         json_schema_extra={"prompt": "Kill threshold for inventory (e.g. 0.40): ", "is_updatable": True},
     )
+
+    @field_validator("inv_hard_band")
+    @classmethod
+    def _hard_band_gt_soft(cls, v: float, info: ValidationInfo) -> float:
+        soft = info.data.get("inv_soft_band")
+        if soft is not None and v <= soft:
+            raise ValueError(f"inv_hard_band ({v}) must be > inv_soft_band ({soft})")
+        return v
+
+    @field_validator("inv_hard_cap")
+    @classmethod
+    def _hard_cap_gt_hard_band(cls, v: float, info: ValidationInfo) -> float:
+        hard = info.data.get("inv_hard_band")
+        if hard is not None and v <= hard:
+            raise ValueError(f"inv_hard_cap ({v}) must be > inv_hard_band ({hard})")
+        return v
+
+    @field_validator("inv_kill")
+    @classmethod
+    def _kill_gt_hard_cap(cls, v: float, info: ValidationInfo) -> float:
+        cap = info.data.get("inv_hard_cap")
+        if cap is not None and v <= cap:
+            raise ValueError(f"inv_kill ({v}) must be > inv_hard_cap ({cap})")
+        return v
     max_net_position_quote: Decimal = Field(
         default=Decimal("60"),
         json_schema_extra={"prompt": "Max net position in quote (e.g. 60 BRL): ", "is_updatable": True},
@@ -137,12 +166,11 @@ class PMMLeadLagSkewController(MarketMakingControllerBase):
         vol_state = compute_vol_state(1.0, 1.0)
         lead_state = compute_lead_state(mid_dec, mid_dec, self.config.basis_deadband_bps)
 
-        # Phase 1: inventory stub — 50/50 split assumed (no balance fetch yet)
-        from decimal import Decimal as D
+        # Phase 1: inventory stub — neutral 50/50 (Phase 2 replaces with live balance fetch)
         inv_state = compute_inventory_state(
-            base_balance=D("0"),
-            quote_balance=D("1"),
-            mid_price=D("1"),
+            base_balance=Decimal("0"),
+            quote_balance=Decimal("1"),
+            mid_price=Decimal("1"),
             target_pct=self.config.target_inventory_base_pct,
             soft_band=self.config.inv_soft_band,
             hard_band=self.config.inv_hard_band,
@@ -160,11 +188,11 @@ class PMMLeadLagSkewController(MarketMakingControllerBase):
             skew_max_bps=self.config.skew_max_bps,
         )
 
-        # Phase 1: sides always enabled (no inventory hard band enforcement yet)
+        # Side permissions: trigger at inv_hard_cap, release at inv_hard_band (§2.4 hysteresis)
         side_perms = compute_side_permissions(
             delta=inv_state.delta,
+            hard_cap=self.config.inv_hard_cap,
             hard_band=self.config.inv_hard_band,
-            hysteresis_pct=self.config.inv_hard_band / 2,
             current_buy_enabled=self._buy_enabled,
             current_sell_enabled=self._sell_enabled,
         )
@@ -178,7 +206,11 @@ class PMMLeadLagSkewController(MarketMakingControllerBase):
             side_perms=side_perms,
         )
 
-        size_factor_buy, size_factor_sell = compute_size_factors(inv_state.s_inv)
+        size_factor_buy, size_factor_sell = compute_size_factors(
+            delta=inv_state.delta,
+            soft_band=self.config.inv_soft_band,
+            hard_band=self.config.inv_hard_band,
+        )
 
         self.processed_data = {
             "reference_price": order_params.reference_price,

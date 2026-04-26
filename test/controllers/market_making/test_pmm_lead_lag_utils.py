@@ -75,43 +75,58 @@ class TestComputeInventoryState(unittest.TestCase):
 
 
 class TestComputeSizeFactors(unittest.TestCase):
+    """Plan §2.3: zone-based size factors with explicit unit-test invariant."""
 
-    def test_neutral_s_inv(self):
-        """s_inv=0 → both factors = 1.0."""
-        sf_buy, sf_sell = compute_size_factors(0.0)
-        self.assertAlmostEqual(sf_buy, 1.0)
-        self.assertAlmostEqual(sf_sell, 1.0)
+    SOFT = 0.10
+    HARD = 0.20
 
-    def test_long_base_buy_penalized(self):
-        """s_inv > 0 (long base) → buy penalized, sell bonus."""
-        sf_buy, sf_sell = compute_size_factors(1.0)
-        self.assertLess(sf_buy, 1.0)
-        self.assertGreater(sf_sell, 1.0)
+    def _f(self, delta):
+        return compute_size_factors(delta, self.SOFT, self.HARD)
 
-    def test_short_base_sell_penalized(self):
-        """s_inv < 0 (short base) → sell penalized, buy bonus."""
-        sf_buy, sf_sell = compute_size_factors(-1.0)
-        self.assertGreater(sf_buy, 1.0)
-        self.assertLess(sf_sell, 1.0)
+    def test_neutral_zone_within_soft(self):
+        """|Δ| ≤ soft → both factors = 1.0."""
+        for delta in [0.0, 0.05, -0.05, 0.10, -0.10]:
+            sf_buy, sf_sell = self._f(delta)
+            self.assertAlmostEqual(sf_buy, 1.0, msg=f"delta={delta}")
+            self.assertAlmostEqual(sf_sell, 1.0, msg=f"delta={delta}")
 
-    def test_buy_penalized_more_than_sell_when_long(self):
-        """When long base: size_factor_buy ≤ size_factor_sell (plan §2.3 invariant)."""
-        for s_inv in [0.3, 0.6, 1.0]:
-            sf_buy, sf_sell = compute_size_factors(s_inv)
-            self.assertLessEqual(sf_buy, sf_sell,
-                                 msg=f"s_inv={s_inv}: buy={sf_buy} should <= sell={sf_sell}")
+    def test_linear_zone_long_base(self):
+        """soft < Δ ≤ hard, long base → buy decays, sell grows."""
+        sf_buy, sf_sell = self._f(0.15)  # midway: t = 0.5
+        self.assertAlmostEqual(sf_buy, 1.0 - 0.8 * 0.5, places=5)   # 0.6
+        self.assertAlmostEqual(sf_sell, 1.0 + 0.5 * 0.5, places=5)  # 1.25
+
+    def test_beyond_hard_band_long_base_buy_off(self):
+        """|Δ| > hard, long base → buy = 0.0 (off), sell = 1.5."""
+        sf_buy, sf_sell = self._f(0.30)
+        self.assertEqual(sf_buy, 0.0)
+        self.assertEqual(sf_sell, 1.5)
+
+    def test_beyond_hard_band_short_base_sell_off(self):
+        """|Δ| > hard, short base → sell = 0.0, buy = 1.5."""
+        sf_buy, sf_sell = self._f(-0.30)
+        self.assertEqual(sf_buy, 1.5)
+        self.assertEqual(sf_sell, 0.0)
+
+    def test_invariant_buy_le_sell_when_long(self):
+        """§2.3 unit-test invariant: Δ > 0 → size_factor_buy ≤ size_factor_sell."""
+        for delta in [-0.05, 0.0, 0.05, 0.15, 0.25, 0.35]:
+            sf_buy, sf_sell = self._f(delta)
+            if delta > 0:
+                self.assertLessEqual(sf_buy, sf_sell,
+                                     msg=f"delta={delta}: buy={sf_buy} should <= sell={sf_sell}")
+
+    def test_branch_safety_no_t_undefined(self):
+        """Beyond hard, branch must not reference `t` from previous scope."""
+        # If the implementation incorrectly used `t` outside the linear zone, this would crash.
+        sf_buy, sf_sell = self._f(0.50)
+        self.assertEqual((sf_buy, sf_sell), (0.0, 1.5))
 
     def test_bonus_capped_at_1_5(self):
-        """Bonus side never exceeds 1.5x."""
-        sf_buy, sf_sell = compute_size_factors(1.0)
+        sf_buy, sf_sell = self._f(0.50)
         self.assertLessEqual(sf_sell, 1.5)
-        sf_buy2, sf_sell2 = compute_size_factors(-1.0)
+        sf_buy2, sf_sell2 = self._f(-0.50)
         self.assertLessEqual(sf_buy2, 1.5)
-
-    def test_penalty_floored_at_0_5(self):
-        """Penalty side never goes below 0.5x."""
-        sf_buy, sf_sell = compute_size_factors(1.0)
-        self.assertGreaterEqual(sf_buy, 0.5)
 
 
 class TestComputeVolState(unittest.TestCase):
@@ -154,43 +169,63 @@ class TestComputeSkewState(unittest.TestCase):
 
 
 class TestComputeSidePermissions(unittest.TestCase):
+    """Plan §2.4: trigger at hard_cap=0.30, release at hard_band=0.20."""
 
-    def _call(self, delta, hard=0.20, hyst=0.10, buy=True, sell=True):
-        return compute_side_permissions(delta, hard, hyst, buy, sell)
+    HARD_CAP = 0.30
+    HARD_BAND = 0.20
 
-    def test_both_enabled_within_soft(self):
+    def _call(self, delta, buy=True, sell=True):
+        return compute_side_permissions(
+            delta, self.HARD_CAP, self.HARD_BAND, buy, sell,
+        )
+
+    def test_both_enabled_within_band(self):
         p = self._call(0.05)
         self.assertTrue(p.buy_enabled)
         self.assertTrue(p.sell_enabled)
 
-    def test_buy_disabled_when_long_past_hard_band(self):
-        p = self._call(0.25)
+    def test_buy_disabled_when_long_past_hard_cap(self):
+        """delta > hard_cap (0.30) → buy disabled."""
+        p = self._call(0.35)
         self.assertFalse(p.buy_enabled)
         self.assertTrue(p.sell_enabled)
 
-    def test_sell_disabled_when_short_past_hard_band(self):
-        p = self._call(-0.25)
+    def test_buy_NOT_disabled_at_hard_band(self):
+        """delta = hard_band (0.20) is NOT enough to disable — only hard_cap."""
+        p = self._call(0.20)
+        self.assertTrue(p.buy_enabled)
+
+    def test_sell_disabled_when_short_past_hard_cap(self):
+        p = self._call(-0.35)
         self.assertTrue(p.buy_enabled)
         self.assertFalse(p.sell_enabled)
 
     def test_buy_stays_disabled_in_hysteresis_zone(self):
-        """Once disabled, buy stays off until delta < hard - hysteresis."""
-        # disabled at 0.25; hysteresis zone is [0.10, 0.20]
-        p = self._call(0.15, buy=False)  # in hysteresis zone
-        self.assertFalse(p.buy_enabled)  # must stay off
+        """Once disabled at hard_cap, buy stays off in [hard_band, hard_cap]."""
+        p = self._call(0.25, buy=False)  # inside hysteresis zone [0.20, 0.30]
+        self.assertFalse(p.buy_enabled)
 
-    def test_buy_reenables_after_hysteresis(self):
-        """Once delta retreats below hard - hysteresis, buy re-enables."""
-        p = self._call(0.05, buy=False)  # below 0.20 - 0.10 = 0.10
+    def test_buy_reenables_below_hard_band(self):
+        """Once delta retreats below hard_band, buy re-enables."""
+        p = self._call(0.15, buy=False)  # below 0.20
         self.assertTrue(p.buy_enabled)
 
     def test_sell_stays_disabled_in_hysteresis_zone(self):
-        p = self._call(-0.15, sell=False)
+        p = self._call(-0.25, sell=False)
         self.assertFalse(p.sell_enabled)
 
-    def test_sell_reenables_after_hysteresis(self):
-        p = self._call(-0.05, sell=False)
+    def test_sell_reenables_above_negative_hard_band(self):
+        p = self._call(-0.15, sell=False)
         self.assertTrue(p.sell_enabled)
+
+    def test_no_flipflop_in_hysteresis_zone(self):
+        """In [hard_band, hard_cap], current state is preserved (no oscillation)."""
+        # currently enabled, delta crosses hard_band but not hard_cap
+        p = self._call(0.25, buy=True)
+        self.assertTrue(p.buy_enabled)  # stays on
+        # currently disabled, same delta
+        p = self._call(0.25, buy=False)
+        self.assertFalse(p.buy_enabled)  # stays off
 
 
 class TestComputeOrderParams(unittest.TestCase):
