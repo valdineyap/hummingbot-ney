@@ -2,13 +2,15 @@
 PMM Lead-Lag Skew controller for BTC-BRL on Binance Spot (Hummingbot V2).
 
 Phase 1: bilateral PMM puro — no skew, no regime filter, no lead-lag.
-Phase 2: inventory tracking + one-sided mode.
+Phase 2: live inventory tracking + size factors + one-sided mode + CSV signals.
 Phase 3: inventory skew + volatility spread multiplier.
-Phase 4: regime circuit breakers.
+Phase 4: regime circuit breakers + max_net_position_quote kill.
 Phase 5: lead-lag micro pause + synthetic fair_brl.
 """
+import csv
+import os
 from decimal import Decimal
-from typing import Dict, List
+from typing import Dict, List, Tuple
 
 from pydantic import Field, field_validator
 from pydantic_core.core_schema import ValidationInfo
@@ -134,6 +136,13 @@ class PMMLeadLagSkewConfig(MarketMakingControllerConfigBase):
     max_leader_staleness_sec: float = Field(default=5.0, gt=0.0)
     max_usdt_brl_staleness_sec: float = Field(default=15.0, gt=0.0)
 
+    # ── Logging (Phase 2) ─────────────────────────────────────────────────
+    csv_log_dir: str = Field(
+        default="logs/pmm_lead_lag",
+        json_schema_extra={"prompt": "Directory for signals.csv (relative to bot root): "},
+    )
+    csv_log_enabled: bool = Field(default=True)
+
 
 class PMMLeadLagSkewController(MarketMakingControllerBase):
     """
@@ -146,31 +155,68 @@ class PMMLeadLagSkewController(MarketMakingControllerBase):
     def __init__(self, config: PMMLeadLagSkewConfig, *args, **kwargs):
         super().__init__(config, *args, **kwargs)
         self.config = config
-        # Hysteresis state for one-sided mode (Phase 2+)
+        # Hysteresis state for one-sided mode (§2.4)
         self._buy_enabled: bool = True
         self._sell_enabled: bool = True
+        # CSV signals logger (lazy init: opened on first write)
+        self._csv_path: str = os.path.join(self.config.csv_log_dir, "signals.csv")
+        self._csv_initialized: bool = False
+
+    # ── Balance fetching (Phase 2) ───────────────────────────────────────
+
+    def _split_pair(self) -> Tuple[str, str]:
+        """Split BTC-BRL → ('BTC', 'BRL'). Falls back to (BASE, QUOTE) on parse error."""
+        try:
+            base, quote = self.config.trading_pair.split("-")
+            return base, quote
+        except ValueError:
+            return "BASE", "QUOTE"
+
+    def _get_balances(self) -> Tuple[Decimal, Decimal]:
+        """
+        Fetch (base, quote) total balances from the connector.
+        Returns (Decimal('0'), Decimal('0')) when connector isn't ready/available
+        (e.g., during warmup or in unit tests with mocked providers).
+        """
+        connectors = getattr(self.market_data_provider, "connectors", None)
+        if not isinstance(connectors, dict):
+            return Decimal("0"), Decimal("0")
+        connector = connectors.get(self.config.connector_name)
+        if connector is None:
+            return Decimal("0"), Decimal("0")
+        base_asset, quote_asset = self._split_pair()
+        try:
+            base = Decimal(str(connector.get_balance(base_asset)))
+            quote = Decimal(str(connector.get_balance(quote_asset)))
+        except Exception:
+            return Decimal("0"), Decimal("0")
+        return base, quote
 
     # ── Data update ───────────────────────────────────────────────────────
 
     async def update_processed_data(self):
         """
-        Phase 1: reference_price = MidPrice, spread_multiplier = 1, no skew.
-        All signals are neutral stubs — replaced incrementally in Phases 2–5.
+        Compute all signals and update processed_data.
+
+        Phase 2: live balances drive inv_pct, size_factors, sides_enabled.
+        Phase 3+: skew_max_bps > 0 will start shifting reference_price.
+        Phase 4+: regime_state stub will be replaced by real circuit breakers.
         """
         mid_price = self.market_data_provider.get_price_by_type(
             self.config.connector_name, self.config.trading_pair, PriceType.MidPrice
         )
         mid_dec = Decimal(str(mid_price))
 
-        # Phase 1: vol neutral, lead neutral, regime normal
+        # Phase 4 stubs — neutral
         vol_state = compute_vol_state(1.0, 1.0)
         lead_state = compute_lead_state(mid_dec, mid_dec, self.config.basis_deadband_bps)
 
-        # Phase 1: inventory stub — neutral 50/50 (Phase 2 replaces with live balance fetch)
+        # Phase 2 — live balances
+        base_bal, quote_bal = self._get_balances()
         inv_state = compute_inventory_state(
-            base_balance=Decimal("0"),
-            quote_balance=Decimal("1"),
-            mid_price=Decimal("1"),
+            base_balance=base_bal,
+            quote_balance=quote_bal,
+            mid_price=mid_dec,
             target_pct=self.config.target_inventory_base_pct,
             soft_band=self.config.inv_soft_band,
             hard_band=self.config.inv_hard_band,
@@ -212,10 +258,20 @@ class PMMLeadLagSkewController(MarketMakingControllerBase):
             hard_band=self.config.inv_hard_band,
         )
 
+        # §2.5 — net exposure in quote (base value at mid). Phase 2 only flags it;
+        # Phase 4 will trigger kill switch when it exceeds max_net_position_quote.
+        net_exposure_quote = base_bal * mid_dec
+        over_max_net_position = net_exposure_quote > self.config.max_net_position_quote
+
         self.processed_data = {
             "reference_price": order_params.reference_price,
             "spread_multiplier": order_params.spread_multiplier,
             "price_shift_bps": order_params.price_shift_bps,
+            "mid_price": mid_dec,
+            "base_balance": base_bal,
+            "quote_balance": quote_bal,
+            "net_exposure_quote": net_exposure_quote,
+            "over_max_net_position": over_max_net_position,
             "inv_pct": inv_state.inv_pct,
             "inv_delta": inv_state.delta,
             "s_inv": inv_state.s_inv,
@@ -234,6 +290,9 @@ class PMMLeadLagSkewController(MarketMakingControllerBase):
             },
         }
 
+        if self.config.csv_log_enabled:
+            self._csv_log_signals()
+
     # ── Level selection ───────────────────────────────────────────────────
 
     def get_levels_to_execute(self) -> List[str]:
@@ -250,13 +309,17 @@ class PMMLeadLagSkewController(MarketMakingControllerBase):
 
     def get_executor_config(self, level_id: str, price: Decimal, amount: Decimal):
         """
-        Create PositionExecutorConfig for a given level.
-        Phase 1: fixed size.
-        Phase 2+: apply size_factor from inventory signal.
+        Create PositionExecutorConfig for a given level, applying inventory size_factor.
+        Returns None when size_factor=0 (adversa side beyond hard_band — see §2.3),
+        which causes the base controller to skip this level entirely.
         """
         trade_type = self.get_trade_type_from_level_id(level_id)
-        size_factors: Dict[str, float] = self.processed_data.get("size_factors", {"buy": 1.0, "sell": 1.0})
+        size_factors: Dict[str, float] = self.processed_data.get(
+            "size_factors", {"buy": 1.0, "sell": 1.0},
+        )
         size_factor = Decimal(str(size_factors.get(trade_type.name.lower(), 1.0)))
+        if size_factor == Decimal("0"):
+            return None
         return PositionExecutorConfig(
             timestamp=self.market_data_provider.time(),
             level_id=level_id,
@@ -268,6 +331,58 @@ class PMMLeadLagSkewController(MarketMakingControllerBase):
             leverage=self.config.leverage,
             side=trade_type,
         )
+
+    # ── CSV logging (Phase 2) ─────────────────────────────────────────────
+
+    _CSV_COLUMNS = (
+        "ts", "regime", "mid", "ref", "shift_bps", "spread_mult",
+        "base_bal", "quote_bal", "net_exposure_quote", "over_max_net_position",
+        "inv_pct", "inv_delta", "s_inv",
+        "s_lead_micro", "s_lead_regime", "basis_bps", "vol_ratio",
+        "buy_enabled", "sell_enabled",
+        "sf_buy", "sf_sell",
+    )
+
+    def _csv_log_signals(self) -> None:
+        """Append one row per update_processed_data() call to signals.csv."""
+        try:
+            os.makedirs(self.config.csv_log_dir, exist_ok=True)
+        except OSError:
+            return
+        d = self.processed_data
+        row = {
+            "ts": self.market_data_provider.time(),
+            "regime": d.get("regime", "normal"),
+            "mid": str(d.get("mid_price", "")),
+            "ref": str(d.get("reference_price", "")),
+            "shift_bps": str(d.get("price_shift_bps", "")),
+            "spread_mult": str(d.get("spread_multiplier", "")),
+            "base_bal": str(d.get("base_balance", "")),
+            "quote_bal": str(d.get("quote_balance", "")),
+            "net_exposure_quote": str(d.get("net_exposure_quote", "")),
+            "over_max_net_position": d.get("over_max_net_position", False),
+            "inv_pct": d.get("inv_pct", ""),
+            "inv_delta": d.get("inv_delta", ""),
+            "s_inv": d.get("s_inv", ""),
+            "s_lead_micro": d.get("s_lead_micro", ""),
+            "s_lead_regime": d.get("s_lead_regime", ""),
+            "basis_bps": d.get("basis_bps", ""),
+            "vol_ratio": d.get("vol_ratio", ""),
+            "buy_enabled": d.get("sides_enabled", {}).get("buy", True),
+            "sell_enabled": d.get("sides_enabled", {}).get("sell", True),
+            "sf_buy": d.get("size_factors", {}).get("buy", ""),
+            "sf_sell": d.get("size_factors", {}).get("sell", ""),
+        }
+        write_header = not self._csv_initialized and not os.path.exists(self._csv_path)
+        try:
+            with open(self._csv_path, "a", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=self._CSV_COLUMNS)
+                if write_header:
+                    writer.writeheader()
+                writer.writerow(row)
+            self._csv_initialized = True
+        except OSError:
+            return
 
     # ── Status ────────────────────────────────────────────────────────────
 
@@ -281,22 +396,34 @@ class PMMLeadLagSkewController(MarketMakingControllerBase):
         spread_mult = d.get("spread_multiplier", "N/A")
         shift_bps = d.get("price_shift_bps", Decimal("0"))
         vol_ratio = d.get("vol_ratio", 1.0)
+        sf = d.get("size_factors", {"buy": 1.0, "sell": 1.0})
+        net_exp = d.get("net_exposure_quote", Decimal("0"))
+        over_cap = d.get("over_max_net_position", False)
+        cap_flag = " ⚠ OVER-CAP" if over_cap else ""
         return [
             f"── PMM Lead-Lag Skew ({self.config.trading_pair}) ──────────────────",
             f"  Regime: {regime:<10}  Vol ratio: {vol_ratio:.2f}x  Spread mult: {spread_mult}",
             f"  Ref price: {ref_price}  Shift: {shift_bps} bps",
             f"  Inventory: {inv_pct:.1%}  Buy: {'ON ' if sides.get('buy') else 'OFF'}  Sell: {'ON' if sides.get('sell') else 'OFF'}",
+            f"  Size factors  buy: {sf.get('buy'):.2f}  sell: {sf.get('sell'):.2f}",
+            f"  Net exposure (quote): {net_exp} / {self.config.max_net_position_quote}{cap_flag}",
         ]
 
     def get_custom_info(self) -> dict:
         """Publish key signals via MQTT for monitoring."""
         d = self.processed_data
+        sf = d.get("size_factors", {"buy": 1.0, "sell": 1.0})
         return {
             "regime": d.get("regime", "normal"),
             "inv_pct": round(d.get("inv_pct", 0.5), 4),
+            "inv_delta": round(d.get("inv_delta", 0.0), 4),
             "s_inv": round(d.get("s_inv", 0.0), 4),
             "price_shift_bps": float(d.get("price_shift_bps", 0)),
             "vol_ratio": round(d.get("vol_ratio", 1.0), 3),
+            "net_exposure_quote": float(d.get("net_exposure_quote", 0)),
+            "over_max_net_position": bool(d.get("over_max_net_position", False)),
             "buy_enabled": d.get("sides_enabled", {}).get("buy", True),
             "sell_enabled": d.get("sides_enabled", {}).get("sell", True),
+            "sf_buy": round(sf.get("buy", 1.0), 3),
+            "sf_sell": round(sf.get("sell", 1.0), 3),
         }
