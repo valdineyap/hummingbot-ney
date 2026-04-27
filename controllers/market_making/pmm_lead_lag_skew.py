@@ -10,7 +10,8 @@ Phase 5: lead-lag micro pause + synthetic fair_brl.
 import csv
 import os
 from decimal import Decimal
-from typing import Dict, List, Optional, Tuple
+from collections import deque
+from typing import Deque, Dict, List, Optional, Tuple
 
 from pydantic import Field, field_validator
 from pydantic_core.core_schema import ValidationInfo
@@ -145,10 +146,12 @@ class PMMLeadLagSkewConfig(MarketMakingControllerConfigBase):
     # ── Volatility (Phase 3) ──────────────────────────────────────────────
     candles_connector: Optional[str] = Field(
         default=None,
+        validate_default=True,
         json_schema_extra={"prompt": "Candles connector (blank = same as connector_name): "},
     )
     candles_trading_pair: Optional[str] = Field(
         default=None,
+        validate_default=True,
         json_schema_extra={"prompt": "Candles pair (blank = same as trading_pair): "},
     )
     candles_interval: str = Field(default="1m")
@@ -173,6 +176,51 @@ class PMMLeadLagSkewConfig(MarketMakingControllerConfigBase):
     basis_deadband_bps: float = Field(default=3.0, ge=0.0)
     max_leader_staleness_sec: float = Field(default=5.0, gt=0.0)
     max_usdt_brl_staleness_sec: float = Field(default=15.0, gt=0.0)
+
+    # Leader & FX feeds — both 1m candles by default. The micro signal uses
+    # only mid_usdt + mid_brl (no FX delta); usdt_brl_ref is just a scale factor.
+    leader_connector: Optional[str] = Field(
+        default=None,
+        validate_default=True,
+        json_schema_extra={"prompt": "Leader connector (blank = same as connector_name): "},
+    )
+    leader_trading_pair: str = Field(
+        default="BTC-USDT",
+        json_schema_extra={"prompt": "Leader trading pair (e.g. BTC-USDT): "},
+    )
+    quote_rate_connector: Optional[str] = Field(
+        default=None,
+        validate_default=True,
+        json_schema_extra={"prompt": "Quote-rate connector (blank = same as connector_name): "},
+    )
+    quote_rate_trading_pair: str = Field(
+        default="USDT-BRL",
+        json_schema_extra={"prompt": "Quote-rate pair (e.g. USDT-BRL): "},
+    )
+
+    # Micro pause (1–5s, BTC-USDT pure)
+    lead_micro_window_sec: float = Field(default=5.0, gt=0.0)
+    lead_micro_threshold_bps: float = Field(default=5.0, gt=0.0)
+    lead_micro_dwell_sec: float = Field(default=3.0, gt=0.0)
+
+    # Regime synthetic (30s–5min, fair_brl smoothed by EWM)
+    lead_lag_short_window_sec: float = Field(default=30.0, gt=0.0)
+    lead_lag_ewm_halflife_sec: float = Field(default=10.0, gt=0.0)
+    lead_lag_z_window_sec: float = Field(default=600.0, gt=0.0)
+
+    @field_validator("leader_connector", mode="before")
+    @classmethod
+    def _leader_connector_default(cls, v, info: ValidationInfo):
+        if v is None or v == "":
+            return info.data.get("connector_name")
+        return v
+
+    @field_validator("quote_rate_connector", mode="before")
+    @classmethod
+    def _quote_rate_connector_default(cls, v, info: ValidationInfo):
+        if v is None or v == "":
+            return info.data.get("connector_name")
+        return v
 
     # ── Regime + kill switch (Phase 4) ───────────────────────────────────
     vol_degraded_threshold_mult: float = Field(
@@ -251,17 +299,64 @@ class PMMLeadLagSkewController(MarketMakingControllerBase):
         self._regime_cause: str = ""
         self._seen_executor_ids: set = set()
         self._session_pnl: float = 0.0
+        # Phase 5 — lead-lag price history buffers and EWM state.
+        # Each entry is (timestamp_sec, mid_brl, mid_usdt, usdt_brl_rate).
+        # Length bounded by max(z_window, micro_window, lead_lag_short_window) + buffer.
+        history_window = max(
+            float(config.lead_lag_z_window_sec),
+            float(config.lead_lag_short_window_sec),
+            float(config.lead_micro_window_sec),
+        ) + 10.0
+        # Assume tick rate ≈ 1 Hz; cap at a few thousand to bound memory.
+        self._lead_history_max_seconds: float = history_window
+        self._lead_history: Deque[Tuple[float, float, float, float]] = deque(maxlen=4096)
+        # EWM state for the synthetic fair_brl.
+        self._fair_brl_smooth: float = 0.0
+        self._fair_brl_smooth_ts: float = 0.0
+        # Recent log-lag samples → adaptive sigma for z_lead.
+        # (timestamp, lag_short) tuples within z_window_sec.
+        self._lag_samples: Deque[Tuple[float, float]] = deque(maxlen=4096)
+        # Last-update timestamps for staleness checks.
+        self._last_mid_brl_ts: float = 0.0
+        self._last_mid_usdt_ts: float = 0.0
+        self._last_usdt_brl_ts: float = 0.0
+        # Pause expiry (set in update_processed_data) — used by get_levels_to_execute.
+        self._pause_buy_until: float = 0.0
+        self._pause_sell_until: float = 0.0
 
     # ── Candles config (Phase 3) ─────────────────────────────────────────
 
     def get_candles_config(self) -> List[CandlesConfig]:
-        """Subscribe to BTC-BRL 1m candles for volatility computation."""
-        return [CandlesConfig(
-            connector=self.config.candles_connector,
-            trading_pair=self.config.candles_trading_pair,
-            interval=self.config.candles_interval,
-            max_records=self.max_records,
-        )]
+        """
+        Subscribe to:
+          - BTC-BRL 1m candles for volatility computation (Phase 3).
+          - Leader (BTC-USDT) 1m candles for s_lead_micro / s_lead_regime (Phase 5).
+          - Quote rate (USDT-BRL) 1m candles for the synthetic fair_brl (Phase 5).
+
+        De-duplicate on (connector, trading_pair, interval) so a config that
+        re-uses the main pair for candles doesn't subscribe twice.
+        """
+        seen = set()
+        out: List[CandlesConfig] = []
+
+        def _add(connector: Optional[str], pair: Optional[str]):
+            if not connector or not pair:
+                return
+            key = (connector, pair, self.config.candles_interval)
+            if key in seen:
+                return
+            seen.add(key)
+            out.append(CandlesConfig(
+                connector=connector,
+                trading_pair=pair,
+                interval=self.config.candles_interval,
+                max_records=self.max_records,
+            ))
+
+        _add(self.config.candles_connector, self.config.candles_trading_pair)
+        _add(self.config.leader_connector, self.config.leader_trading_pair)
+        _add(self.config.quote_rate_connector, self.config.quote_rate_trading_pair)
+        return out
 
     def _compute_vol_from_candles(self):
         """
@@ -313,6 +408,220 @@ class PMMLeadLagSkewController(MarketMakingControllerBase):
         except Exception:
             return Decimal("0"), Decimal("0")
         return base, quote
+
+    # ── Lead-lag helpers (Phase 5) ───────────────────────────────────────
+
+    def _read_latest_close(self, connector: Optional[str], pair: Optional[str]) -> Optional[float]:
+        """
+        Return the most recent close price from candles for (connector, pair).
+        None if the feed is unavailable or empty.
+        """
+        if not connector or not pair:
+            return None
+        try:
+            df = self.market_data_provider.get_candles_df(
+                connector_name=connector,
+                trading_pair=pair,
+                interval=self.config.candles_interval,
+                max_records=2,
+            )
+        except Exception:
+            return None
+        if df is None or len(df) == 0:
+            return None
+        try:
+            return float(df["close"].iloc[-1])
+        except (KeyError, IndexError, ValueError, TypeError):
+            return None
+
+    def _read_leg_prices(self) -> Tuple[Optional[float], Optional[float], Optional[float]]:
+        """
+        Return (mid_brl, mid_usdt, usdt_brl) sourced from latest candle close.
+        Any leg can be None when its feed is unavailable.
+        """
+        try:
+            mid_brl_raw = self.market_data_provider.get_price_by_type(
+                self.config.connector_name,
+                self.config.trading_pair,
+                PriceType.MidPrice,
+            )
+            mid_brl = float(mid_brl_raw) if mid_brl_raw is not None else None
+        except Exception:
+            mid_brl = None
+        if mid_brl is not None and mid_brl <= 0:
+            mid_brl = None
+        mid_usdt = self._read_latest_close(
+            self.config.leader_connector, self.config.leader_trading_pair,
+        )
+        usdt_brl = self._read_latest_close(
+            self.config.quote_rate_connector, self.config.quote_rate_trading_pair,
+        )
+        return mid_brl, mid_usdt, usdt_brl
+
+    def _record_lead_history(self, now: float, mid_brl: Optional[float],
+                             mid_usdt: Optional[float], usdt_brl: Optional[float]) -> None:
+        """
+        Append (timestamp, mid_brl, mid_usdt, usdt_brl) to history and update
+        last-seen timestamps. Drops samples with non-positive prices for any leg.
+        Trims history to lead_history_max_seconds.
+        """
+        if mid_brl is None or mid_brl <= 0:
+            return
+        if mid_usdt is None or mid_usdt <= 0:
+            return
+        if usdt_brl is None or usdt_brl <= 0:
+            return
+        self._lead_history.append((now, mid_brl, mid_usdt, usdt_brl))
+        self._last_mid_brl_ts = now
+        self._last_mid_usdt_ts = now
+        self._last_usdt_brl_ts = now
+        cutoff = now - self._lead_history_max_seconds
+        while self._lead_history and self._lead_history[0][0] < cutoff:
+            self._lead_history.popleft()
+
+    def _lookup_past(self, target_ts: float) -> Optional[Tuple[float, float, float, float]]:
+        """
+        Return the closest history entry whose timestamp is <= target_ts.
+        Used as the t-Δs reference for lag computations. None when history
+        doesn't span far enough back.
+        """
+        if not self._lead_history:
+            return None
+        if self._lead_history[0][0] > target_ts:
+            return None
+        # Walk from oldest, keep last <= target.
+        chosen = self._lead_history[0]
+        for entry in self._lead_history:
+            if entry[0] > target_ts:
+                break
+            chosen = entry
+        return chosen
+
+    def _compute_lead_signals(self, mid_dec: Decimal):
+        """
+        Phase 5 — assemble micro + regime lead-lag signals.
+
+        Steps:
+          1. Read latest mid_brl / mid_usdt / usdt_brl from feeds.
+          2. Append to history; update last-seen ts.
+          3. Update fair_brl_smooth via EWM step.
+          4. Look up past values at t-micro_window and t-short_window.
+          5. Compute staleness flags from last-seen ts.
+          6. Update sigma_lag from rolling lag samples.
+          7. Call compute_lead_state(...) with the assembled inputs.
+        """
+        from controllers.market_making.pmm_lead_lag_utils import (
+            LeadState,
+            compute_lead_state,
+            ewm_step,
+        )
+
+        try:
+            now = float(self.market_data_provider.time())
+        except (TypeError, ValueError):
+            now = 0.0
+
+        mid_brl, mid_usdt, usdt_brl = self._read_leg_prices()
+        # If mid_dec is provided and feed read failed, prefer mid_dec for BRL.
+        if mid_brl is None and mid_dec is not None and mid_dec > 0:
+            try:
+                mid_brl = float(mid_dec)
+            except (TypeError, ValueError):
+                mid_brl = None
+
+        # Staleness — based on most recent successful read (any leg).
+        micro_stale = (
+            mid_brl is None or mid_usdt is None
+            or (now - max(self._last_mid_brl_ts, 0.0)) > self.config.max_leader_staleness_sec
+            or (now - max(self._last_mid_usdt_ts, 0.0)) > self.config.max_leader_staleness_sec
+        )
+        regime_stale = (
+            micro_stale or usdt_brl is None
+            or (now - max(self._last_usdt_brl_ts, 0.0)) > self.config.max_usdt_brl_staleness_sec
+        )
+
+        self._record_lead_history(now, mid_brl, mid_usdt, usdt_brl)
+
+        # If we have no usable history yet, return neutral state with stale flags.
+        if mid_brl is None or mid_usdt is None or usdt_brl is None:
+            return LeadState(
+                s_lead_micro=0.0, s_lead_regime=0.0, basis_bps=0.0,
+                micro_stale=True, regime_stale=True,
+                pause_buy=False, pause_sell=False,
+            )
+
+        # EWM update for fair_brl_smooth.
+        fair_brl_raw = mid_usdt * usdt_brl
+        dt = now - self._fair_brl_smooth_ts if self._fair_brl_smooth_ts > 0 else 0.0
+        self._fair_brl_smooth = ewm_step(
+            prev=self._fair_brl_smooth,
+            new_value=fair_brl_raw,
+            halflife_sec=self.config.lead_lag_ewm_halflife_sec,
+            dt_sec=dt,
+        )
+        self._fair_brl_smooth_ts = now
+
+        # Past references.
+        micro_past = self._lookup_past(now - self.config.lead_micro_window_sec)
+        regime_past = self._lookup_past(now - self.config.lead_lag_short_window_sec)
+
+        # Past mid_brl / mid_usdt for micro.
+        if micro_past is not None and (now - micro_past[0]) >= self.config.lead_micro_window_sec * 0.5:
+            mid_brl_past = micro_past[1]
+            mid_usdt_past = micro_past[2]
+        else:
+            mid_brl_past = mid_brl
+            mid_usdt_past = mid_usdt
+            micro_stale = True  # not enough history → micro disabled
+
+        # Past fair smooth approximation for regime: use the smoothed value
+        # at past tick. Since we don't store the historic smooth, fall back to
+        # raw fair (mid_usdt_past × usdt_brl_past) as an unbiased estimator —
+        # the regime horizon is long enough that EWM mostly approximates raw.
+        if regime_past is not None and (now - regime_past[0]) >= self.config.lead_lag_short_window_sec * 0.5:
+            mid_brl_regime_past = regime_past[1]
+            fair_brl_smooth_past = regime_past[2] * regime_past[3]
+        else:
+            mid_brl_regime_past = mid_brl
+            fair_brl_smooth_past = self._fair_brl_smooth
+            regime_stale = True  # not enough history → regime disabled
+
+        # Adaptive sigma_lag from samples in z_window.
+        z_cutoff = now - self.config.lead_lag_z_window_sec
+        while self._lag_samples and self._lag_samples[0][0] < z_cutoff:
+            self._lag_samples.popleft()
+        # Use a small default sigma during warmup so z_lead doesn't blow up.
+        if len(self._lag_samples) >= 5:
+            mean = sum(s for _, s in self._lag_samples) / len(self._lag_samples)
+            var = sum((s - mean) ** 2 for _, s in self._lag_samples) / max(len(self._lag_samples) - 1, 1)
+            sigma_lag = max(var ** 0.5, 1e-6)
+        else:
+            sigma_lag = 1e-3
+
+        # Record this tick's raw lag_short for next sigma update.
+        # (Compute it inline, not redundantly via compute_lag_regime.)
+        if mid_brl_regime_past > 0 and self._fair_brl_smooth > 0 and fair_brl_smooth_past > 0:
+            import math as _m
+            try:
+                this_lag = _m.log(self._fair_brl_smooth / fair_brl_smooth_past) - _m.log(mid_brl / mid_brl_regime_past)
+                self._lag_samples.append((now, this_lag))
+            except (ValueError, ZeroDivisionError):
+                pass
+
+        return compute_lead_state(
+            mid_brl_now=mid_brl,
+            mid_brl_past=mid_brl_past,
+            mid_usdt_now=mid_usdt,
+            mid_usdt_past=mid_usdt_past,
+            usdt_brl_ref=usdt_brl,
+            fair_brl_smooth_now=self._fair_brl_smooth,
+            fair_brl_smooth_past=fair_brl_smooth_past,
+            sigma_lag=sigma_lag,
+            micro_threshold_bps=self.config.lead_micro_threshold_bps,
+            basis_deadband_bps=self.config.basis_deadband_bps,
+            micro_stale=micro_stale,
+            regime_stale=regime_stale,
+        )
 
     # ── Regime helpers (Phase 4) ─────────────────────────────────────────
 
@@ -461,8 +770,24 @@ class PMMLeadLagSkewController(MarketMakingControllerBase):
         else:
             vol_state = compute_vol_state(1.0, 1.0)  # neutral until enough history
 
-        # Phase 5 stub — neutral
-        lead_state = compute_lead_state(mid_dec, mid_dec, self.config.basis_deadband_bps)
+        # Phase 5 lead-lag — real signals from price history + EWM.
+        lead_state = self._compute_lead_signals(mid_dec)
+        # Micro pause has its own dwell — when fired, latch until dwell expires
+        # so a single tick over the threshold buys lead_micro_dwell_sec of pause.
+        try:
+            now_lead = float(self.market_data_provider.time())
+        except (TypeError, ValueError):
+            now_lead = 0.0
+        if lead_state.pause_buy:
+            self._pause_buy_until = max(
+                self._pause_buy_until,
+                now_lead + self.config.lead_micro_dwell_sec,
+            )
+        if lead_state.pause_sell:
+            self._pause_sell_until = max(
+                self._pause_sell_until,
+                now_lead + self.config.lead_micro_dwell_sec,
+            )
 
         # Phase 2 — live balances
         base_bal, quote_bal = self._get_balances()
@@ -558,6 +883,10 @@ class PMMLeadLagSkewController(MarketMakingControllerBase):
             "s_lead_regime": lead_state.s_lead_regime,
             "s_lead_micro": lead_state.s_lead_micro,
             "basis_bps": lead_state.basis_bps,
+            "micro_stale": lead_state.micro_stale,
+            "regime_stale": lead_state.regime_stale,
+            "pause_buy": lead_state.pause_buy or now_lead < self._pause_buy_until,
+            "pause_sell": lead_state.pause_sell or now_lead < self._pause_sell_until,
             "vol_ratio": vol_state.vol_ratio,
             "regime": regime_state.regime,
             "regime_cause": self._regime_cause,
@@ -579,10 +908,14 @@ class PMMLeadLagSkewController(MarketMakingControllerBase):
 
     def get_levels_to_execute(self) -> List[str]:
         """
-        Filter levels by sides_enabled (Phase 2) and regime (Phase 4):
-          - paused / killed: no orders.
-          - safe: at most one buy + one sell level (the first of each side).
-          - normal / degraded: full configured ladder, modulo sides_enabled.
+        Filter levels by:
+          - regime (Phase 4): paused/killed → []; safe → 1 level per side.
+          - sides_enabled (Phase 2): inventory-driven side shutdown.
+          - lead-lag micro pause (Phase 5, §3.6): suppress side until dwell ends.
+
+        Note: micro pause does NOT cancel active orders here — only suppresses
+        creation of new ones. Cancel-on-lag-≥-spread lives in
+        executors_to_early_stop (B8).
         """
         regime = self.processed_data.get("regime", "normal")
         if regime in ("paused", "killed"):
@@ -594,6 +927,19 @@ class PMMLeadLagSkewController(MarketMakingControllerBase):
             if (lv.startswith("buy") and sides.get("buy", True)) or
                (lv.startswith("sell") and sides.get("sell", True))
         ]
+        # Micro pause filter — only when dwell hasn't expired.
+        try:
+            now = float(self.market_data_provider.time())
+        except (TypeError, ValueError):
+            now = 0.0
+        pause_buy = now < self._pause_buy_until
+        pause_sell = now < self._pause_sell_until
+        if pause_buy or pause_sell:
+            levels = [
+                lv for lv in levels
+                if not (lv.startswith("buy") and pause_buy) and
+                   not (lv.startswith("sell") and pause_sell)
+            ]
         if regime == "safe":
             buy_levels = [lv for lv in levels if lv.startswith("buy")]
             sell_levels = [lv for lv in levels if lv.startswith("sell")]
@@ -700,10 +1046,13 @@ class PMMLeadLagSkewController(MarketMakingControllerBase):
 
     def executors_to_early_stop(self) -> List[ExecutorAction]:
         """
-        Combine three early-stop drivers:
+        Combine four early-stop drivers:
           1. force_requote_bps (§5.7) — stale-order protection in fast markets.
           2. paused / killed regime (§4) — cancel all active resting orders.
           3. safe regime (§4) — keep only buy_0 / sell_0 active; cancel deeper.
+          4. micro lag ≥ spread (§3.6 critério 1, Phase 5) — when the leader
+             moved by more than the resting order's own spread, the order is
+             effectively at fair value and will be sniped → cancel it.
 
         Active trading positions (is_trading=True) are never cancelled here —
         triple-barrier handles them.
@@ -713,6 +1062,10 @@ class PMMLeadLagSkewController(MarketMakingControllerBase):
         regime = self.processed_data.get("regime", "normal")
         stopped_ids = {getattr(a, "executor_id", None) for a in base_actions}
         extra: List[ExecutorAction] = []
+
+        # Phase 5 — only the absolute magnitude of the micro lag matters here;
+        # direction (pause_buy vs pause_sell) is handled by get_levels_to_execute.
+        s_lead_micro_abs = abs(float(self.processed_data.get("s_lead_micro", 0.0) or 0.0))
 
         for executor in self.executors_info:
             if not executor.is_active or executor.is_trading:
@@ -741,6 +1094,30 @@ class PMMLeadLagSkewController(MarketMakingControllerBase):
                     stopped_ids.add(executor.id)
                     continue
 
+            # §3.6 critério 1 — micro lag ≥ side spread → cancel that side's order.
+            # We use the configured per-level spread (closest spread for the side)
+            # as the comparison. side spread is a fraction; convert to bps × 1e4.
+            if s_lead_micro_abs > 0:
+                custom_info = getattr(executor, "custom_info", None) or {}
+                level_id = custom_info.get("level_id", "")
+                side_spreads: List[float] = (
+                    self.config.buy_spreads if level_id.startswith("buy")
+                    else (self.config.sell_spreads if level_id.startswith("sell") else [])
+                )
+                if side_spreads:
+                    side_spread_bps = float(min(side_spreads)) * 1e4  # tightest level
+                    pause_for_side = (
+                        (level_id.startswith("buy") and self.processed_data.get("pause_buy"))
+                        or (level_id.startswith("sell") and self.processed_data.get("pause_sell"))
+                    )
+                    if pause_for_side and s_lead_micro_abs >= side_spread_bps:
+                        extra.append(StopExecutorAction(
+                            controller_id=self.config.id,
+                            executor_id=executor.id,
+                        ))
+                        stopped_ids.add(executor.id)
+                        continue
+
             # Force-requote when price drifted beyond force_requote_bps.
             delta_bps = self._delta_bps_for_executor(executor)
             if delta_bps is not None and delta_bps >= threshold:
@@ -758,7 +1135,9 @@ class PMMLeadLagSkewController(MarketMakingControllerBase):
         "ts", "regime", "regime_cause", "mid", "ref", "shift_bps", "spread_mult",
         "base_bal", "quote_bal", "net_exposure_quote", "over_max_net_position",
         "inv_pct", "inv_delta", "s_inv",
-        "s_lead_micro", "s_lead_regime", "basis_bps", "vol_ratio",
+        "s_lead_micro", "s_lead_regime", "basis_bps",
+        "micro_stale", "regime_stale", "pause_buy", "pause_sell",
+        "vol_ratio",
         "buy_enabled", "sell_enabled",
         "sf_buy", "sf_sell",
         "session_pnl",
@@ -789,6 +1168,10 @@ class PMMLeadLagSkewController(MarketMakingControllerBase):
             "s_lead_micro": d.get("s_lead_micro", ""),
             "s_lead_regime": d.get("s_lead_regime", ""),
             "basis_bps": d.get("basis_bps", ""),
+            "micro_stale": d.get("micro_stale", False),
+            "regime_stale": d.get("regime_stale", False),
+            "pause_buy": d.get("pause_buy", False),
+            "pause_sell": d.get("pause_sell", False),
             "vol_ratio": d.get("vol_ratio", ""),
             "buy_enabled": d.get("sides_enabled", {}).get("buy", True),
             "sell_enabled": d.get("sides_enabled", {}).get("sell", True),
@@ -826,6 +1209,26 @@ class PMMLeadLagSkewController(MarketMakingControllerBase):
         cap_flag = " ! OVER-CAP" if over_cap else ""
         session_pnl = d.get("session_pnl", 0.0)
         cause_str = f" ({regime_cause})" if regime_cause else ""
+        # Phase 5 lead-lag telemetry
+        s_lead_micro = float(d.get("s_lead_micro", 0.0) or 0.0)
+        s_lead_regime = float(d.get("s_lead_regime", 0.0) or 0.0)
+        basis_bps = float(d.get("basis_bps", 0.0) or 0.0)
+        pause_buy = d.get("pause_buy", False)
+        pause_sell = d.get("pause_sell", False)
+        micro_stale = d.get("micro_stale", False)
+        regime_stale = d.get("regime_stale", False)
+        stale_flags = []
+        if micro_stale:
+            stale_flags.append("micro")
+        if regime_stale:
+            stale_flags.append("regime")
+        stale_str = f"  Stale: {','.join(stale_flags)}" if stale_flags else ""
+        pause_flags = []
+        if pause_buy:
+            pause_flags.append("BUY")
+        if pause_sell:
+            pause_flags.append("SELL")
+        pause_str = f"  Pause: {'+'.join(pause_flags)}" if pause_flags else ""
         return [
             f"── PMM Lead-Lag Skew ({self.config.trading_pair}) ──────────────────",
             f"  Regime: {regime:<10}{cause_str}  Vol ratio: {vol_ratio:.2f}x  Spread mult: {spread_mult}",
@@ -833,6 +1236,7 @@ class PMMLeadLagSkewController(MarketMakingControllerBase):
             f"  Inventory: {inv_pct:.1%}  Buy: {'ON ' if sides.get('buy') else 'OFF'}  Sell: {'ON' if sides.get('sell') else 'OFF'}",
             f"  Size factors  buy: {sf.get('buy'):.2f}  sell: {sf.get('sell'):.2f}",
             f"  Net exposure (quote): {net_exp} / {self.config.max_net_position_quote}{cap_flag}",
+            f"  Lead-lag  micro: {s_lead_micro:+.2f} bps  regime: {s_lead_regime:+.3f}  basis: {basis_bps:+.2f} bps{stale_str}{pause_str}",
             f"  Session PnL (quote): {session_pnl:.4f}  Killed: {self._is_killed}",
         ]
 
@@ -856,4 +1260,12 @@ class PMMLeadLagSkewController(MarketMakingControllerBase):
             "sell_enabled": d.get("sides_enabled", {}).get("sell", True),
             "sf_buy": round(sf.get("buy", 1.0), 3),
             "sf_sell": round(sf.get("sell", 1.0), 3),
+            # Phase 5 lead-lag fields
+            "s_lead_micro": round(float(d.get("s_lead_micro", 0.0) or 0.0), 3),
+            "s_lead_regime": round(float(d.get("s_lead_regime", 0.0) or 0.0), 3),
+            "basis_bps": round(float(d.get("basis_bps", 0.0) or 0.0), 3),
+            "pause_buy": bool(d.get("pause_buy", False)),
+            "pause_sell": bool(d.get("pause_sell", False)),
+            "micro_stale": bool(d.get("micro_stale", False)),
+            "regime_stale": bool(d.get("regime_stale", False)),
         }

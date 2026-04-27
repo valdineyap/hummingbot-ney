@@ -115,10 +115,66 @@ Commits: `5d6b1efc` (initial), `1992a90a` (gap fixes vs §2.2/2.3/2.4)
 - [x] telemetria: regime_cause, session_pnl, custom_info (2)
 - [x] testes Fase 1-3 atualizados: setUp Phase 3 com max_net_position=10000; vol_capped_at_3 com novo upper bound
 
+## ✅ Fase 5 — Lead-lag (sintético + micro) — concluída
+
+### Phase 5 A — pure functions em pmm_lead_lag_utils.py
+- [x] `ewm_step()` — EWM contínuo com halflife em segundos
+- [x] `compute_lag_micro()` — lag em bps, pause_buy/pause_sell (BTCUSDT puro)
+- [x] `compute_lag_regime()` — z_lead com sigma adaptativo + tanh + deadband
+- [x] `compute_lead_state()` — composto (micro + regime + basis)
+- [x] LeadState estendido com `pause_buy`/`pause_sell`
+
+### Phase 5 B — config (PMMLeadLagSkewConfig)
+- [x] `leader_connector` / `leader_trading_pair` (BTC-USDT)
+- [x] `quote_rate_connector` / `quote_rate_trading_pair` (USDT-BRL)
+- [x] Micro: `lead_micro_window_sec`, `lead_micro_threshold_bps`, `lead_micro_dwell_sec`
+- [x] Regime: `lead_lag_short_window_sec`, `lead_lag_ewm_halflife_sec`, `lead_lag_z_window_sec`
+- [x] `validate_default=True` no `leader_connector` / `quote_rate_connector` /
+      `candles_connector` / `candles_trading_pair` para que defaults fluam
+
+### Phase 5 C — controller wiring
+- [x] `__init__`: history deque, EWM state (`_fair_brl_smooth`), `_lag_samples`,
+      staleness ts, `_pause_buy_until` / `_pause_sell_until`
+- [x] `get_candles_config()` — adiciona BTC-USDT e USDT-BRL (de-duplica)
+- [x] `_read_latest_close()` / `_read_leg_prices()` / `_record_lead_history()` /
+      `_lookup_past()` helpers
+- [x] `_compute_lead_signals()` — orquestrador completo (EWM, sigma adaptativo,
+      staleness, past lookups, dwell latching)
+- [x] `update_processed_data()` — usa `_compute_lead_signals` real;
+      latch de `_pause_*_until` baseado em `lead_micro_dwell_sec`
+- [x] `processed_data` exposto: `s_lead_micro`, `s_lead_regime`, `basis_bps`,
+      `micro_stale`, `regime_stale`, `pause_buy`, `pause_sell`
+
+### Phase 5 D — efeitos do micro pause nos hooks
+- [x] `get_levels_to_execute()` — filtra side em pause até `_pause_*_until`
+- [x] `executors_to_early_stop()` — §3.6 critério 1: cancela ordem ativa quando
+      `|s_lead_micro| ≥ tightest_side_spread_bps` E `pause_*` está ativo
+- [x] `to_format_status()` — linha extra com `s_lead_micro`, `s_lead_regime`,
+      `basis_bps`, `Stale:`/`Pause:` flags
+- [x] `get_custom_info()` — 7 novos campos lead-lag + staleness
+- [x] CSV: 27 colunas (adicionadas micro_stale, regime_stale, pause_buy, pause_sell)
+
+### Phase 5 E — testes
+- [x] 6 testes `compute_lag_micro` (stale, USDT↑/↓, threshold, brl-acompanha, inválido)
+- [x] 6 testes `compute_lag_regime` (stale, deadband, sinal, clip, inválido)
+- [x] 7 testes `compute_lead_state` composto (neutral, stale isolado, deadband, sinal, micro buy/sell)
+- [x] 5 testes `ewm_step` (warmup, halflife decay, dt=0, inválido)
+- [x] 12 testes controller Phase 5 (pause filter, dwell latch, lag≥spread cancel,
+      staleness, w_lead skew, telemetria, candles_config 3 pares)
+- [x] Phase 4 tests atualizados — `_neutral_lead_state()` helper para isolar lead-lag
+
 ## ⏳ Próximas fases
 
-### Fase 5 — Lead-lag (sintético + micro)
-- [ ] CandlesFeed BTC-USDT + USDT-BRL
-- [ ] s_lead_micro (1-5s, BTCUSDT puro)
-- [ ] s_lead_regime (30s-5min, sintético com EWM + deadband + 3-leg staleness)
-- [ ] w_lead=0.1 inicial, validação A/B
+### Fase 6 — Validação extensiva pré-capital
+- [ ] Backtest replay 30 dias
+- [ ] Paper trading 2 semanas (incl. fim-de-semana)
+- [ ] Calibração thresholds com p95 vol observada
+- [ ] Dry-run R$200 / 3 dias
+- [ ] Aumento progressivo: 500 → 1k → 3k → alvo
+
+### Notas pós-Fase 5
+- `w_lead=0.1` é o default conservador (plan §5.4); subir só com evidência A/B
+- Limitação atual: `_read_latest_close` usa candle 1m → resolução de micro fica
+  presa a 1m enquanto não houver bookTicker subscription dedicada para BTC-USDT
+- TODO Fase 6: medir `cancel_rate` Fase 5 vs Fase 4; se subir > 30% sem
+  ganho de edge, reduzir `lead_micro_threshold_bps` ou zerar `w_lead`

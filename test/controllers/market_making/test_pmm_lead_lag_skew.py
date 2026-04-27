@@ -57,6 +57,16 @@ def _make_mock_connector(base_balance="0", quote_balance="200"):
     return conn
 
 
+def _neutral_lead_state():
+    """Neutral LeadState for tests that don't care about lead-lag signals."""
+    from controllers.market_making.pmm_lead_lag_utils import LeadState
+    return LeadState(
+        s_lead_micro=0.0, s_lead_regime=0.0, basis_bps=0.0,
+        micro_stale=False, regime_stale=False,
+        pause_buy=False, pause_sell=False,
+    )
+
+
 class TestPMMLeadLagSkewControllerPhase1(IsolatedAsyncioWrapperTestCase):
 
     def setUp(self):
@@ -573,23 +583,23 @@ class TestPMMLeadLagSkewControllerPhase4(IsolatedAsyncioWrapperTestCase):
         """vol_ratio > vol_degraded but < vol_pause → degraded."""
         df = self._candles_with_ratio(3.5)
         self.mock_market_data_provider.get_candles_df = MagicMock(return_value=df)
-        await self.controller.update_processed_data()
-        # Skip if synthetic candles fell outside expected band; assertion is on regime label.
+        # Lead-lag uses a separate feed; with the same MagicMock returning the
+        # synthetic df, the implied basis would blow up and trigger paused.
+        # Neutralize lead signals here — this test is about vol-driven regime.
+        with patch.object(self.controller, "_compute_lead_signals",
+                          return_value=_neutral_lead_state()):
+            await self.controller.update_processed_data()
         self.assertIn(self.controller.processed_data["regime"], ("degraded", "safe"))
 
     async def test_regime_paused_when_basis_excessive(self):
         """|basis_bps| above pause_basis_bps → paused."""
-        # Patch the symbol bound inside the controller module (not utils),
-        # because the controller does `from ... import compute_lead_state`.
         from controllers.market_making.pmm_lead_lag_utils import LeadState
         fake_lead = LeadState(
             s_lead_micro=0.0, s_lead_regime=0.0, basis_bps=50.0,
             micro_stale=False, regime_stale=False,
+            pause_buy=False, pause_sell=False,
         )
-        with patch(
-            "controllers.market_making.pmm_lead_lag_skew.compute_lead_state",
-            return_value=fake_lead,
-        ):
+        with patch.object(self.controller, "_compute_lead_signals", return_value=fake_lead):
             await self.controller.update_processed_data()
         self.assertEqual(self.controller.processed_data["regime"], "paused")
 
@@ -605,10 +615,11 @@ class TestPMMLeadLagSkewControllerPhase4(IsolatedAsyncioWrapperTestCase):
         """L1 sustained beyond safe_mode_entry_sec → escalate to safe."""
         df = self._candles_with_ratio(4.0)
         self.mock_market_data_provider.get_candles_df = MagicMock(return_value=df)
-        # Pretend we entered L1 200 seconds ago (> 120s threshold).
         now = float(self.mock_market_data_provider.time())
         self.controller._l1_entry_time = now - 200
-        await self.controller.update_processed_data()
+        with patch.object(self.controller, "_compute_lead_signals",
+                          return_value=_neutral_lead_state()):
+            await self.controller.update_processed_data()
         self.assertEqual(self.controller.processed_data["regime"], "safe")
         self.assertIsNotNone(self.controller._safe_entry_time)
 
@@ -808,6 +819,202 @@ class TestPMMLeadLagSkewControllerPhase4(IsolatedAsyncioWrapperTestCase):
         self.assertIn("is_killed", info)
         self.assertIn("regime_cause", info)
         self.assertIn("session_pnl", info)
+
+
+class TestPMMLeadLagSkewControllerPhase5(IsolatedAsyncioWrapperTestCase):
+    """
+    Phase 5 — lead-lag micro pause + synthetic regime signal.
+
+    The controller's `_compute_lead_signals` is patched per-test to inject a
+    deterministic LeadState; the unit tests for the underlying pure functions
+    live in `test_pmm_lead_lag_utils.py`.
+    """
+
+    def setUp(self):
+        self.tmpdir = tempfile.mkdtemp(prefix="pmm_test_p5_")
+        self.config = _make_config(
+            csv_log_enabled=False,
+            csv_log_dir=self.tmpdir,
+            skew_max_bps=2.0,
+            min_requote_bps=1.0,
+            force_requote_bps=15.0,
+            max_net_position_quote=Decimal("10000"),
+            # Phase 5 thresholds
+            lead_micro_threshold_bps=5.0,
+            lead_micro_dwell_sec=3.0,
+            basis_deadband_bps=3.0,
+            w_lead=0.1,
+        )
+        self.mock_market_data_provider = MagicMock(spec=MarketDataProvider)
+        self.mock_market_data_provider.time = MagicMock(return_value=1_000_000.0)
+        self.mock_actions_queue = AsyncMock(spec=asyncio.Queue)
+        self.controller = PMMLeadLagSkewController(
+            config=self.config,
+            market_data_provider=self.mock_market_data_provider,
+            actions_queue=self.mock_actions_queue,
+        )
+        self.mock_market_data_provider.connectors = {
+            "binance": _make_mock_connector("0.0005", "200"),
+        }
+        self.mock_market_data_provider.get_candles_df = MagicMock(return_value=None)
+        self.mock_market_data_provider.get_price_by_type = MagicMock(return_value=Decimal("400000"))
+
+    def tearDown(self):
+        shutil.rmtree(self.tmpdir, ignore_errors=True)
+
+    def _patch_lead(self, **lead_kwargs):
+        from controllers.market_making.pmm_lead_lag_utils import LeadState
+        defaults = dict(
+            s_lead_micro=0.0, s_lead_regime=0.0, basis_bps=0.0,
+            micro_stale=False, regime_stale=False,
+            pause_buy=False, pause_sell=False,
+        )
+        defaults.update(lead_kwargs)
+        return patch.object(
+            self.controller, "_compute_lead_signals",
+            return_value=LeadState(**defaults),
+        )
+
+    # ── Micro pause level filter (§3.6) ─────────────────────────────────
+
+    async def test_pause_sell_filters_sell_levels(self):
+        """When pause_sell fires, sell levels are removed from execution."""
+        with self._patch_lead(s_lead_micro=50.0, pause_sell=True):
+            await self.controller.update_processed_data()
+        levels = self.controller.get_levels_to_execute()
+        self.assertTrue(any(lv.startswith("buy") for lv in levels))
+        self.assertFalse(any(lv.startswith("sell") for lv in levels))
+
+    async def test_pause_buy_filters_buy_levels(self):
+        with self._patch_lead(s_lead_micro=-50.0, pause_buy=True):
+            await self.controller.update_processed_data()
+        levels = self.controller.get_levels_to_execute()
+        self.assertFalse(any(lv.startswith("buy") for lv in levels))
+        self.assertTrue(any(lv.startswith("sell") for lv in levels))
+
+    async def test_neutral_lead_keeps_all_levels(self):
+        with self._patch_lead():
+            await self.controller.update_processed_data()
+        levels = self.controller.get_levels_to_execute()
+        self.assertTrue(any(lv.startswith("buy") for lv in levels))
+        self.assertTrue(any(lv.startswith("sell") for lv in levels))
+
+    async def test_micro_pause_dwell_persists_across_ticks(self):
+        """One trigger latches pause for lead_micro_dwell_sec, even if next tick clears."""
+        # First tick fires pause_sell.
+        with self._patch_lead(s_lead_micro=50.0, pause_sell=True):
+            await self.controller.update_processed_data()
+        self.assertTrue(self.controller._pause_sell_until > 1_000_000.0)
+        # Next tick at +1s, lead now neutral but dwell hasn't expired yet.
+        self.mock_market_data_provider.time = MagicMock(return_value=1_000_001.0)
+        with self._patch_lead():
+            await self.controller.update_processed_data()
+        self.assertTrue(self.controller.processed_data["pause_sell"])
+        # After dwell expires (3s + 1s buffer), pause clears.
+        self.mock_market_data_provider.time = MagicMock(return_value=1_000_010.0)
+        with self._patch_lead():
+            await self.controller.update_processed_data()
+        self.assertFalse(self.controller.processed_data["pause_sell"])
+
+    # ── §3.6 critério 1: lag ≥ spread → cancel ──────────────────────────
+
+    def _make_resting_executor(self, eid, level_id, entry_price):
+        ex = MagicMock(spec=ExecutorInfo)
+        ex.id = eid
+        ex.is_active = True
+        ex.is_trading = False
+        ex.is_done = False
+        ex.custom_info = {"level_id": level_id}
+        ex.config = MagicMock()
+        ex.config.entry_price = entry_price
+        ex.config.side = TradeType.BUY if level_id.startswith("buy") else TradeType.SELL
+        return ex
+
+    async def test_lag_above_spread_cancels_resting_order(self):
+        """
+        s_lead_micro = 50 bps and pause_sell=True; tightest sell spread = 10 bps.
+        Resting sell order must be cancelled (§3.6 critério 1).
+        """
+        with self._patch_lead(s_lead_micro=50.0, pause_sell=True):
+            await self.controller.update_processed_data()
+        sell0 = self._make_resting_executor("s0", "sell_0", Decimal("400500"))
+        self.controller.executors_info = [sell0]
+        actions = self.controller.executors_to_early_stop()
+        stopped_ids = {a.executor_id for a in actions}
+        self.assertIn("s0", stopped_ids)
+
+    async def test_lag_below_spread_keeps_resting_order(self):
+        """s_lead_micro = 5 bps < 10 bps tightest spread → resting order stays."""
+        # threshold_bps=5; need micro just over threshold but below side_spread (10 bps).
+        with self._patch_lead(s_lead_micro=6.0, pause_sell=True):
+            await self.controller.update_processed_data()
+        # Use entry_price near current mid to avoid force_requote tripping.
+        sell0 = self._make_resting_executor("s0", "sell_0", Decimal("400400"))
+        # New computed price for sell_0 ≈ 400400 → delta ≈ 0 bps; force-requote inert.
+        self.controller.get_price_and_amount = MagicMock(return_value=(Decimal("400400"), Decimal("1")))
+        self.controller.executors_info = [sell0]
+        actions = self.controller.executors_to_early_stop()
+        stopped_ids = {a.executor_id for a in actions}
+        self.assertNotIn("s0", stopped_ids)
+
+    # ── Staleness ───────────────────────────────────────────────────────
+
+    async def test_micro_stale_disables_pause(self):
+        """When micro_stale=True, pause flags must be False even with a lag value."""
+        with self._patch_lead(s_lead_micro=0.0, micro_stale=True,
+                              pause_buy=False, pause_sell=False):
+            await self.controller.update_processed_data()
+        self.assertFalse(self.controller.processed_data["pause_buy"])
+        self.assertFalse(self.controller.processed_data["pause_sell"])
+
+    async def test_regime_stale_zeroes_lead_regime(self):
+        with self._patch_lead(s_lead_regime=0.0, regime_stale=True):
+            await self.controller.update_processed_data()
+        self.assertEqual(self.controller.processed_data["s_lead_regime"], 0.0)
+        self.assertTrue(self.controller.processed_data["regime_stale"])
+
+    # ── Skew contribution from s_lead_regime ────────────────────────────
+
+    async def test_w_lead_contributes_to_price_shift(self):
+        """With w_lead=0.1 and s_lead_regime=-0.5, price_shift_bps shifts toward defense."""
+        # Inventory neutral so s_inv ≈ 0; only s_lead_regime contributes.
+        self.mock_market_data_provider.connectors = {
+            "binance": _make_mock_connector("0.0001", "160"),  # ~50/50 inv
+        }
+        with self._patch_lead(s_lead_regime=-0.5, basis_bps=10.0):
+            await self.controller.update_processed_data()
+        # skew_norm ≈ tanh(0.1 * -0.5) ≈ -0.05 → price_shift_bps ≈ -0.1.
+        # Negative shift → ref > mid → defensive (asks up).
+        shift = self.controller.processed_data["price_shift_bps"]
+        self.assertLess(float(shift), 0.0)
+
+    # ── CSV / telemetry columns ──────────────────────────────────────────
+
+    async def test_processed_data_includes_lead_fields(self):
+        with self._patch_lead(s_lead_micro=8.0, s_lead_regime=-0.3, basis_bps=12.0):
+            await self.controller.update_processed_data()
+        d = self.controller.processed_data
+        for key in ("s_lead_micro", "s_lead_regime", "basis_bps",
+                    "micro_stale", "regime_stale", "pause_buy", "pause_sell"):
+            self.assertIn(key, d)
+        self.assertEqual(d["s_lead_micro"], 8.0)
+        self.assertAlmostEqual(d["s_lead_regime"], -0.3)
+        self.assertAlmostEqual(d["basis_bps"], 12.0)
+
+    async def test_get_custom_info_includes_lead_fields(self):
+        with self._patch_lead(s_lead_micro=4.0, basis_bps=2.0):
+            await self.controller.update_processed_data()
+        info = self.controller.get_custom_info()
+        for key in ("s_lead_micro", "s_lead_regime", "basis_bps",
+                    "pause_buy", "pause_sell", "micro_stale", "regime_stale"):
+            self.assertIn(key, info)
+
+    async def test_get_candles_config_includes_three_pairs(self):
+        cfg = self.controller.get_candles_config()
+        pairs = {(c.connector, c.trading_pair) for c in cfg}
+        self.assertIn(("binance", "BTC-BRL"), pairs)
+        self.assertIn(("binance", "BTC-USDT"), pairs)
+        self.assertIn(("binance", "USDT-BRL"), pairs)
 
 
 if __name__ == "__main__":

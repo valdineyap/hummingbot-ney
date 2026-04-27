@@ -12,6 +12,8 @@ from controllers.market_making.pmm_lead_lag_utils import (
     SidePermissions,
     VolState,
     compute_inventory_state,
+    compute_lag_micro,
+    compute_lag_regime,
     compute_lead_state,
     compute_order_params,
     compute_regime_state,
@@ -20,6 +22,7 @@ from controllers.market_making.pmm_lead_lag_utils import (
     compute_skew_state,
     compute_vol_state,
     compute_volatility_from_prices,
+    ewm_step,
 )
 
 
@@ -310,15 +313,8 @@ class TestComputeVolatilityFromPrices(unittest.TestCase):
         self.assertEqual(compute_volatility_from_prices(["foo", "bar"]), 0.0)
 
 
-class TestLeadAndRegimeStubs(unittest.TestCase):
-    """Verify Phase 5 / Phase 4 stubs return safe neutral values."""
-
-    def test_lead_state_stub_neutral(self):
-        state = compute_lead_state(Decimal("350000"), Decimal("350000"), 3.0)
-        self.assertEqual(state.s_lead_micro, 0.0)
-        self.assertEqual(state.s_lead_regime, 0.0)
-        self.assertFalse(state.micro_stale)
-        self.assertFalse(state.regime_stale)
+class TestRegimeStateStub(unittest.TestCase):
+    """compute_regime_state still returns 'normal' (real machinery is in controller)."""
 
     def test_regime_state_stub_normal(self):
         vol = compute_vol_state(1.0, 1.0)
@@ -328,6 +324,239 @@ class TestLeadAndRegimeStubs(unittest.TestCase):
         regime = compute_regime_state(vol, inv)
         self.assertEqual(regime.regime, "normal")
         self.assertAlmostEqual(regime.spread_multiplier, 1.0)
+
+
+class TestEwmStep(unittest.TestCase):
+
+    def test_warmup_returns_first_positive(self):
+        self.assertEqual(ewm_step(0.0, 100.0, halflife_sec=10.0, dt_sec=1.0), 100.0)
+
+    def test_zero_input_keeps_prev(self):
+        self.assertEqual(ewm_step(50.0, 0.0, 10.0, 1.0), 50.0)
+        self.assertEqual(ewm_step(50.0, -1.0, 10.0, 1.0), 50.0)
+
+    def test_halflife_decay_after_one_halflife(self):
+        # After dt = halflife, alpha = 0.5; new value should be midpoint.
+        out = ewm_step(prev=100.0, new_value=200.0, halflife_sec=10.0, dt_sec=10.0)
+        self.assertAlmostEqual(out, 150.0, places=6)
+
+    def test_zero_dt_returns_new_value(self):
+        # Edge case: dt=0 with positive prev → prev unchanged is more sensible
+        # but we chose to return new (avoids division-by-zero issues elsewhere).
+        out = ewm_step(prev=100.0, new_value=200.0, halflife_sec=10.0, dt_sec=0.0)
+        self.assertEqual(out, 200.0)
+
+    def test_invalid_input_returns_prev(self):
+        self.assertEqual(ewm_step(75.0, "bad", 10.0, 1.0), 75.0)
+
+
+class TestComputeLagMicro(unittest.TestCase):
+
+    def test_stale_returns_zeros(self):
+        lag, pb, ps = compute_lag_micro(
+            mid_brl_now=400000.0, mid_brl_past=400000.0,
+            mid_usdt_now=80000.0, mid_usdt_past=80000.0,
+            usdt_brl_ref=5.0, threshold_bps=5.0, micro_stale=True,
+        )
+        self.assertEqual(lag, 0.0)
+        self.assertFalse(pb)
+        self.assertFalse(ps)
+
+    def test_usdt_up_brl_lagging_pauses_sell(self):
+        # USDT up 0.5% in 5s, BRL flat → asks under-priced → pause SELL.
+        # implied = (80400-80000)*5 = 2000 BRL; actual=0; lag = 2000/400000*1e4 = 50 bps.
+        lag, pb, ps = compute_lag_micro(
+            mid_brl_now=400000.0, mid_brl_past=400000.0,
+            mid_usdt_now=80400.0, mid_usdt_past=80000.0,
+            usdt_brl_ref=5.0, threshold_bps=5.0, micro_stale=False,
+        )
+        self.assertAlmostEqual(lag, 50.0, places=3)
+        self.assertFalse(pb)
+        self.assertTrue(ps)
+
+    def test_usdt_down_brl_lagging_pauses_buy(self):
+        # implied = (79600-80000)*5 = -2000 BRL; actual=0; lag = -50 bps.
+        lag, pb, ps = compute_lag_micro(
+            mid_brl_now=400000.0, mid_brl_past=400000.0,
+            mid_usdt_now=79600.0, mid_usdt_past=80000.0,
+            usdt_brl_ref=5.0, threshold_bps=5.0, micro_stale=False,
+        )
+        self.assertAlmostEqual(lag, -50.0, places=3)
+        self.assertTrue(pb)
+        self.assertFalse(ps)
+
+    def test_below_threshold_no_pause(self):
+        # implied = (80016-80000)*5 = 80 BRL; lag = 80/400000*1e4 = 2 bps; below 5 bps threshold.
+        lag, pb, ps = compute_lag_micro(
+            mid_brl_now=400000.0, mid_brl_past=400000.0,
+            mid_usdt_now=80016.0, mid_usdt_past=80000.0,
+            usdt_brl_ref=5.0, threshold_bps=5.0, micro_stale=False,
+        )
+        self.assertAlmostEqual(lag, 2.0, places=3)
+        self.assertFalse(pb)
+        self.assertFalse(ps)
+
+    def test_brl_caught_up_no_lag(self):
+        # USDT moved +1% (800), BRL moved +1% (4000) with rate=5 → no lag.
+        lag, pb, ps = compute_lag_micro(
+            mid_brl_now=404000.0, mid_brl_past=400000.0,
+            mid_usdt_now=80800.0, mid_usdt_past=80000.0,
+            usdt_brl_ref=5.0, threshold_bps=5.0, micro_stale=False,
+        )
+        self.assertAlmostEqual(lag, 0.0, places=3)
+        self.assertFalse(pb)
+        self.assertFalse(ps)
+
+    def test_invalid_inputs_returns_zeros(self):
+        lag, pb, ps = compute_lag_micro(0, 100.0, 1.0, 1.0, 1.0, 5.0, False)
+        self.assertEqual((lag, pb, ps), (0.0, False, False))
+
+
+class TestComputeLagRegime(unittest.TestCase):
+
+    def test_stale_returns_zeros(self):
+        s, z = compute_lag_regime(
+            mid_brl_now=400000.0, mid_brl_past=400000.0,
+            fair_brl_smooth_now=400500.0, fair_brl_smooth_past=400000.0,
+            sigma_lag=0.001, basis_bps=12.5, basis_deadband_bps=3.0,
+            regime_stale=True,
+        )
+        self.assertEqual(s, 0.0)
+        self.assertEqual(z, 0.0)
+
+    def test_inside_deadband_zeroes_signal_keeps_z(self):
+        s, z = compute_lag_regime(
+            mid_brl_now=400000.0, mid_brl_past=399000.0,
+            fair_brl_smooth_now=400100.0, fair_brl_smooth_past=399000.0,
+            sigma_lag=0.001, basis_bps=2.0, basis_deadband_bps=3.0,
+            regime_stale=False,
+        )
+        self.assertEqual(s, 0.0)
+        self.assertNotEqual(z, 0.0)
+
+    def test_brl_below_fair_pushes_signal_negative(self):
+        # fair grew more than BRL → lag>0 → defensive: s_lead < 0.
+        s, z = compute_lag_regime(
+            mid_brl_now=400000.0, mid_brl_past=400000.0,
+            fair_brl_smooth_now=400500.0, fair_brl_smooth_past=400000.0,
+            sigma_lag=0.001, basis_bps=12.5, basis_deadband_bps=3.0,
+            regime_stale=False,
+        )
+        self.assertGreater(z, 0.0)
+        self.assertLess(s, 0.0)
+
+    def test_brl_above_fair_pushes_signal_positive(self):
+        s, z = compute_lag_regime(
+            mid_brl_now=400500.0, mid_brl_past=400000.0,
+            fair_brl_smooth_now=400000.0, fair_brl_smooth_past=400000.0,
+            sigma_lag=0.001, basis_bps=-12.5, basis_deadband_bps=3.0,
+            regime_stale=False,
+        )
+        self.assertLess(z, 0.0)
+        self.assertGreater(s, 0.0)
+
+    def test_signal_clipped_in_unit_range(self):
+        # Tiny sigma_lag inflates z → tanh saturates near ±1.
+        s, _ = compute_lag_regime(
+            mid_brl_now=400000.0, mid_brl_past=400000.0,
+            fair_brl_smooth_now=410000.0, fair_brl_smooth_past=400000.0,
+            sigma_lag=1e-9, basis_bps=250.0, basis_deadband_bps=3.0,
+            regime_stale=False,
+        )
+        self.assertLessEqual(s, 0.0)
+        self.assertGreaterEqual(s, -1.0)
+
+    def test_invalid_prices_returns_zeros(self):
+        s, z = compute_lag_regime(
+            mid_brl_now=0.0, mid_brl_past=400000.0,
+            fair_brl_smooth_now=400500.0, fair_brl_smooth_past=400000.0,
+            sigma_lag=0.001, basis_bps=12.5, basis_deadband_bps=3.0,
+            regime_stale=False,
+        )
+        self.assertEqual((s, z), (0.0, 0.0))
+
+
+class TestComputeLeadStateComposite(unittest.TestCase):
+    """Verify compute_lead_state wires micro + regime + basis correctly."""
+
+    def _kwargs(self, **overrides):
+        base = dict(
+            mid_brl_now=400000.0, mid_brl_past=400000.0,
+            mid_usdt_now=80000.0, mid_usdt_past=80000.0,
+            usdt_brl_ref=5.0,
+            fair_brl_smooth_now=400000.0, fair_brl_smooth_past=400000.0,
+            sigma_lag=0.001,
+            micro_threshold_bps=5.0,
+            basis_deadband_bps=3.0,
+            micro_stale=False,
+            regime_stale=False,
+        )
+        base.update(overrides)
+        return base
+
+    def test_neutral_inputs_zero_signals(self):
+        ls = compute_lead_state(**self._kwargs())
+        self.assertEqual(ls.s_lead_micro, 0.0)
+        self.assertEqual(ls.s_lead_regime, 0.0)
+        self.assertEqual(ls.basis_bps, 0.0)
+        self.assertFalse(ls.pause_buy)
+        self.assertFalse(ls.pause_sell)
+        self.assertFalse(ls.micro_stale)
+        self.assertFalse(ls.regime_stale)
+
+    def test_micro_stale_kills_micro_only(self):
+        ls = compute_lead_state(**self._kwargs(
+            mid_usdt_now=80400.0, mid_usdt_past=80000.0,
+            fair_brl_smooth_now=400500.0,
+            micro_stale=True,
+        ))
+        self.assertEqual(ls.s_lead_micro, 0.0)
+        self.assertFalse(ls.pause_sell)
+        # Regime not stale → s_lead_regime can fire (basis = 12.5 bps > deadband 3).
+        self.assertNotEqual(ls.s_lead_regime, 0.0)
+
+    def test_regime_stale_kills_regime_only(self):
+        ls = compute_lead_state(**self._kwargs(
+            mid_usdt_now=80400.0,
+            fair_brl_smooth_now=400500.0,
+            regime_stale=True,
+        ))
+        self.assertEqual(ls.s_lead_regime, 0.0)
+        self.assertNotEqual(ls.s_lead_micro, 0.0)
+
+    def test_basis_below_deadband_zeroes_regime_signal(self):
+        # basis = (400100 - 400000)/400000 * 1e4 = 2.5 bps < 3 bps deadband.
+        ls = compute_lead_state(**self._kwargs(
+            fair_brl_smooth_now=400100.0,
+            mid_brl_past=399000.0,
+            fair_brl_smooth_past=399000.0,
+        ))
+        self.assertAlmostEqual(ls.basis_bps, 2.5, places=2)
+        self.assertEqual(ls.s_lead_regime, 0.0)
+
+    def test_sign_convention_brl_below_fair_negative_signal(self):
+        # USDT-BRL synthetic above mid_brl → defensive: s_lead_regime < 0
+        ls = compute_lead_state(**self._kwargs(
+            fair_brl_smooth_now=400500.0,  # basis = 12.5 bps > 3
+        ))
+        self.assertGreater(ls.basis_bps, 3.0)
+        self.assertLess(ls.s_lead_regime, 0.0)
+
+    def test_micro_pause_sell_when_usdt_up(self):
+        ls = compute_lead_state(**self._kwargs(
+            mid_usdt_now=80400.0, mid_usdt_past=80000.0,  # +50 bps lag at rate 5
+        ))
+        self.assertGreater(ls.s_lead_micro, 5.0)
+        self.assertTrue(ls.pause_sell)
+        self.assertFalse(ls.pause_buy)
+
+    def test_micro_pause_buy_when_usdt_down(self):
+        ls = compute_lead_state(**self._kwargs(
+            mid_usdt_now=79600.0, mid_usdt_past=80000.0,
+        ))
+        self.assertLess(ls.s_lead_micro, -5.0)
+        self.assertTrue(ls.pause_buy)
+        self.assertFalse(ls.pause_sell)
 
 
 if __name__ == "__main__":
