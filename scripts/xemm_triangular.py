@@ -49,12 +49,15 @@ class XEMMTriangularConfig(_simple_xemm.SimpleXEMMConfig):
     leg2_pair: str = Field("USDT-BRL", json_schema_extra={
         "prompt": "Synthetic sub-leg 2: intermediate-to-quote pair (e.g. USDT-BRL)", "prompt_on_new": True})
 
-    usdt_rebalance_target: Decimal = Field(Decimal("10"), json_schema_extra={
-        "prompt": "Target USDT buffer on the synthetic exchange", "prompt_on_new": True})
-    usdt_rebalance_threshold: Decimal = Field(Decimal("2"), json_schema_extra={
-        "prompt": "USDT drift tolerance before rebalancing", "prompt_on_new": True})
-    usdt_rebalance_interval: int = Field(60, json_schema_extra={
-        "prompt": "Ticks between USDT balance checks (~60 s at 1 s/tick)", "prompt_on_new": True})
+    triangulation_coin_rebalance_target: Decimal = Field(Decimal("100"), json_schema_extra={
+        "prompt": "Target balance for the intermediate coin on the synthetic exchange (e.g. 100 USDT)",
+        "prompt_on_new": True})
+    triangulation_coin_rebalance_threshold: Decimal = Field(Decimal("10"), json_schema_extra={
+        "prompt": "Max drift allowed from target before rebalancing (e.g. 10 USDT)",
+        "prompt_on_new": True})
+    triangulation_coin_rebalance_interval: int = Field(60, json_schema_extra={
+        "prompt": "Ticks between intermediate coin balance checks (~60 s at 1 s/tick)",
+        "prompt_on_new": True})
 
     def update_markets(self, markets):
         # Register the real direct-pair side (maker by default) and the leg exchange.
@@ -102,6 +105,8 @@ class XEMMTriangular(_simple_xemm.SimpleXEMM):
 
         super().__init__(connectors, config)
         self._rebalance_counter = 0
+        self._startup_checked = False
+        self._halted = False
 
     def place_buy_order(self, exchange, trading_pair, amount, order_type=OrderType.LIMIT):
         if exchange.endswith("_synthetic"):
@@ -158,7 +163,6 @@ class XEMMTriangular(_simple_xemm.SimpleXEMM):
             syn_spread_pct = (syn_buy - syn_sell) / syn_mid * Decimal("100") if syn_mid else Decimal("0")
 
             # Fee breakdown for synthetic taker
-            syn_conn = self.connectors.get(self.config.taker_connector) or self.connectors.get(self.config.maker_connector)
             base, quote = self.config.leg1_pair.split("-")
             leg1_fee = conn.get_fee(base, quote, OrderType.MARKET, TradeType.SELL, amt, leg1_sell_p, False)
             int_asset = self.config.leg1_pair.split("-")[1]
@@ -196,44 +200,77 @@ class XEMMTriangular(_simple_xemm.SimpleXEMM):
             self.logger().warning(f"[TRI PRICES] Error: {e}")
 
     def on_tick(self):
-        super().on_tick()  # full SimpleXEMM logic: prices, maker orders, cancels, hedges
+        if not self._startup_checked:
+            self._startup_checked = True
+            self._check_startup()
+
+        if self._halted:
+            coin = self.config.leg2_pair.split("-")[0]
+            target = self.config.triangulation_coin_rebalance_target
+            threshold = self.config.triangulation_coin_rebalance_threshold
+            self.logger().warning(
+                f"Bot halted: {coin} balance is too far from target={target} "
+                f"(threshold={threshold}). Fix triangulation_coin_rebalance_target in config and restart."
+            )
+            return
+
+        super().on_tick()
 
         # Log triangular price breakdown every 60 ticks
         if self._tick_counter % 60 == 1:
             self._log_triangular_prices()
 
         self._rebalance_counter += 1
-        if self._rebalance_counter >= self.config.usdt_rebalance_interval:
+        if self._rebalance_counter >= self.config.triangulation_coin_rebalance_interval:
             self._rebalance_counter = 0
-            self._maybe_rebalance_usdt()
+            self._maybe_rebalance_triangulation_coin()
 
-    def _maybe_rebalance_usdt(self):
-        """
-        Corrects residual drift in the intermediate asset accumulated from bid-ask slippage.
-        The intermediate asset is the quote of leg1 (e.g. ETH in BTC-ETH, USDT in BTC-USDT).
-        Fires a single MARKET order on leg2 to bring the intermediate back to target.
-        """
-        intermediate_asset = self.config.leg1_pair.split("-")[1]
+    def _check_startup(self):
+        coin = self.config.leg2_pair.split("-")[0]
         conn = self.connectors[self.config.leg_connector]
-        balance = Decimal(str(conn.get_available_balance(intermediate_asset)))
-        drift = balance - self.config.usdt_rebalance_target
+        balance = Decimal(str(conn.get_available_balance(coin)))
+        target = self.config.triangulation_coin_rebalance_target
+        threshold = self.config.triangulation_coin_rebalance_threshold
+        drift = abs(balance - target)
 
-        if abs(drift) <= self.config.usdt_rebalance_threshold:
+        if drift > threshold:
+            self._halted = True
+            self.logger().error(
+                f"STARTUP HALT: {coin} balance={balance:.4f} differs from "
+                f"triangulation_coin_rebalance_target={target} by {drift:.4f} "
+                f"(max allowed={threshold}). "
+                f"Rebalance {coin} manually or adjust the config before restarting."
+            )
+        else:
+            self.logger().info(
+                f"Startup check OK: {coin} balance={balance:.4f}, target={target}, drift={drift:.4f}"
+            )
+
+    def _maybe_rebalance_triangulation_coin(self):
+        """
+        Corrects residual drift in the intermediate coin accumulated from bid-ask
+        slippage across hedge cycles. Fires a single MARKET order on leg2 to bring
+        the balance back to target.
+        """
+        coin = self.config.leg2_pair.split("-")[0]
+        conn = self.connectors[self.config.leg_connector]
+        balance = Decimal(str(conn.get_available_balance(coin)))
+        drift = balance - self.config.triangulation_coin_rebalance_target
+
+        if abs(drift) <= self.config.triangulation_coin_rebalance_threshold:
             return
 
         mid = Decimal(str(conn.get_mid_price(self.config.leg2_pair)))
 
         if drift > Decimal("0"):
-            # Excess intermediate → sell via leg2
             self.sell(self.config.leg_connector, self.config.leg2_pair,
                       drift, OrderType.MARKET, mid)
             self.logger().info(
-                f"Intermediate rebalance SELL {drift:.4f} {intermediate_asset} ({self.config.leg2_pair})"
-                f" — balance={balance:.4f}")
+                f"{coin} rebalance SELL {drift:.4f} ({self.config.leg2_pair}) — balance={balance:.4f}"
+            )
         else:
-            # Deficit intermediate → buy via leg2
             self.buy(self.config.leg_connector, self.config.leg2_pair,
                      abs(drift), OrderType.MARKET, mid)
             self.logger().info(
-                f"Intermediate rebalance BUY {abs(drift):.4f} {intermediate_asset} ({self.config.leg2_pair})"
-                f" — balance={balance:.4f}")
+                f"{coin} rebalance BUY {abs(drift):.4f} ({self.config.leg2_pair}) — balance={balance:.4f}"
+            )
