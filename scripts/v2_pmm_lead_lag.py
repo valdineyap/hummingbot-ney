@@ -13,6 +13,41 @@ The script reads the controller config from:
   conf/controllers/conf_pmm_lead_lag_skew.yml
 """
 import os
+
+# Paper-trade compatibility patch.
+# PaperTradeExchange (V1 Cython) lacks two attributes V2 PositionExecutor requires:
+#   1. .trading_rules   — patched to return permissive TradingRule defaults
+#   2. ._order_tracker  — patched to return None (TrackedOrder handles None safely)
+# We patch ExecutorBase at import time so all subclasses pick it up without
+# modifying upstream executor files.
+def _patch_executor_base_for_paper_trade():
+    from hummingbot.connector.trading_rule import TradingRule as _TradingRule
+    from hummingbot.strategy_v2.executors.executor_base import ExecutorBase as _ExecutorBase
+
+    _orig_trading_rules = _ExecutorBase.get_trading_rules
+    _orig_in_flight = _ExecutorBase.get_in_flight_order
+
+    def _trading_rules_fallback(self, connector_name: str, trading_pair: str):
+        connector = self.connectors.get(connector_name)
+        if connector is not None and not hasattr(connector, "trading_rules"):
+            return _TradingRule(trading_pair)  # permissive defaults (min=0)
+        return _orig_trading_rules(self, connector_name, trading_pair)
+
+    def _in_flight_fallback(self, connector_name: str, order_id: str):
+        # PaperTradeExchange has no _order_tracker; return None so TrackedOrder
+        # falls back to safe defaults (is_done=False, executed_amount=0).
+        # Fill amounts are still counted via _total_executed_amount_backup from
+        # process_order_completed_event.
+        connector = self.connectors.get(connector_name)
+        if connector is not None and not hasattr(connector, "_order_tracker"):
+            return None
+        return _orig_in_flight(self, connector_name, order_id)
+
+    _ExecutorBase.get_trading_rules = _trading_rules_fallback
+    _ExecutorBase.get_in_flight_order = _in_flight_fallback
+
+
+_patch_executor_base_for_paper_trade()
 from decimal import Decimal
 from typing import Dict, List, Optional
 
