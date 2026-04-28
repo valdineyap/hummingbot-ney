@@ -20,7 +20,7 @@ spread bilateral com controle rígido de inventário, sem alpha direcional.
 
 ## 2. Estado atual — o que já foi implementado
 
-**Todas as Fases 1–5 estão concluídas e testadas.** 130 testes passando.
+**Todas as Fases 1–5 estão concluídas e testadas. Fase 6 (paper trade) iniciada.** 150 testes passando.
 
 | Fase | Commit | Conteúdo |
 |------|--------|----------|
@@ -29,8 +29,11 @@ spread bilateral com controle rígido de inventário, sem alpha direcional.
 | 3 | `d1de1efb` | Skew por inventário, vol multiplier, freios de churn |
 | 4 | `5a30246f` | Regime L1/L1.5/L2/L3, kill switch, session PnL |
 | 5 | `8c3d4c9e` | Lead-lag micro pause + sintético fair_brl EWM |
+| Pós-5 refactor | `c432df4e` | Modulariza regime em utils, staleness/critical-error, orders.csv |
+| Pós-5 paper boot | `9f4407ea` | Patch V1/V2 compat para paper trade no boot script |
+| Pós-5 paper config | `ee7e6980` | Configs paper trade (YAMLs para script + controller) |
 
-**Fase 6 (paper trading + capital real) ainda não foi iniciada.**
+**Fase 6 em andamento — paper trade rodando com configs dedicados.**
 
 ---
 
@@ -38,23 +41,27 @@ spread bilateral com controle rígido de inventário, sem alpha direcional.
 
 ```
 controllers/market_making/
-  pmm_lead_lag_skew.py        ← controller + config (PMMLeadLagSkewController)
-  pmm_lead_lag_utils.py       ← funções puras testáveis (sem connectors/feeds)
-  IMPL_PROGRESS.md            ← checklist detalhado por fase
+  pmm_lead_lag_skew.py              ← controller + config (PMMLeadLagSkewController)
+  pmm_lead_lag_utils.py             ← funções puras testáveis (sem connectors/feeds)
+  IMPL_PROGRESS.md                  ← checklist detalhado por fase
 
 scripts/
-  v2_pmm_lead_lag.py          ← boot script com drawdown global de sessão
+  v2_pmm_lead_lag.py                ← boot script com patch V1/V2 compat + drawdown global
+
+conf/scripts/
+  conf_v2_pmm_lead_lag.yml          ← config do boot script (drawdown global, controller list)
 
 conf/controllers/
-  conf_pmm_lead_lag_skew.yml  ← YAML de configuração atual
+  conf_pmm_lead_lag_skew.yml        ← YAML live (binance real, max_net_position=60)
+  conf_pmm_lead_lag_skew_paper.yml  ← YAML paper trade (binance_paper_trade, sem cap)
 
 test/controllers/market_making/
-  test_pmm_lead_lag_skew.py   ← 66 testes do controller
-  test_pmm_lead_lag_utils.py  ← 64 testes das funções puras
+  test_pmm_lead_lag_skew.py         ← 72 testes do controller
+  test_pmm_lead_lag_utils.py        ← 78 testes das funções puras
 
 docs/pmm_lead_lag/
-  PLAN.md                     ← plano completo de implementação (1468 linhas)
-  HANDOFF.md                  ← este arquivo
+  PLAN.md                           ← plano completo de implementação (1468 linhas)
+  HANDOFF.md                        ← este arquivo
 ```
 
 ---
@@ -64,15 +71,15 @@ docs/pmm_lead_lag/
 ```bash
 cd /home/user/hummingbot-ney
 
-# Todos os testes do projeto (130 testes, ~10s)
+# Todos os testes do projeto (150 testes, ~10s)
 python -m pytest test/controllers/market_making/test_pmm_lead_lag_skew.py \
                  test/controllers/market_making/test_pmm_lead_lag_utils.py \
                  -v --tb=short
 
-# Só utils (64 testes, funções puras)
+# Só utils (78 testes, funções puras)
 python -m pytest test/controllers/market_making/test_pmm_lead_lag_utils.py -v
 
-# Só controller (66 testes)
+# Só controller (72 testes)
 python -m pytest test/controllers/market_making/test_pmm_lead_lag_skew.py -v
 
 # Um teste específico
@@ -86,47 +93,59 @@ python -m pytest test/controllers/market_making/test_pmm_lead_lag_skew.py \
 
 ## 5. Como rodar o bot em paper trading
 
-### 5.1 Pré-requisitos
-
-O Hummingbot deve estar instalado e configurado. Verificar:
+### 5.1 Iniciar (headless)
 
 ```bash
-# No ambiente Hummingbot (conda ou venv):
-python -c "from hummingbot.strategy_v2.controllers.market_making_controller_base import MarketMakingControllerBase; print('OK')"
-```
+conda activate hummingbot
+cd ~/hummingbot-ney
+conda run -n hummingbot python bin/hummingbot_quickstart.py \
+  --v2 conf_v2_pmm_lead_lag.yml -p Senha123 --headless &
 
-### 5.2 Configurar paper connector
-
-No Hummingbot CLI:
-```
-create --controller-config conf/controllers/conf_pmm_lead_lag_skew.yml
-```
-
-Ou manualmente criar connector `paper_trade` com saldo inicial:
-- BTC: 0.001 (≈ R$500 ao preço atual)
-- BRL: 200
-
-### 5.3 Iniciar o bot
-
-```bash
-# No Hummingbot CLI:
-start --script v2_pmm_lead_lag.py --conf conf/scripts/conf_v2_pmm_lead_lag.yml
-```
-
-Após 2 minutos, verificar com `status`:
-- Deve mostrar `Regime: normal`
-- `inv_pct` próximo de 0.50
-- 2 ordens de compra + 2 ordens de venda ativas
-
-### 5.4 Verificar logs
-
-```bash
-# CSV de sinais (atualizado a cada tick ~1s):
+# Monitorar sinais em tempo real:
 tail -f logs/pmm_lead_lag/signals.csv
 
-# Log principal do Hummingbot:
-tail -f logs/hummingbot_logs.log | grep -E "(ERROR|WARNING|pmm_lead_lag)"
+# Log geral (filtrar MQTT que é verboso):
+tail -f logs/logs_conf_v2_pmm_lead_lag.log | grep -v MQTT
 ```
+
+O config `conf/scripts/conf_v2_pmm_lead_lag.yml` aponta automaticamente para
+`conf/controllers/conf_pmm_lead_lag_skew_paper.yml` (connector `binance_paper_trade`).
+
+### 5.2 Verificar que está operando
+
+Após ~2 minutos nos logs:
+- Linha em `signals.csv` com `regime=normal`
+- `inv_pct` próximo de 0.50
+- Ordens criadas: 2 bids + 2 asks a 10 bps e 20 bps do mid
+
+### 5.3 Limitações do paper trade (importante)
+
+| Funcionalidade | Status |
+|----------------|--------|
+| Regime (normal/degraded/safe/paused/killed) | ✅ funciona |
+| Spread e preço das ordens | ✅ funciona |
+| Inventory tracking (`inv_pct`, `s_inv`) | ✅ funciona |
+| `signals.csv` e `orders.csv` em tempo real | ✅ funciona |
+| Colocação de ordens no paper connector | ✅ funciona |
+| Fill tracking / `session_pnl` | ❌ sempre zero |
+
+**Por que fill tracking é zero:** `PaperTradeExchange` é Cython V1 e não completa o
+ciclo de vida do executor V2. O patch de compatibilidade (`_patch_executor_base_for_paper_trade`)
+resolve o crash de inicialização, mas não emula fills completos.
+
+**Workaround de PnL:** monitorar riqueza total via `signals.csv`:
+
+```python
+# Exemplo de cálculo de PnL estimado a partir de signals.csv:
+import pandas as pd
+df = pd.read_csv("logs/pmm_lead_lag/signals.csv")
+df["wealth_brl"] = df["base_balance"].astype(float) * df["mid_brl"].astype(float) \
+                 + df["quote_balance"].astype(float)
+pnl = df["wealth_brl"].iloc[-1] - df["wealth_brl"].iloc[0]
+```
+
+Fill tracking real e `session_pnl` funcionarão corretamente no dry-run com conector
+`binance` real (Fase 6 após paper).
 
 ---
 
@@ -148,23 +167,21 @@ em YAML separado. NUNCA misturar capital entre as duas instâncias.
 
 ---
 
-## 7. Próxima tarefa — Fase 6
+## 7. Fase 6 em andamento — validação pré-capital
 
-A próxima tarefa é a **Fase 6: validação pré-capital**. Sequência obrigatória:
+### 7.1 Semana 1 — Baseline Phase 4 (em andamento)
 
-### 7.1 Semana 1 — Baseline Phase 4
-
-- Rodar paper trading com `w_lead: 0.0` (config atual)
-- Coletar métricas em `logs/pmm_lead_lag/signals.csv`:
-  - `turnover` = volume / capital
-  - `PnL líquido` = trading_pnl − fees
-  - `max_drawdown`
-  - `inventory_drift_stddev` = stddev de `inv_pct`
-  - `adverse_fill_ratio_10s`
+- Paper trade rodando com `w_lead: 0.0` (config `conf_pmm_lead_lag_skew_paper.yml`)
+- Métricas a coletar via `logs/pmm_lead_lag/signals.csv`:
+  - `inventory_drift_stddev` = stddev de `inv_pct` (coluna da signals)
+  - `adverse_fill_ratio_10s` (coluna da signals)
+  - PnL estimado: `base_balance * mid_brl + quote_balance` (ver §5.3 workaround)
+  - `regime` — % do tempo em cada estado
+- **Nota:** `session_pnl` e `fill_rate` são zero no paper trade (limitação V1/V2, ver §5.3)
 
 ### 7.2 Semanas 2–3 — A/B Phase 4 vs Phase 5
 
-- Segunda instância com `w_lead: 0.1` (Phase 5)
+- Segunda instância com `w_lead: 0.1` (Phase 5) — criar novo YAML copiando o paper com essa mudança
 - Gate para aceitar Phase 5:
   - `adverse_fill_ratio_10s` cai ≥ 15%
   - volume de fills não cai > 15%
@@ -173,7 +190,7 @@ A próxima tarefa é a **Fase 6: validação pré-capital**. Sequência obrigat�
 ### 7.3 Após A/B
 
 1. Calibrar thresholds com p95 de vol observada
-2. Dry-run R$200 real por 3 dias
+2. Dry-run R$200 real por 3 dias (fill tracking funcionará com conector real)
 3. Escala progressiva: 500 → 1k → 3k → alvo
 
 ### 7.4 Limitação conhecida da Phase 5
@@ -314,3 +331,11 @@ BTC-USDT (TODO Phase 6).
 `to_format_status()` mostra `Regime: PAUSED (cause: ...)` no topo.
 O CSV `signals.csv` tem colunas `regime` e `regime_cause` em cada linha.
 Transições para killed geram log `CRITICAL`.
+
+**Por que `session_pnl` é sempre 0 no paper trade?**  
+`PaperTradeExchange` é implementado em Cython V1 e não completa o ciclo de vida do
+`PositionExecutor` V2 (o executor nunca recebe evento de fill). O patch de compat
+(`_patch_executor_base_for_paper_trade`) resolve o crash de inicialização mas não
+emula fills. Workaround: calcular riqueza como `base_balance * mid_brl + quote_balance`
+a partir das colunas da `signals.csv`. Fill tracking real funciona com conector `binance`
+real (dry-run Fase 6).

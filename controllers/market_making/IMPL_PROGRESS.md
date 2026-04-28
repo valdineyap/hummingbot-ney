@@ -199,11 +199,47 @@ Endereça achados de revisão externa pré-paper trading.
 - [x] 2 testes `orders.csv` (escrita ativa/desativada)
 - Total: 150 testes passando (78 utils + 72 controller)
 
+## ✅ Pós-Fase 5 — Paper trade bootstrap (commits 9f4407ea + ee7e6980)
+
+### Patch V1/V2 compat (`scripts/v2_pmm_lead_lag.py`)
+- [x] `_patch_executor_base_for_paper_trade()` — monkey-patch em `ExecutorBase` aplicado
+      na importação do script; sem modificar nenhum arquivo de `strategy_v2/executors/`
+- [x] `.trading_rules` → retorna `TradingRule(trading_pair)` com defaults permissivos
+      (min_order_size=0, min_notional_size=0); evita crash no `__init__` do executor
+- [x] `._order_tracker` → retorna `None`; `TrackedOrder` lida com None de forma segura
+      (is_done=False, executed_amount=0)
+
+### Configs de paper trade
+- [x] `conf/scripts/conf_v2_pmm_lead_lag.yml` — aponta para `conf_pmm_lead_lag_skew_paper.yml`,
+      `max_global_drawdown_quote: 10.0 BRL`, `max_controller_drawdown_quote: null`
+- [x] `conf/controllers/conf_pmm_lead_lag_skew_paper.yml` — connector `binance_paper_trade`,
+      candles/leader/quote_rate_connector → `binance` (CandlesFactory não suporta paper_trade),
+      `max_net_position_quote: 999999` (saldo paper 1 BTC + 500k BRL viola cap live de R$60),
+      `w_lead: 0.0` (Semana 1 baseline Phase 4)
+
+### Limitações conhecidas do paper trade
+- **Fill tracking zerado**: `PaperTradeExchange` (Cython V1) não completa ciclo de vida do
+  executor V2 → `session_pnl` permanece 0 durante todo o paper trade
+- **Workaround de PnL**: monitorar `base_bal * mid + quote_bal` via `signals.csv`
+  (colunas `base_balance`, `mid_brl`, `quote_balance` ou equivalente na signals)
+- Regime, spread, inv_pct, signals.csv e colocação de ordens funcionam corretamente
+
+### Como iniciar
+```bash
+conda activate hummingbot
+cd ~/hummingbot-ney
+conda run -n hummingbot python bin/hummingbot_quickstart.py \
+  --v2 conf_v2_pmm_lead_lag.yml -p Senha123 --headless &
+
+tail -f logs/pmm_lead_lag/signals.csv
+tail -f logs/logs_conf_v2_pmm_lead_lag.log | grep -v MQTT
+```
+
 ## ⏳ Próximas fases
 
 ### Fase 6 — Validação extensiva pré-capital
+- [ ] Paper trading 2 semanas (incl. fim-de-semana) — **EM ANDAMENTO** (paper bootstrap feito)
 - [ ] Backtest replay 30 dias
-- [ ] Paper trading 2 semanas (incl. fim-de-semana)
 - [ ] Calibração thresholds com p95 vol observada
 - [ ] Dry-run R$200 / 3 dias
 - [ ] Aumento progressivo: 500 → 1k → 3k → alvo
@@ -214,3 +250,5 @@ Endereça achados de revisão externa pré-paper trading.
   presa a 1m enquanto não houver bookTicker subscription dedicada para BTC-USDT
 - TODO Fase 6: medir `cancel_rate` Fase 5 vs Fase 4; se subir > 30% sem
   ganho de edge, reduzir `lead_micro_threshold_bps` ou zerar `w_lead`
+- TODO Fase 6: `session_pnl` sempre zero em paper → usar `base_bal * mid + quote_bal`
+  da signals.csv como proxy de PnL; implementar fill tracking real só no dry-run
