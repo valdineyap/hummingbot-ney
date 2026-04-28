@@ -10,9 +10,9 @@ Phase 5: replace lead stubs with synthetic fair_brl and micro pause.
 from __future__ import annotations
 
 import math
-from dataclasses import dataclass
+from dataclasses import dataclass, field
 from decimal import Decimal
-from typing import Tuple
+from typing import List, Optional, Tuple
 
 
 # ── Dataclasses ──────────────────────────────────────────────────────────────
@@ -63,6 +63,45 @@ class RegimeState:
     """Phase 4 — regime classification. Always "normal" in Phase 1."""
     regime: str             # "normal" | "degraded" | "safe" | "paused" | "killed"
     spread_multiplier: float  # regime-adjusted multiplier (1x normal, 1.5x degraded)
+    cause: str = ""         # human-readable reason (e.g. "vol_ratio=4.2>3.0")
+
+
+@dataclass
+class RegimeContext:
+    """
+    Mutable state carried across ticks for the regime state machine (§4.3).
+
+    The controller owns one instance and passes it to compute_regime_state on
+    each tick. The function mutates and returns the same instance so callers
+    don't need to thread the carry-state through multiple return values.
+
+    Fields:
+      is_killed       — L3 latch; once True, only operator restart clears.
+      last_l2_time    — last timestamp regime evaluated to "paused" (used for dwell).
+      l1_entry_time   — when L1 (degraded) was first entered (for safe-mode escalation).
+      safe_entry_time — when L1.5 (safe) was entered (for 2× dwell).
+      l2_timestamps   — timeline of L2 transitions (for thrash detection).
+      critical_error_count — running counter consumed by L3 trigger.
+    """
+    is_killed: bool = False
+    last_l2_time: float = float("-inf")
+    l1_entry_time: Optional[float] = None
+    safe_entry_time: Optional[float] = None
+    l2_timestamps: List[float] = field(default_factory=list)
+    critical_error_count: int = 0
+
+
+@dataclass
+class RegimeThresholds:
+    """Bundled regime thresholds (subset of PMMLeadLagSkewConfig) for the pure function."""
+    vol_pause_threshold_mult: float
+    vol_degraded_threshold_mult: float
+    pause_basis_bps: float
+    pause_release_sec: float
+    safe_mode_entry_sec: float
+    safe_thrash_window_sec: float
+    max_session_drawdown_quote: float
+    critical_error_threshold: int
 
 
 @dataclass
@@ -410,15 +449,123 @@ def compute_lead_state(
     )
 
 
+_REGIME_SPREAD_MULT = {
+    "normal": 1.0,
+    "degraded": 1.5,
+    "safe": 2.5,
+    "paused": 1.0,
+    "killed": 1.0,
+}
+
+
 def compute_regime_state(
     vol_state: VolState,
     inv_state: InventoryState,
+    basis_bps: float,
+    regime_stale: bool,
+    over_max_net_position: bool,
+    session_pnl: float,
+    now: float,
+    ctx: RegimeContext,
+    th: RegimeThresholds,
 ) -> RegimeState:
     """
-    Phase 4 stub — always returns normal regime with multiplier=1.0.
-    Replace in Phase 4 with real L1/L1.5/L2/L3 circuit breaker logic.
+    Plan §4.3 — five-level state machine (normal | degraded | safe | paused | killed).
+
+    Pure function: takes vol/inv signals + the carry-state `ctx` and returns the
+    regime classification. Mutates `ctx` in-place to update timestamps / latches
+    so the caller doesn't need to thread state across multiple return values.
+
+    L3 (killed) latches via ctx.is_killed; only operator restart clears.
+    L2 (paused) has dwell of th.pause_release_sec.
+    L1.5 (safe) has dwell of 2 × pause_release_sec (sticky).
+    L1 (degraded) escalates to L1.5 after sustained time or thrash detection.
+
+    Triggers (§4.1):
+      L3: |delta| > inv_kill (via inv_state.in_kill)
+          | over_max_net_position (§2.5)
+          | session_pnl < -max_session_drawdown_quote
+          | critical_error_count >= critical_error_threshold (§4.1 L3 item 4)
+      L2: vol_ratio > vol_pause_threshold_mult
+          | |basis_bps| > pause_basis_bps
+          | regime_stale (§4.1 L2 item 4: feed staleness pauses)
+      L1: vol_ratio > vol_degraded_threshold_mult
     """
-    return RegimeState(regime="normal", spread_multiplier=1.0)
+    # L3 — kill (latching)
+    if ctx.is_killed:
+        return RegimeState(regime="killed", spread_multiplier=_REGIME_SPREAD_MULT["killed"],
+                           cause="killed_latched")
+    if th.max_session_drawdown_quote > 0 and session_pnl < -th.max_session_drawdown_quote:
+        ctx.is_killed = True
+        cause = f"session_pnl={session_pnl:.2f} < -{th.max_session_drawdown_quote:.2f}"
+        return RegimeState(regime="killed", spread_multiplier=_REGIME_SPREAD_MULT["killed"], cause=cause)
+    if inv_state.in_kill:
+        ctx.is_killed = True
+        cause = f"|delta|={abs(inv_state.delta):.3f} >= inv_kill"
+        return RegimeState(regime="killed", spread_multiplier=_REGIME_SPREAD_MULT["killed"], cause=cause)
+    if over_max_net_position:
+        ctx.is_killed = True
+        return RegimeState(regime="killed", spread_multiplier=_REGIME_SPREAD_MULT["killed"],
+                           cause="over_max_net_position")
+    if (th.critical_error_threshold > 0 and
+            ctx.critical_error_count >= th.critical_error_threshold):
+        ctx.is_killed = True
+        cause = f"critical_errors={ctx.critical_error_count} >= {th.critical_error_threshold}"
+        return RegimeState(regime="killed", spread_multiplier=_REGIME_SPREAD_MULT["killed"], cause=cause)
+
+    # L2 — paused (vol, basis, or feed staleness)
+    l2_vol = vol_state.vol_ratio > th.vol_pause_threshold_mult
+    l2_basis = abs(basis_bps) > th.pause_basis_bps
+    l2_stale = regime_stale
+    if l2_vol or l2_basis or l2_stale:
+        if l2_vol:
+            cause = f"vol_ratio={vol_state.vol_ratio:.2f}>{th.vol_pause_threshold_mult}"
+        elif l2_basis:
+            cause = f"|basis|={abs(basis_bps):.1f}>{th.pause_basis_bps}"
+        else:
+            cause = "feed_stale"
+        ctx.last_l2_time = now
+        ctx.l2_timestamps.append(now)
+        cutoff = now - th.safe_thrash_window_sec
+        ctx.l2_timestamps = [t for t in ctx.l2_timestamps if t >= cutoff]
+        return RegimeState(regime="paused", spread_multiplier=_REGIME_SPREAD_MULT["paused"], cause=cause)
+    if now - ctx.last_l2_time < th.pause_release_sec:
+        remaining = th.pause_release_sec - (now - ctx.last_l2_time)
+        cause = f"paused_dwell({remaining:.0f}s remaining)"
+        return RegimeState(regime="paused", spread_multiplier=_REGIME_SPREAD_MULT["paused"], cause=cause)
+
+    # Safe-mode dwell — once entered, stays for 2× pause_release_sec (sticky)
+    if ctx.safe_entry_time is not None:
+        safe_elapsed = now - ctx.safe_entry_time
+        if safe_elapsed < 2.0 * th.pause_release_sec:
+            cause = f"safe_dwell({safe_elapsed:.0f}s/{2*th.pause_release_sec:.0f}s)"
+            return RegimeState(regime="safe", spread_multiplier=_REGIME_SPREAD_MULT["safe"], cause=cause)
+
+    # L1 — degraded
+    l1 = vol_state.vol_ratio > th.vol_degraded_threshold_mult
+    if not l1:
+        ctx.l1_entry_time = None
+        ctx.safe_entry_time = None
+        return RegimeState(regime="normal", spread_multiplier=_REGIME_SPREAD_MULT["normal"], cause="")
+
+    if ctx.l1_entry_time is None:
+        ctx.l1_entry_time = now
+
+    l1_duration = now - ctx.l1_entry_time
+    cutoff = now - th.safe_thrash_window_sec
+    thrash_count = sum(1 for t in ctx.l2_timestamps if t >= cutoff)
+    base_cause = f"vol_ratio={vol_state.vol_ratio:.2f}>{th.vol_degraded_threshold_mult}"
+
+    if l1_duration > th.safe_mode_entry_sec or thrash_count >= 2:
+        if ctx.safe_entry_time is None:
+            ctx.safe_entry_time = now
+        extra = (f"l1_dur={l1_duration:.0f}s" if l1_duration > th.safe_mode_entry_sec
+                 else f"thrash={thrash_count}")
+        cause = f"{base_cause} -> safe({extra})"
+        return RegimeState(regime="safe", spread_multiplier=_REGIME_SPREAD_MULT["safe"], cause=cause)
+
+    ctx.safe_entry_time = None
+    return RegimeState(regime="degraded", spread_multiplier=_REGIME_SPREAD_MULT["degraded"], cause=base_cause)
 
 
 def compute_skew_state(

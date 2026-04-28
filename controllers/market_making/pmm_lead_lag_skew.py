@@ -26,11 +26,14 @@ from hummingbot.strategy_v2.executors.position_executor.data_types import Positi
 from hummingbot.strategy_v2.models.executor_actions import ExecutorAction, StopExecutorAction
 
 from controllers.market_making.pmm_lead_lag_utils import (
+    RegimeContext,
     RegimeState,
+    RegimeThresholds,
     SkewState,
     compute_inventory_state,
     compute_lead_state,
     compute_order_params,
+    compute_regime_state,
     compute_side_permissions,
     compute_size_factors,
     compute_skew_state,
@@ -285,20 +288,23 @@ class PMMLeadLagSkewController(MarketMakingControllerBase):
         # Hysteresis state for one-sided mode (§2.4)
         self._buy_enabled: bool = True
         self._sell_enabled: bool = True
-        # CSV signals logger (lazy init: opened on first write)
+        # CSV loggers (lazy init: opened on first write)
         self._csv_path: str = os.path.join(self.config.csv_log_dir, "signals.csv")
         self._csv_initialized: bool = False
-        # Phase 4 — regime state machine (§4.3)
-        # `_last_l2_time` uses -inf so the very first tick (when now is 0 in tests)
-        # cannot be inside the dwell window from a non-existent L2 entry.
-        self._l1_entry_time: Optional[float] = None
-        self._safe_entry_time: Optional[float] = None
-        self._last_l2_time: float = float("-inf")
-        self._l2_timestamps: List[float] = []
-        self._is_killed: bool = False
+        self._orders_csv_path: str = os.path.join(self.config.csv_log_dir, "orders.csv")
+        self._orders_csv_initialized: bool = False
+        # Phase 4 — regime state machine (§4.3). All carry-state lives in one
+        # RegimeContext owned by the controller; compute_regime_state mutates it.
+        # `last_l2_time = -inf` so the very first tick cannot be inside the dwell
+        # window from a non-existent L2 entry.
+        self._regime_ctx: RegimeContext = RegimeContext(last_l2_time=float("-inf"))
         self._regime_cause: str = ""
         self._seen_executor_ids: set = set()
         self._session_pnl: float = 0.0
+        # Sustained-feed-stale tracking — bumps critical_error_count once per
+        # stale episode after stale_episode_critical_sec (plan §4.1 L3 item 4).
+        self._feed_stale_started_at: Optional[float] = None
+        self._feed_stale_critical_recorded: bool = False
         # Phase 5 — lead-lag price history buffers and EWM state.
         # Each entry is (timestamp_sec, mid_brl, mid_usdt, usdt_brl_rate).
         # Length bounded by max(z_window, micro_window, lead_lag_short_window) + buffer.
@@ -644,109 +650,95 @@ class PMMLeadLagSkewController(MarketMakingControllerBase):
             self._session_pnl += pnl
             self._seen_executor_ids.add(ex_id)
 
-    def _trigger_kill(self, reason: str) -> None:
-        """Latch the kill switch — only logs CRITICAL once per kill event."""
-        if not self._is_killed:
-            self._is_killed = True
-            self._regime_cause = reason
-            try:
-                self.logger().critical(f"[PMM Lead-Lag] Kill switch triggered: {reason}")
-            except Exception:
-                pass
-
-    def _record_l2_transition(self, now: float) -> None:
-        """Track L2 entries within the thrash window for safe-mode escalation."""
-        self._l2_timestamps.append(now)
-        cutoff = now - self.config.safe_thrash_window_sec
-        self._l2_timestamps = [t for t in self._l2_timestamps if t >= cutoff]
-
-    def _l2_transitions_in_window(self, window_sec: float, now: float) -> int:
-        cutoff = now - window_sec
-        return sum(1 for t in self._l2_timestamps if t >= cutoff)
-
-    def _evaluate_regime(self, vol_state, inv_state, basis_bps: float, now: float) -> str:
+    def _record_critical_error(self, source: str = "") -> None:
         """
-        Plan §4 — five-level state machine: normal | degraded | safe | paused | killed.
+        Increment the critical-error counter consumed by L3 in compute_regime_state.
+        Plan §4.1 L3 item 4: order rejections, websocket loss, time desync.
+        """
+        self._regime_ctx.critical_error_count += 1
+        try:
+            self.logger().warning(
+                f"[PMM Lead-Lag] critical error recorded ({source}); "
+                f"count={self._regime_ctx.critical_error_count}/"
+                f"{self.config.critical_error_threshold}"
+            )
+        except Exception:
+            pass
 
-        L3 latches; L2 has dwell of pause_release_sec; safe (L1.5) has dwell of
-        2 × pause_release_sec; L1 (degraded) escalates to L1.5 after sustained
-        time or thrash detection.
+    def _feed_stale_for_regime_pause(self, now: float) -> bool:
+        """
+        Plan §4.1 L2 item 4: BTC-USDT leader feed older than max_leader_staleness_sec
+        triggers L2 pause. Only fires AFTER warmup (we must have seen at least one
+        BTC-USDT tick); a never-populated feed is treated as warmup, not failure.
+        """
+        last_ts = self._last_mid_usdt_ts
+        if last_ts <= 0:
+            return False  # warmup — no tick yet, not "stale"
+        return (now - last_ts) > self.config.max_leader_staleness_sec
 
-        Mutates self._regime_cause for telemetry and self._{l1,safe,l2}_* state.
+    def _track_sustained_feed_stale(self, now: float) -> None:
+        """
+        Auto-trigger for the L3 critical-error counter: when the leader feed has
+        been stale for > 6× max_leader_staleness_sec continuously, record one
+        critical error per episode (plan §4.1 L3 item 4 — "websocket loss > 30s"
+        analog). Resets when feed recovers.
+        """
+        if self._feed_stale_for_regime_pause(now):
+            if self._feed_stale_started_at is None:
+                self._feed_stale_started_at = now
+                self._feed_stale_critical_recorded = False
+            elif (not self._feed_stale_critical_recorded and
+                  (now - self._feed_stale_started_at)
+                  > 6.0 * self.config.max_leader_staleness_sec):
+                self._record_critical_error("feed_stale_sustained")
+                self._feed_stale_critical_recorded = True
+        else:
+            self._feed_stale_started_at = None
+            self._feed_stale_critical_recorded = False
+
+    def _evaluate_regime(self, vol_state, inv_state, basis_bps: float,
+                         regime_stale: bool, now: float) -> str:
+        """
+        Thin wrapper that delegates to compute_regime_state (plan §1.7 modularization).
+
+        All decision logic lives in the pure function; this wrapper:
+          - bundles config thresholds into a RegimeThresholds dataclass
+          - feeds the controller's RegimeContext (carry-state mutated in place)
+          - logs CRITICAL once when the kill latch fires
+          - mirrors regime.cause to self._regime_cause for telemetry consumers
         """
         c = self.config
-
-        # L3 — kill (latching)
-        if self._is_killed:
-            return "killed"
-        try:
-            max_dd = float(c.max_session_drawdown_quote)
-        except (TypeError, ValueError):
-            max_dd = 0.0
-        if max_dd > 0 and self._session_pnl < -max_dd:
-            self._trigger_kill(f"session_pnl={self._session_pnl:.2f} < -{max_dd:.2f}")
-            return "killed"
-        if inv_state.in_kill:
-            self._trigger_kill(f"|delta|={abs(inv_state.delta):.3f} >= inv_kill={c.inv_kill}")
-            return "killed"
-        if self.processed_data.get("over_max_net_position", False):
+        th = RegimeThresholds(
+            vol_pause_threshold_mult=c.vol_pause_threshold_mult,
+            vol_degraded_threshold_mult=c.vol_degraded_threshold_mult,
+            pause_basis_bps=c.pause_basis_bps,
+            pause_release_sec=c.pause_release_sec,
+            safe_mode_entry_sec=c.safe_mode_entry_sec,
+            safe_thrash_window_sec=c.safe_thrash_window_sec,
+            max_session_drawdown_quote=float(c.max_session_drawdown_quote),
+            critical_error_threshold=int(c.critical_error_threshold),
+        )
+        was_killed = self._regime_ctx.is_killed
+        result = compute_regime_state(
+            vol_state=vol_state,
+            inv_state=inv_state,
+            basis_bps=basis_bps,
+            regime_stale=regime_stale,
+            over_max_net_position=self.processed_data.get("over_max_net_position", False),
+            session_pnl=self._session_pnl,
+            now=now,
+            ctx=self._regime_ctx,
+            th=th,
+        )
+        self._regime_cause = result.cause
+        if not was_killed and self._regime_ctx.is_killed:
             try:
-                exp = float(self.processed_data.get("net_exposure_quote", 0))
-                cap = float(c.max_net_position_quote)
-            except (TypeError, ValueError):
-                exp, cap = 0.0, 0.0
-            self._trigger_kill(f"net_exposure={exp:.2f} > max_net_position={cap:.2f}")
-            return "killed"
-
-        # L2 — paused (vol or basis)
-        l2_vol = vol_state.vol_ratio > c.vol_pause_threshold_mult
-        l2_basis = abs(basis_bps) > c.pause_basis_bps
-        if l2_vol or l2_basis:
-            if l2_vol:
-                self._regime_cause = f"vol_ratio={vol_state.vol_ratio:.2f}>{c.vol_pause_threshold_mult}"
-            else:
-                self._regime_cause = f"|basis|={abs(basis_bps):.1f}>{c.pause_basis_bps}"
-            self._last_l2_time = now
-            self._record_l2_transition(now)
-            return "paused"
-        if now - self._last_l2_time < c.pause_release_sec:
-            remaining = c.pause_release_sec - (now - self._last_l2_time)
-            self._regime_cause = f"paused_dwell({remaining:.0f}s remaining)"
-            return "paused"
-
-        # Safe-mode dwell — once entered, stays for 2×pause_release_sec
-        if self._safe_entry_time is not None:
-            safe_elapsed = now - self._safe_entry_time
-            if safe_elapsed < 2.0 * c.pause_release_sec:
-                self._regime_cause = f"safe_dwell({safe_elapsed:.0f}s/{2*c.pause_release_sec:.0f}s)"
-                return "safe"
-            # Dwell expired — re-evaluate normally below
-
-        # L1 — degraded
-        l1 = vol_state.vol_ratio > c.vol_degraded_threshold_mult
-        if not l1:
-            self._l1_entry_time = None
-            self._safe_entry_time = None
-            self._regime_cause = ""
-            return "normal"
-
-        if self._l1_entry_time is None:
-            self._l1_entry_time = now
-
-        l1_duration = now - self._l1_entry_time
-        thrash_count = self._l2_transitions_in_window(c.safe_thrash_window_sec, now)
-        self._regime_cause = f"vol_ratio={vol_state.vol_ratio:.2f}>{c.vol_degraded_threshold_mult}"
-
-        if l1_duration > c.safe_mode_entry_sec or thrash_count >= 2:
-            if self._safe_entry_time is None:
-                self._safe_entry_time = now
-            extra = (f"l1_dur={l1_duration:.0f}s" if l1_duration > c.safe_mode_entry_sec
-                     else f"thrash={thrash_count}")
-            self._regime_cause = f"{self._regime_cause} -> safe({extra})"
-            return "safe"
-
-        self._safe_entry_time = None
-        return "degraded"
+                self.logger().critical(
+                    f"[PMM Lead-Lag] Kill switch triggered: {result.cause}"
+                )
+            except Exception:
+                pass
+        return result.regime
 
     # ── Data update ───────────────────────────────────────────────────────
 
@@ -816,7 +808,12 @@ class PMMLeadLagSkewController(MarketMakingControllerBase):
             now = float(self.market_data_provider.time())
         except (TypeError, ValueError):
             now = 0.0
-        regime = self._evaluate_regime(vol_state, inv_state, lead_state.basis_bps, now)
+        # Track sustained feed staleness as critical-error proxy (§4.1 L3 item 4).
+        self._track_sustained_feed_stale(now)
+        regime = self._evaluate_regime(
+            vol_state, inv_state, lead_state.basis_bps,
+            regime_stale=self._feed_stale_for_regime_pause(now), now=now,
+        )
         _regime_mult_map = {
             "normal": 1.0, "degraded": 1.5, "safe": 2.5,
             "paused": 1.0, "killed": 1.0,
@@ -975,13 +972,20 @@ class PMMLeadLagSkewController(MarketMakingControllerBase):
             return None
 
         clamped_price = self._clamp_to_mid(price, trade_type)
+        final_amount = amount * size_factor
+        self._csv_log_order(
+            level_id=level_id,
+            side=trade_type.name.lower(),
+            price=clamped_price,
+            amount=final_amount,
+        )
         return PositionExecutorConfig(
             timestamp=self.market_data_provider.time(),
             level_id=level_id,
             connector_name=self.config.connector_name,
             trading_pair=self.config.trading_pair,
             entry_price=clamped_price,
-            amount=amount * size_factor,
+            amount=final_amount,
             triple_barrier_config=self.config.triple_barrier_config,
             leverage=self.config.leverage,
             side=trade_type,
@@ -1143,6 +1147,61 @@ class PMMLeadLagSkewController(MarketMakingControllerBase):
         "session_pnl",
     )
 
+    _ORDERS_CSV_COLUMNS = (
+        "ts", "level_id", "side", "price", "amount",
+        "distance_from_mid_bps", "shift_bps", "regime",
+    )
+
+    def _csv_log_order(
+        self,
+        level_id: str,
+        side: str,
+        price: Decimal,
+        amount: Decimal,
+    ) -> None:
+        """
+        Plan §1.4 — append one row per executor created to orders.csv.
+        Captures distance from mid, applied skew, and regime for post-session
+        analysis of fill quality vs adverse selection.
+        Silently no-ops if csv_log is disabled or the directory cannot be created.
+        """
+        if not self.config.csv_log_enabled:
+            return
+        try:
+            os.makedirs(self.config.csv_log_dir, exist_ok=True)
+        except OSError:
+            return
+        d = self.processed_data
+        try:
+            mid = d.get("mid_price")
+            if mid is not None and mid > 0:
+                dist_bps = (price - mid) / mid * Decimal("10000")
+            else:
+                dist_bps = Decimal("0")
+        except (TypeError, ZeroDivisionError):
+            dist_bps = Decimal("0")
+        row = {
+            "ts": self.market_data_provider.time(),
+            "level_id": level_id,
+            "side": side,
+            "price": str(price),
+            "amount": str(amount),
+            "distance_from_mid_bps": str(dist_bps),
+            "shift_bps": str(d.get("price_shift_bps", "")),
+            "regime": d.get("regime", "normal"),
+        }
+        write_header = (not self._orders_csv_initialized
+                        and not os.path.exists(self._orders_csv_path))
+        try:
+            with open(self._orders_csv_path, "a", newline="") as f:
+                writer = csv.DictWriter(f, fieldnames=self._ORDERS_CSV_COLUMNS)
+                if write_header:
+                    writer.writeheader()
+                writer.writerow(row)
+            self._orders_csv_initialized = True
+        except OSError:
+            return
+
     def _csv_log_signals(self) -> None:
         """Append one row per update_processed_data() call to signals.csv."""
         try:
@@ -1237,7 +1296,7 @@ class PMMLeadLagSkewController(MarketMakingControllerBase):
             f"  Size factors  buy: {sf.get('buy'):.2f}  sell: {sf.get('sell'):.2f}",
             f"  Net exposure (quote): {net_exp} / {self.config.max_net_position_quote}{cap_flag}",
             f"  Lead-lag  micro: {s_lead_micro:+.2f} bps  regime: {s_lead_regime:+.3f}  basis: {basis_bps:+.2f} bps{stale_str}{pause_str}",
-            f"  Session PnL (quote): {session_pnl:.4f}  Killed: {self._is_killed}",
+            f"  Session PnL (quote): {session_pnl:.4f}  Killed: {self._regime_ctx.is_killed}",
         ]
 
     def get_custom_info(self) -> dict:
@@ -1247,7 +1306,7 @@ class PMMLeadLagSkewController(MarketMakingControllerBase):
         return {
             "regime": d.get("regime", "normal"),
             "regime_cause": d.get("regime_cause", ""),
-            "is_killed": self._is_killed,
+            "is_killed": self._regime_ctx.is_killed,
             "session_pnl": float(d.get("session_pnl", 0.0)),
             "inv_pct": round(d.get("inv_pct", 0.5), 4),
             "inv_delta": round(d.get("inv_delta", 0.0), 4),

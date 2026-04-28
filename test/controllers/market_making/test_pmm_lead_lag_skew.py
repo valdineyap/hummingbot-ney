@@ -319,6 +319,41 @@ class TestPMMLeadLagSkewControllerPhase2(IsolatedAsyncioWrapperTestCase):
         self.assertIn("regime", lines[0])
         self.assertIn("inv_pct", lines[0])
 
+    async def test_orders_csv_written_on_executor_creation(self):
+        """orders.csv records one row per get_executor_config success call."""
+        self.config.__dict__["csv_log_enabled"] = True
+        # Phase 2 setUp uses max_net_position_quote=60, so keep exposure below it.
+        self._set_balances(base="0.0001", quote="200")
+        self.mock_market_data_provider.get_price_by_type = MagicMock(return_value=Decimal("400000"))
+        await self.controller.update_processed_data()
+
+        cfg = self.controller.get_executor_config(
+            "buy_0", price=Decimal("399800"), amount=Decimal("0.0005"),
+        )
+        self.assertIsNotNone(cfg)
+        orders_path = os.path.join(self.tmpdir, "orders.csv")
+        self.assertTrue(os.path.exists(orders_path))
+        with open(orders_path) as f:
+            lines = f.readlines()
+        self.assertEqual(len(lines), 2)  # header + 1 row
+        self.assertIn("level_id", lines[0])
+        self.assertIn("distance_from_mid_bps", lines[0])
+        self.assertIn("buy_0", lines[1])
+        self.assertIn("buy", lines[1])
+
+    async def test_orders_csv_disabled_when_csv_log_off(self):
+        """When csv_log_enabled=False, orders.csv must not be created."""
+        self.assertFalse(self.config.csv_log_enabled)  # default for this setUp
+        self._set_balances(base="0.0001", quote="200")
+        self.mock_market_data_provider.get_price_by_type = MagicMock(return_value=Decimal("400000"))
+        await self.controller.update_processed_data()
+        cfg = self.controller.get_executor_config(
+            "buy_0", price=Decimal("399800"), amount=Decimal("0.0005"),
+        )
+        self.assertIsNotNone(cfg)
+        orders_path = os.path.join(self.tmpdir, "orders.csv")
+        self.assertFalse(os.path.exists(orders_path))
+
 
 class TestPMMLeadLagSkewControllerPhase3(IsolatedAsyncioWrapperTestCase):
     """Phase 3: vol from candles, skew active, requote brakes, distance clamp."""
@@ -577,7 +612,7 @@ class TestPMMLeadLagSkewControllerPhase4(IsolatedAsyncioWrapperTestCase):
         """vol_ratio ≈ 1, no balance issue → regime normal."""
         await self.controller.update_processed_data()
         self.assertEqual(self.controller.processed_data["regime"], "normal")
-        self.assertFalse(self.controller._is_killed)
+        self.assertFalse(self.controller._regime_ctx.is_killed)
 
     async def test_regime_degraded_above_threshold(self):
         """vol_ratio > vol_degraded but < vol_pause → degraded."""
@@ -607,7 +642,7 @@ class TestPMMLeadLagSkewControllerPhase4(IsolatedAsyncioWrapperTestCase):
         """Once L2 fires, regime stays paused for pause_release_sec."""
         # Trigger L2 via fake L2 timestamp.
         now = float(self.mock_market_data_provider.time())
-        self.controller._last_l2_time = now - 10  # 10s into 60s dwell
+        self.controller._regime_ctx.last_l2_time = now - 10  # 10s into 60s dwell
         await self.controller.update_processed_data()
         self.assertEqual(self.controller.processed_data["regime"], "paused")
 
@@ -616,17 +651,17 @@ class TestPMMLeadLagSkewControllerPhase4(IsolatedAsyncioWrapperTestCase):
         df = self._candles_with_ratio(4.0)
         self.mock_market_data_provider.get_candles_df = MagicMock(return_value=df)
         now = float(self.mock_market_data_provider.time())
-        self.controller._l1_entry_time = now - 200
+        self.controller._regime_ctx.l1_entry_time = now - 200
         with patch.object(self.controller, "_compute_lead_signals",
                           return_value=_neutral_lead_state()):
             await self.controller.update_processed_data()
         self.assertEqual(self.controller.processed_data["regime"], "safe")
-        self.assertIsNotNone(self.controller._safe_entry_time)
+        self.assertIsNotNone(self.controller._regime_ctx.safe_entry_time)
 
     async def test_regime_safe_dwell_persists_when_conditions_clear(self):
         """Once in safe, regime stays safe for 2 × pause_release_sec."""
         now = float(self.mock_market_data_provider.time())
-        self.controller._safe_entry_time = now - 30  # 30s into 120s dwell
+        self.controller._regime_ctx.safe_entry_time = now - 30  # 30s into 120s dwell
         # Calm candles (would normally → normal) but safe dwell holds.
         await self.controller.update_processed_data()
         self.assertEqual(self.controller.processed_data["regime"], "safe")
@@ -639,7 +674,7 @@ class TestPMMLeadLagSkewControllerPhase4(IsolatedAsyncioWrapperTestCase):
         }
         await self.controller.update_processed_data()
         self.assertEqual(self.controller.processed_data["regime"], "killed")
-        self.assertTrue(self.controller._is_killed)
+        self.assertTrue(self.controller._regime_ctx.is_killed)
 
     async def test_regime_killed_by_max_net_position(self):
         """net_exposure_quote > max_net_position_quote triggers kill."""
@@ -655,44 +690,44 @@ class TestPMMLeadLagSkewControllerPhase4(IsolatedAsyncioWrapperTestCase):
         }
         await controller.update_processed_data()
         self.assertEqual(controller.processed_data["regime"], "killed")
-        self.assertTrue(controller._is_killed)
+        self.assertTrue(controller._regime_ctx.is_killed)
 
     async def test_regime_killed_by_session_drawdown(self):
         """session_pnl < -max_session_drawdown_quote triggers kill."""
         self.controller._session_pnl = -50.0   # < -10 = -max_session_drawdown_quote
         await self.controller.update_processed_data()
         self.assertEqual(self.controller.processed_data["regime"], "killed")
-        self.assertTrue(self.controller._is_killed)
+        self.assertTrue(self.controller._regime_ctx.is_killed)
 
     async def test_kill_latch_persists_across_ticks(self):
         """Once killed, _is_killed stays True even if conditions clear."""
-        self.controller._is_killed = True
+        self.controller._regime_ctx.is_killed = True
         await self.controller.update_processed_data()
         self.assertEqual(self.controller.processed_data["regime"], "killed")
         # And again on a second tick with all-normal data.
         await self.controller.update_processed_data()
         self.assertEqual(self.controller.processed_data["regime"], "killed")
-        self.assertTrue(self.controller._is_killed)
+        self.assertTrue(self.controller._regime_ctx.is_killed)
 
     # ── Level filtering by regime ────────────────────────────────────────
 
     async def test_paused_returns_no_levels(self):
         """regime=paused → get_levels_to_execute returns empty list."""
-        self.controller._last_l2_time = float(self.mock_market_data_provider.time())
+        self.controller._regime_ctx.last_l2_time = float(self.mock_market_data_provider.time())
         await self.controller.update_processed_data()
         self.assertEqual(self.controller.processed_data["regime"], "paused")
         self.assertEqual(self.controller.get_levels_to_execute(), [])
 
     async def test_killed_returns_no_levels(self):
         """regime=killed → get_levels_to_execute returns empty list."""
-        self.controller._is_killed = True
+        self.controller._regime_ctx.is_killed = True
         await self.controller.update_processed_data()
         self.assertEqual(self.controller.get_levels_to_execute(), [])
 
     async def test_safe_limits_to_one_level_per_side(self):
         """regime=safe → at most one buy + one sell level."""
         now = float(self.mock_market_data_provider.time())
-        self.controller._safe_entry_time = now - 30  # inside dwell
+        self.controller._regime_ctx.safe_entry_time = now - 30  # inside dwell
         await self.controller.update_processed_data()
         self.assertEqual(self.controller.processed_data["regime"], "safe")
         levels = self.controller.get_levels_to_execute()
@@ -707,7 +742,7 @@ class TestPMMLeadLagSkewControllerPhase4(IsolatedAsyncioWrapperTestCase):
         }
         # Force safe regime via dwell.
         now = float(self.mock_market_data_provider.time())
-        self.controller._safe_entry_time = now - 30
+        self.controller._regime_ctx.safe_entry_time = now - 30
         await self.controller.update_processed_data()
         self.assertEqual(self.controller.processed_data["regime"], "safe")
         self.assertEqual(self.controller.processed_data["price_shift_bps"], Decimal("0"))
@@ -775,7 +810,7 @@ class TestPMMLeadLagSkewControllerPhase4(IsolatedAsyncioWrapperTestCase):
 
     async def test_killed_stops_all_active_executors(self):
         """regime=killed → all resting executors are scheduled for stop."""
-        self.controller._is_killed = True
+        self.controller._regime_ctx.is_killed = True
         await self.controller.update_processed_data()
         e1 = self._make_resting_executor("e1", "buy_0", Decimal("399000"))
         self.controller.executors_info = [e1]
@@ -819,6 +854,58 @@ class TestPMMLeadLagSkewControllerPhase4(IsolatedAsyncioWrapperTestCase):
         self.assertIn("is_killed", info)
         self.assertIn("regime_cause", info)
         self.assertIn("session_pnl", info)
+
+    # ── Critical error counter (§4.1 L3 item 4) ─────────────────────────────
+
+    def test_record_critical_error_increments_counter(self):
+        self.assertEqual(self.controller._regime_ctx.critical_error_count, 0)
+        self.controller._record_critical_error("test")
+        self.assertEqual(self.controller._regime_ctx.critical_error_count, 1)
+        self.controller._record_critical_error("test")
+        self.assertEqual(self.controller._regime_ctx.critical_error_count, 2)
+
+    async def test_critical_error_threshold_triggers_kill(self):
+        """Reaching critical_error_threshold flips to L3 killed via the regime fn."""
+        # Bump counter to threshold (default 5).
+        for _ in range(self.config.critical_error_threshold):
+            self.controller._record_critical_error("synthetic")
+        with patch.object(self.controller, "_compute_lead_signals",
+                          return_value=_neutral_lead_state()):
+            await self.controller.update_processed_data()
+        self.assertEqual(self.controller.processed_data["regime"], "killed")
+        self.assertTrue(self.controller._regime_ctx.is_killed)
+        self.assertIn("critical_errors", self.controller._regime_cause)
+
+    def test_sustained_feed_stale_records_one_critical(self):
+        """Auto-trigger: stale > 6× max_leader_staleness_sec → 1 critical recorded."""
+        # Simulate having seen at least one BTC-USDT tick in the past.
+        self.controller._last_mid_usdt_ts = 1000.0
+        episode_threshold = 6.0 * self.config.max_leader_staleness_sec  # 30s default
+        # First call enters the stale episode (just past staleness threshold).
+        self.controller._track_sustained_feed_stale(now=1010.0)
+        self.assertEqual(self.controller._regime_ctx.critical_error_count, 0)
+        self.assertEqual(self.controller._feed_stale_started_at, 1010.0)
+        # Second call after 30+s of sustained staleness → 1 critical recorded.
+        self.controller._track_sustained_feed_stale(now=1010.0 + episode_threshold + 1.0)
+        self.assertEqual(self.controller._regime_ctx.critical_error_count, 1)
+        # Subsequent stale ticks within same episode do NOT double-bump.
+        self.controller._track_sustained_feed_stale(now=1010.0 + episode_threshold + 10.0)
+        self.assertEqual(self.controller._regime_ctx.critical_error_count, 1)
+
+    def test_feed_recovery_resets_stale_episode(self):
+        """When feed recovers, counter does not bump again until a new stale episode."""
+        self.controller._last_mid_usdt_ts = 1000.0
+        episode_threshold = 6.0 * self.config.max_leader_staleness_sec
+        # Enter stale → episode starts.
+        self.controller._track_sustained_feed_stale(now=1010.0)
+        # Sustained stale → record critical.
+        self.controller._track_sustained_feed_stale(now=1010.0 + episode_threshold + 1.0)
+        self.assertEqual(self.controller._regime_ctx.critical_error_count, 1)
+        # Feed recovers (last tick now fresh).
+        self.controller._last_mid_usdt_ts = 2000.0
+        self.controller._track_sustained_feed_stale(now=2000.5)
+        self.assertIsNone(self.controller._feed_stale_started_at)
+        self.assertFalse(self.controller._feed_stale_critical_recorded)
 
 
 class TestPMMLeadLagSkewControllerPhase5(IsolatedAsyncioWrapperTestCase):

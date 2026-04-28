@@ -163,6 +163,42 @@ Commits: `5d6b1efc` (initial), `1992a90a` (gap fixes vs §2.2/2.3/2.4)
       staleness, w_lead skew, telemetria, candles_config 3 pares)
 - [x] Phase 4 tests atualizados — `_neutral_lead_state()` helper para isolar lead-lag
 
+## ✅ Pós-Fase 5 — refator de arquitetura + gatilhos extras
+
+Endereça achados de revisão externa pré-paper trading.
+
+### A — Modularização do regime (plan §1.7)
+- [x] `RegimeContext` dataclass — carry-state (l1/safe/l2 timestamps, is_killed, critical_error_count)
+- [x] `RegimeThresholds` dataclass — bundle de thresholds passados à função pura
+- [x] `compute_regime_state()` real em utils — lógica completa L1/L1.5/L2/L3
+- [x] Controller `_evaluate_regime` reduzido a wrapper de delegação (~30 linhas)
+- [x] Controller mantém apenas `_regime_ctx`, `_regime_cause`; helpers redundantes
+      (`_record_l2_transition`, `_l2_transitions_in_window`, `_trigger_kill`) removidos
+
+### B — Gatilhos completados
+- [x] `regime_stale` (feed BTC-USDT velho > max_leader_staleness_sec) → L2 trigger
+- [x] `_feed_stale_for_regime_pause()` separa warmup (sem trigger) de stale real
+- [x] `critical_error_count` consumido pelo L3 em `compute_regime_state`
+- [x] Auto-trigger: `_track_sustained_feed_stale` bumpa o counter em stale > 6×
+      (proxy para "websocket loss > 30s" do plano §4.1 L3)
+- [x] Hook manual `_record_critical_error(source)` para integrações externas
+
+### C — Observabilidade ampliada
+- [x] `orders.csv` (8 colunas) — uma linha por executor criado em `get_executor_config`
+      colunas: ts, level_id, side, price, amount, distance_from_mid_bps, shift_bps, regime
+
+### D — Itens deferidos para Fase 6 (após dados de paper)
+- [ ] Trend filter (z_trend = ema_fast - ema_slow / σ) — feature nova ~80 linhas
+- [ ] Adverse cluster (3 fills consecutivos do mesmo lado, mid adverso > 5bps em 1s)
+- [ ] `fills.csv` com adverse_mid_1s e adverse_mid_10s (requer scheduler async)
+
+### E — testes (20 novos)
+- [x] 14 testes `compute_regime_state` em utils (normal/L1/L2/L1.5/L3 + ctx mutations)
+- [x] 4 testes `_record_critical_error` + `_track_sustained_feed_stale` (counter,
+      threshold-triggered kill, episode bump, recovery reset)
+- [x] 2 testes `orders.csv` (escrita ativa/desativada)
+- Total: 150 testes passando (78 utils + 72 controller)
+
 ## ⏳ Próximas fases
 
 ### Fase 6 — Validação extensiva pré-capital

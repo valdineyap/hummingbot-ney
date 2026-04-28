@@ -313,17 +313,128 @@ class TestComputeVolatilityFromPrices(unittest.TestCase):
         self.assertEqual(compute_volatility_from_prices(["foo", "bar"]), 0.0)
 
 
-class TestRegimeStateStub(unittest.TestCase):
-    """compute_regime_state still returns 'normal' (real machinery is in controller)."""
+class TestComputeRegimeState(unittest.TestCase):
+    """Pure-function regime state machine — covers L1/L1.5/L2/L3 transitions."""
 
-    def test_regime_state_stub_normal(self):
-        vol = compute_vol_state(1.0, 1.0)
-        inv = compute_inventory_state(
+    def setUp(self):
+        from controllers.market_making.pmm_lead_lag_utils import RegimeContext, RegimeThresholds
+        self.RegimeContext = RegimeContext
+        self.th = RegimeThresholds(
+            vol_pause_threshold_mult=5.0,
+            vol_degraded_threshold_mult=3.0,
+            pause_basis_bps=30.0,
+            pause_release_sec=60.0,
+            safe_mode_entry_sec=120.0,
+            safe_thrash_window_sec=600.0,
+            max_session_drawdown_quote=10.0,
+            critical_error_threshold=5,
+        )
+        self.normal_inv = compute_inventory_state(
             Decimal("0.01"), Decimal("500"), Decimal("50000"), 0.5, 0.1, 0.2, 0.4
         )
-        regime = compute_regime_state(vol, inv)
-        self.assertEqual(regime.regime, "normal")
-        self.assertAlmostEqual(regime.spread_multiplier, 1.0)
+
+    def _call(self, **overrides):
+        kwargs = dict(
+            vol_state=compute_vol_state(1.0, 1.0),
+            inv_state=self.normal_inv,
+            basis_bps=0.0,
+            regime_stale=False,
+            over_max_net_position=False,
+            session_pnl=0.0,
+            now=1000.0,
+            ctx=self.RegimeContext(),
+            th=self.th,
+        )
+        kwargs.update(overrides)
+        return compute_regime_state(**kwargs)
+
+    def test_normal_when_all_quiet(self):
+        result = self._call()
+        self.assertEqual(result.regime, "normal")
+        self.assertAlmostEqual(result.spread_multiplier, 1.0)
+
+    def test_l1_degraded_above_threshold(self):
+        result = self._call(vol_state=compute_vol_state(4.0, 1.0))  # ratio = 4.0
+        self.assertEqual(result.regime, "degraded")
+        self.assertAlmostEqual(result.spread_multiplier, 1.5)
+
+    def test_l2_paused_when_vol_extreme(self):
+        result = self._call(vol_state=compute_vol_state(6.0, 1.0))  # ratio = 6.0 > 5.0
+        self.assertEqual(result.regime, "paused")
+        self.assertIn("vol_ratio", result.cause)
+
+    def test_l2_paused_when_basis_excessive(self):
+        result = self._call(basis_bps=50.0)  # > 30
+        self.assertEqual(result.regime, "paused")
+        self.assertIn("basis", result.cause)
+
+    def test_l2_paused_when_regime_stale(self):
+        # New trigger: feed staleness should pause regime (§4.1 L2 item 4).
+        result = self._call(regime_stale=True)
+        self.assertEqual(result.regime, "paused")
+        self.assertIn("stale", result.cause)
+
+    def test_l2_dwell_keeps_paused(self):
+        ctx = self.RegimeContext(last_l2_time=1000.0)
+        result = self._call(now=1030.0, ctx=ctx)  # 30s after last L2 (dwell=60s)
+        self.assertEqual(result.regime, "paused")
+        self.assertIn("dwell", result.cause)
+
+    def test_l3_killed_by_drawdown(self):
+        result = self._call(session_pnl=-15.0)  # < -10
+        self.assertEqual(result.regime, "killed")
+        self.assertIn("session_pnl", result.cause)
+
+    def test_l3_killed_by_inv_kill(self):
+        # Inventory deviation > inv_kill (0.4)
+        long_inv = compute_inventory_state(
+            Decimal("0.02"), Decimal("100"), Decimal("50000"), 0.5, 0.1, 0.2, 0.4
+        )
+        result = self._call(inv_state=long_inv)
+        self.assertEqual(result.regime, "killed")
+
+    def test_l3_killed_by_over_max_net_position(self):
+        result = self._call(over_max_net_position=True)
+        self.assertEqual(result.regime, "killed")
+        self.assertEqual(result.cause, "over_max_net_position")
+
+    def test_l3_killed_by_critical_errors(self):
+        # New trigger: critical_error_count >= threshold (§4.1 L3 item 4).
+        ctx = self.RegimeContext(critical_error_count=5)
+        result = self._call(ctx=ctx)
+        self.assertEqual(result.regime, "killed")
+        self.assertIn("critical_errors", result.cause)
+
+    def test_l3_latches(self):
+        # Once killed, stays killed even when conditions clear.
+        ctx = self.RegimeContext(is_killed=True)
+        result = self._call(ctx=ctx)
+        self.assertEqual(result.regime, "killed")
+        self.assertEqual(result.cause, "killed_latched")
+
+    def test_safe_mode_after_sustained_l1(self):
+        # L1 entered at t=0, current t=200, exceeds safe_mode_entry_sec=120
+        ctx = self.RegimeContext(l1_entry_time=0.0)
+        result = self._call(vol_state=compute_vol_state(4.0, 1.0), now=200.0, ctx=ctx)
+        self.assertEqual(result.regime, "safe")
+        self.assertAlmostEqual(result.spread_multiplier, 2.5)
+
+    def test_safe_mode_dwell_2x(self):
+        # In safe mode for 100s, dwell = 2 × 60 = 120 → stays safe
+        ctx = self.RegimeContext(safe_entry_time=900.0)
+        result = self._call(now=1000.0, ctx=ctx)
+        self.assertEqual(result.regime, "safe")
+
+    def test_ctx_mutates_on_l2_entry(self):
+        ctx = self.RegimeContext()
+        self._call(vol_state=compute_vol_state(6.0, 1.0), now=1000.0, ctx=ctx)
+        self.assertEqual(ctx.last_l2_time, 1000.0)
+        self.assertIn(1000.0, ctx.l2_timestamps)
+
+    def test_ctx_mutates_on_kill(self):
+        ctx = self.RegimeContext()
+        self._call(session_pnl=-15.0, ctx=ctx)
+        self.assertTrue(ctx.is_killed)
 
 
 class TestEwmStep(unittest.TestCase):
