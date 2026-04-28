@@ -1,0 +1,19 @@
+# Boot script config — PMM Lead-Lag Skew
+#
+# Uso:
+#   start --script v2_pmm_lead_lag.py --conf conf/scripts/conf_v2_pmm_lead_lag.yml
+#
+# O controller é carregado via controllers_config abaixo.
+# Para paper trade: aponta para conf_pmm_lead_lag_skew_paper.yml
+# Para capital real: trocar para conf_pmm_lead_lag_skew.yml
+
+script_file_name: v2_pmm_lead_lag.py
+controllers_config:
+  - conf_pmm_lead_lag_skew_paper.yml
+
+# Drawdown global de sessão em quote (BRL).
+# Complementa o kill switch do próprio controller (max_session_drawdown_quote).
+max_global_drawdown_quote: 10.0
+
+# Drawdown por controller — null = delega ao kill switch do controller.
+max_controller_drawdown_quote: null

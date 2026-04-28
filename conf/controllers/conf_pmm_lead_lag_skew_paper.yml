@@ -1,0 +1,85 @@
+# PMM Lead-Lag Skew — Paper Trade (Fase 6, Semana 1 baseline)
+# BTC-BRL on Binance Paper Trade
+#
+# Idêntico ao config de produção, exceto pelos connectors (binance_paper_trade).
+# Não editar os parâmetros de regime/inventário — baseline deve ser comparável ao live.
+
+controller_name: pmm_lead_lag_skew
+controller_type: market_making
+id: pmm_btc_brl_paper
+
+# ── Connector ──────────────────────────────────────────────────────────────
+connector_name: binance_paper_trade
+trading_pair: BTC-BRL
+leverage: 1
+
+# ── Capital e níveis ──────────────────────────────────────────────────────
+total_amount_quote: 200          # R$200 — equivalente ao capital real planejado
+buy_spreads:  [0.0010, 0.0020]  # 10 bps e 20 bps
+sell_spreads: [0.0010, 0.0020]
+buy_amounts_pct:  [50, 50]
+sell_amounts_pct: [50, 50]
+
+# ── Executor ──────────────────────────────────────────────────────────────
+executor_refresh_time: 60
+cooldown_time: 15
+
+# ── Triple barrier — PMM puro (sem SL/TP) ────────────────────────────────
+stop_loss: null
+take_profit: null
+time_limit: null
+
+# ── Rebalance spot ────────────────────────────────────────────────────────
+position_rebalance_threshold_pct: 0.25
+skip_rebalance: true
+
+# ── Inventário (Fase 2) ──────────────────────────────────────────────────
+target_inventory_base_pct: 0.5
+inv_soft_band: 0.10
+inv_hard_band: 0.20
+inv_hard_cap:  0.30
+inv_kill:      0.40
+max_net_position_quote: 999999  # paper: desabilitado; proteção real é inv_kill=0.40. Real R$200 → usar 60
+
+# ── Skew (Fase 3) ────────────────────────────────────────────────────────
+w_inv: 1.0
+w_lead: 0.0                      # Semana 1: baseline Phase 4 — lead-lag desligado
+skew_max_bps: 2
+min_maker_distance_bps: 1
+min_requote_bps: 1
+force_requote_bps: 15
+
+# ── Volatilidade (Fase 3) ────────────────────────────────────────────────
+candles_connector: binance  # candles = dados de mercado; não usa paper trade
+candles_trading_pair: BTC-BRL
+candles_interval: 1m
+vol_short_length: 30
+vol_ref_length:   360
+
+# ── Lead-lag (Fase 5 — desligado na Semana 1) ───────────────────────────
+basis_deadband_bps: 3
+max_leader_staleness_sec: 5
+max_usdt_brl_staleness_sec: 15
+
+leader_connector: binance  # dados de preço BTC-USDT; não usa paper trade
+leader_trading_pair: BTC-USDT
+quote_rate_connector: binance  # dados de taxa USDT-BRL; não usa paper trade
+quote_rate_trading_pair: USDT-BRL
+
+lead_micro_window_sec: 5
+lead_micro_threshold_bps: 5
+lead_micro_dwell_sec: 3
+
+lead_lag_short_window_sec: 30
+lead_lag_ewm_halflife_sec: 10
+lead_lag_z_window_sec:     600
+
+# ── Regime + kill switch (Fase 4) ────────────────────────────────────────
+vol_degraded_threshold_mult: 3.0
+vol_pause_threshold_mult:    5.0
+pause_basis_bps:             30.0
+pause_release_sec:           60.0
+safe_mode_entry_sec:         120.0
+safe_thrash_window_sec:      600.0
+max_session_drawdown_quote:  10
+critical_error_threshold:    5
