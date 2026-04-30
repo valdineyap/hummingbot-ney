@@ -381,7 +381,25 @@ python bin/hummingbot_quickstart.py --v2 conf_v2_pmm_lead_lag.yml
 
 ---
 
-### 9.9 Estado da Fase 6 (atualizado 2026-04-30)
+### 9.9 Taxas Binance VIP 4 — `conf/conf_fee_overrides.yml`
+
+As taxas devem refletir o nível VIP e se BNB é usado para pagar fees:
+
+| Cenário | maker | taker |
+|---|---|---|
+| VIP 4 **sem BNB** (configurado) | **0.04%** | **0.052%** |
+| VIP 4 com BNB (25% off) | 0.030% | 0.039% |
+| Padrão retail (default Hummingbot) | 0.100% | 0.100% |
+
+**Impacto no live:** o `session_pnl` usa as taxas reais reportadas pelo fill da Binance
+(campo `commission`), não este config. O config afeta principalmente paper trade e
+estimativas pré-trade.
+
+**Referência:** `conf/conf_fee_overrides.yml` — requer reinício do bot para entrar em vigor.
+
+---
+
+### 9.11 Estado da Fase 6 (atualizado 2026-04-30)
 
 | Semana | Connector | `w_lead` | Duração | Resultado |
 |---|---|---|---|---|
