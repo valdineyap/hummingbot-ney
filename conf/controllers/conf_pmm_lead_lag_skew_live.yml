@@ -58,7 +58,7 @@ vol_ref_length:   360
 
 # ── Lead-lag ─────────────────────────────────────────────────────────────
 basis_deadband_bps: 3
-max_leader_staleness_sec: 15     # fix S2: 5→15 para reduzir stale de warmup
+max_leader_staleness_sec: 5      # deve ser <= lead_micro_window_sec (5s)
 max_usdt_brl_staleness_sec: 15
 
 leader_connector: binance

@@ -58,7 +58,7 @@ vol_ref_length:   360
 
 # ── Lead-lag (Fase 5 — desligado na Semana 1) ───────────────────────────
 basis_deadband_bps: 3
-max_leader_staleness_sec: 15
+max_leader_staleness_sec: 5
 max_usdt_brl_staleness_sec: 15
 
 leader_connector: binance  # dados de preço BTC-USDT; não usa paper trade

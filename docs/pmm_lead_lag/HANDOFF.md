@@ -350,6 +350,9 @@ resolve o problema de warmup mas não elimina o steady-state.
 - **Impacto com w_lead=0.1:** lead signal inativo nos ~10% de ticks stale; aceitável.
 - **Diagnóstico:** verificar se os runs são de 1 tick (estrutural) ou longos (rede).
 - **Fix definitivo:** implementar subscrição bookTicker dedicada para BTC-USDT.
+- **⚠️ NÃO aumentar `max_leader_staleness_sec` para reduzir stale:** esse threshold
+  deve ser ≤ `lead_micro_window_sec` (5s). Aumentar para 15s não reduz stale
+  (a causa é `None` reads, não o timestamp) e aceita dados semanticamente inválidos.
 
 ---
 
