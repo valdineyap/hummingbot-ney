@@ -1,0 +1,114 @@
+# XEMM Lead-Lag controller — BTC-BRL  (EXAMPLE — copy to conf/controllers/)
+#
+# To use: copy this file to `conf/controllers/xemm_lead_lag_btc_brl.yml`
+# (the conf/ directory is gitignored — it's where runtime configs live).
+#
+# Maker: Bybit BTC-BRL  |  Taker (hedge): Binance BTC-BRL
+# Signal: Binance BTC-USDT × Binance USDT-BRL (used only as lead-lag indicator)
+#
+# Read first:
+#   * Always start with shadow_mode: true. Collect ≥48h of CSV data and
+#     analyze before flipping to live.
+#   * The XEMMExecutor handles fees automatically via _tx_cost_pct, so
+#     `min/target/max_profitability` are NET edges (after fees).
+#   * Confirm your real fee tier via "My Fee Rate" on each exchange.
+#     Reference (subject to change):
+#       - Binance VIP4 spot:  0.040% maker / 0.052% taker
+#       - Bybit VIP4 spot fiat-crypto: ~0.050% maker / ~0.060% taker
+#     Round-trip cost ≈ 9–11 bps; min_profitability=7 bps NET means the bot
+#     refreshes when the gross edge falls below ~16 bps gross.
+#   * The controller uses XEMMBRLExecutor (LIMIT_MAKER), not XEMMExecutor
+#     (LIMIT). This is a hard requirement to avoid maker→taker conversion
+#     under home latency.
+
+id: xemm_lead_lag_btcbrl_v1
+controller_name: xemm_lead_lag
+controller_type: generic
+
+# ============================================================ #
+# Markets                                                      #
+# ============================================================ #
+maker_connector: bybit
+maker_trading_pair: BTC-BRL
+taker_connector: binance
+taker_trading_pair: BTC-BRL
+signal_connector: binance
+signal_base_pair: BTC-USDT
+signal_fx_pair: USDT-BRL
+
+# ============================================================ #
+# Sizing                                                       #
+# ============================================================ #
+# Cap on total budget tracked by the framework (BRL).
+total_amount_quote: "1000"
+# Per-order amount in base asset (BTC). At ~300k BRL/BTC, 0.0002 ≈ 60 BRL.
+# Confirm Bybit min_notional and tick_size before going live.
+order_amount: "0.0002"
+
+# ============================================================ #
+# Profitability (NET of fees — XEMMExecutor adds tx_cost_pct)  #
+# All values are decimals: 0.001 = 10 bps                      #
+# ============================================================ #
+min_profitability: "0.0007"     # 7 bps net floor
+target_profitability: "0.0020"  # 20 bps net target
+max_profitability: "0.0080"     # 80 bps net ceiling (refresh above)
+
+# ============================================================ #
+# Lead-lag signal                                              #
+# ============================================================ #
+lead_windows_seconds:
+  - 5
+  - 10
+  - 15
+profitability_adjust_threshold_bps: "5"   # |lead| above → adjust targets
+soft_cancel_threshold_bps: "10"            # |lead| above → DEGRADED state
+fast_cancel_threshold_bps: "15"            # |lead| above → PAUSED + cancel
+w_lead: "0.20"                             # weight applied to lead in target
+ema_alpha_fx: "0.30"                       # USDT-BRL smoothing for fair_slow
+
+# ============================================================ #
+# Feed staleness (seconds)                                     #
+# ============================================================ #
+max_leader_staleness_sec: 5.0
+max_fx_staleness_sec: 10.0    # USDT-BRL is less liquid; allow more
+max_local_staleness_sec: 5.0
+
+# ============================================================ #
+# Risk gates                                                   #
+# ============================================================ #
+basis_hard_threshold_bps: "150"
+max_local_spread_bps: "200"
+
+# ============================================================ #
+# Anti-churn                                                   #
+# ============================================================ #
+min_requote_interval_sec: 3.0
+
+# ============================================================ #
+# Inventory (per-exchange)                                     #
+# ============================================================ #
+inventory_target_pct: "0.5"
+inventory_skew_strength: "0.001"
+# Minimum balances on the TAKER exchange to allow each maker side
+# (because a fill on maker triggers the opposite hedge on taker).
+min_taker_base_for_sell_hedge: "0.0005"   # need BTC on Binance for BUY-maker
+min_taker_quote_for_buy_hedge: "200"      # need BRL on Binance for SELL-maker
+
+# ============================================================ #
+# Warmup                                                       #
+# ============================================================ #
+# Must be >= max(lead_windows_seconds) + 5
+warmup_seconds: 25.0
+
+# ============================================================ #
+# Circuit breakers                                             #
+# ============================================================ #
+max_consecutive_hedge_failures: 1
+max_daily_loss_quote: "100"     # BRL
+
+# ============================================================ #
+# Operational                                                  #
+# ============================================================ #
+shadow_mode: true                          # MUST start as true
+log_dir: "logs/xemm_lead_lag"
+kill_switch_file: "/tmp/xemm_lead_lag_pause"  # touch this file to pause live
