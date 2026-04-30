@@ -326,6 +326,9 @@ class PMMLeadLagSkewController(MarketMakingControllerBase):
         self._last_mid_brl_ts: float = 0.0
         self._last_mid_usdt_ts: float = 0.0
         self._last_usdt_brl_ts: float = 0.0
+        # Cache of last known good close prices — used when candles DF momentarily
+        # returns None/empty (race condition during feed refresh, ~1 tick, ~10% rate).
+        self._price_cache: dict = {}
         # Pause expiry (set in update_processed_data) — used by get_levels_to_execute.
         self._pause_buy_until: float = 0.0
         self._pause_sell_until: float = 0.0
@@ -420,10 +423,13 @@ class PMMLeadLagSkewController(MarketMakingControllerBase):
     def _read_latest_close(self, connector: Optional[str], pair: Optional[str]) -> Optional[float]:
         """
         Return the most recent close price from candles for (connector, pair).
-        None if the feed is unavailable or empty.
+        Falls back to the last cached value when the feed DF is transiently
+        empty (race condition during candles refresh, typically ~1 tick).
+        Returns None only on the very first call before any data arrives.
         """
         if not connector or not pair:
             return None
+        cache_key = f"{connector}|{pair}"
         try:
             df = self.market_data_provider.get_candles_df(
                 connector_name=connector,
@@ -432,13 +438,15 @@ class PMMLeadLagSkewController(MarketMakingControllerBase):
                 max_records=2,
             )
         except Exception:
-            return None
+            return self._price_cache.get(cache_key)
         if df is None or len(df) == 0:
-            return None
+            return self._price_cache.get(cache_key)
         try:
-            return float(df["close"].iloc[-1])
+            value = float(df["close"].iloc[-1])
         except (KeyError, IndexError, ValueError, TypeError):
-            return None
+            return self._price_cache.get(cache_key)
+        self._price_cache[cache_key] = value
+        return value
 
     def _read_leg_prices(self) -> Tuple[Optional[float], Optional[float], Optional[float]]:
         """

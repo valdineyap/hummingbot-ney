@@ -254,7 +254,147 @@ price_shift_bps < 0  → ref sobe → bids mais atrativos, asks menos atrativos 
 
 ---
 
-## 9. Regras de desenvolvimento
+## 9. Lições de Configuração — armadilhas conhecidas
+
+> Aprendidas durante a Fase 6 (paper trade + live deploy). Leia antes de criar
+> ou alterar qualquer YAML de configuração.
+
+### 9.1 `max_net_position_quote` — semântica crítica
+
+**Cálculo no controller (linha ~806):**
+```python
+net_exposure_quote = base_bal * mid_dec   # valor TOTAL de BTC em BRL, não desvio
+over_max_net_position = net_exposure_quote > config.max_net_position_quote
+```
+
+**Erro comum:** definir como `30% do capital total` (ex. R$60 para R$200 de capital).
+Com target 50/50, a posição BTC inicial é ~R$100 → dispara imediatamente.
+
+**Regra correta:** o valor deve ser **maior que o valor atual de BTC** e servir como
+cap de emergência acima do `inv_kill` (que já protege a 90% do portfolio).
+
+| Capital total | BTC inicial (~50%) | `max_net_position_quote` recomendado |
+|---|---|---|
+| R$400 | R$200 | **500** (cap em 63% do portfolio) |
+| R$800 | R$400 | **650** |
+| R$200 | R$100 | **160** |
+
+A proteção primária de inventário é `inv_kill: 0.40` (kill quando inv_pct > 0.90 ou < 0.10).
+Use `max_net_position_quote` apenas como guard contra cenários extremos de mercado.
+
+---
+
+### 9.2 `controllers_config` — só o filename, sem path
+
+No YAML do boot script (`conf/scripts/`), o sistema prepende `conf/controllers/`
+automaticamente. Passar o path completo causa duplicação:
+
+```yaml
+# ERRADO — gera "conf/controllers/conf/controllers/conf_pmm_lead_lag_skew.yml"
+controllers_config:
+  - conf/controllers/conf_pmm_lead_lag_skew_paper.yml
+
+# CORRETO
+controllers_config:
+  - conf_pmm_lead_lag_skew_paper.yml
+```
+
+---
+
+### 9.3 `controller_type` — obrigatório no YAML
+
+O `trading_core` loader exige explicitamente:
+```yaml
+controller_type: market_making   # sem isso → "Missing controller_type"
+```
+
+---
+
+### 9.4 `candles_connector` — nunca `binance_paper_trade`
+
+A `CandlesFactory` não suporta o conector `binance_paper_trade`. Sempre use o
+conector real para dados de mercado, mesmo em paper trade:
+
+```yaml
+candles_connector: binance        # CORRETO (mesmo em paper trade)
+leader_connector: binance         # idem
+quote_rate_connector: binance     # idem
+connector_name: binance_paper_trade  # só aqui vai o paper
+```
+
+---
+
+### 9.5 PaperTradeExchange (V1) — incompatibilidade com V2 PositionExecutor
+
+`PaperTradeExchange` (Cython V1) não tem `.trading_rules` nem `._order_tracker`.
+O `ExecutorBase` (V2) precisa desses atributos. O `scripts/v2_pmm_lead_lag.py`
+contém um monkey-patch de compatibilidade que deve ser mantido:
+
+```python
+def _patch_executor_base_for_paper_trade():
+    # Patcheia get_trading_rules → retorna TradingRule permissivo se não tiver .trading_rules
+    # Patcheia get_in_flight_order → retorna None se não tiver ._order_tracker
+```
+
+**Não remover** este patch enquanto usar paper trade com V2 controllers.
+
+---
+
+### 9.6 `micro_stale` — causa estrutural (~10% steady-state)
+
+O `micro_stale` é disparado quando `mid_brl is None or mid_usdt is None`, o que
+ocorre quando `get_candles_df` retorna DF vazio (~1 tick a cada ~10s, race condition
+na atualização do feed). O cache em `_read_latest_close` (adicionado na Fase 6)
+resolve o problema de warmup mas não elimina o steady-state.
+
+- **Impacto com w_lead=0.1:** lead signal inativo nos ~10% de ticks stale; aceitável.
+- **Diagnóstico:** verificar se os runs são de 1 tick (estrutural) ou longos (rede).
+- **Fix definitivo:** implementar subscrição bookTicker dedicada para BTC-USDT.
+
+---
+
+### 9.7 `session_pnl` — zero em paper trade (V1)
+
+O `session_pnl` permanece 0 em paper trade porque o `PaperTradeExchange` V1 não
+despacha eventos de fill compatíveis com o V2 executor. Para medir PnL use o proxy:
+
+```python
+portfolio_brl = base_bal * mid + quote_bal
+```
+
+No **live** (Binance real), `session_pnl` é rastreado corretamente e o kill switch
+`max_session_drawdown_quote` funciona de verdade.
+
+---
+
+### 9.8 `--v2` no quickstart — só filename
+
+O flag `--v2` do `bin/hummingbot_quickstart.py` prepende `conf/scripts/` automaticamente:
+
+```bash
+# ERRADO — gera "conf/scripts/conf/scripts/conf_v2_pmm_lead_lag.yml"
+python bin/hummingbot_quickstart.py --v2 conf/scripts/conf_v2_pmm_lead_lag.yml
+
+# CORRETO
+python bin/hummingbot_quickstart.py --v2 conf_v2_pmm_lead_lag.yml
+```
+
+---
+
+### 9.9 Estado da Fase 6 (atualizado 2026-04-30)
+
+| Semana | Connector | `w_lead` | Duração | Resultado |
+|---|---|---|---|---|
+| S1 baseline | binance_paper_trade | 0.0 | 19.5h | normal 100%, stale 10.5%, inv soft 89% |
+| S2 A/B | binance_paper_trade | 0.1 | ~38h total | normal 99.9%, lead ativo 82%, inv soft 100% |
+| Live deploy | **binance** | 0.1 | em curso | R$407 BRL + 0.001 BTC, 4 ordens ativas |
+
+**Config live ativa:** `conf/controllers/conf_pmm_lead_lag_skew_live.yml`
+**Boot script live:** `conf/scripts/conf_v2_pmm_lead_lag_live.yml`
+
+---
+
+## 10. Regras de desenvolvimento
 
 ### Antes de qualquer alteração
 
@@ -288,7 +428,7 @@ git push -u origin claude/pmm-bot-lead-lag-skew-RXuZp
 
 ---
 
-## 10. Referências rápidas
+## 11. Referências rápidas
 
 | O que | Onde |
 |-------|------|
@@ -296,14 +436,19 @@ git push -u origin claude/pmm-bot-lead-lag-skew-RXuZp
 | Checklist de progresso por fase | `controllers/market_making/IMPL_PROGRESS.md` |
 | Config Pydantic completa | `pmm_lead_lag_skew.py` linha ~42 |
 | Funções puras (dataclasses + cálculos) | `pmm_lead_lag_utils.py` |
-| YAML de configuração | `conf/controllers/conf_pmm_lead_lag_skew.yml` |
+| YAML controller — referência (Phase 1) | `conf/controllers/conf_pmm_lead_lag_skew.yml` |
+| YAML controller — paper trade (Phase 6) | `conf/controllers/conf_pmm_lead_lag_skew_paper.yml` |
+| YAML controller — live Binance (Phase 6) | `conf/controllers/conf_pmm_lead_lag_skew_live.yml` |
+| Boot script paper | `conf/scripts/conf_v2_pmm_lead_lag.yml` |
+| Boot script live | `conf/scripts/conf_v2_pmm_lead_lag_live.yml` |
 | Testes de utils | `test/controllers/market_making/test_pmm_lead_lag_utils.py` |
 | Testes do controller | `test/controllers/market_making/test_pmm_lead_lag_skew.py` |
-| Boot script | `scripts/v2_pmm_lead_lag.py` |
+| Boot script Python | `scripts/v2_pmm_lead_lag.py` |
+| Armadilhas de configuração | `docs/pmm_lead_lag/HANDOFF.md` §9 |
 
 ---
 
-## 11. Perguntas frequentes
+## 12. Perguntas frequentes
 
 **Por que `w_lead: 0.0` no YAML atual?**  
 Lead-lag (Phase 5) só deve ser ativado após 1 semana de baseline Phase 4 e com

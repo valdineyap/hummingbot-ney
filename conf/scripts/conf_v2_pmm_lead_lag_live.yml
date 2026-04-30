@@ -1,0 +1,16 @@
+# Boot script config — PMM Lead-Lag Skew LIVE
+#
+# Uso:
+#   start --script v2_pmm_lead_lag.py --conf conf/scripts/conf_v2_pmm_lead_lag_live.yml
+# Headless:
+#   python bin/hummingbot_quickstart.py --headless --v2 conf_v2_pmm_lead_lag_live.yml --config-password Senha123
+
+script_file_name: v2_pmm_lead_lag.py
+controllers_config:
+  - conf_pmm_lead_lag_skew_live.yml
+
+# Drawdown global de sessão em quote (BRL) — ativo no live pois fills são reais
+max_global_drawdown_quote: 20.0
+
+# Drawdown por controller — null = delega ao kill switch do controller
+max_controller_drawdown_quote: null
