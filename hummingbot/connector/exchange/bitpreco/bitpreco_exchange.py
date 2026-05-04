@@ -168,7 +168,8 @@ class BitprecoExchange(ExchangePyBase):
         )
         if response.get("message_cod") == "ORDER_CANCELED":
             return True
-        return False
+        message = response.get("message", "Cancel failed")
+        raise IOError(f"Order cancel failed: {message}")
 
     async def _format_trading_rules(self, exchange_info_dict: Dict[str, Any]) -> List[TradingRule]:
 
@@ -254,10 +255,10 @@ class BitprecoExchange(ExchangePyBase):
             min_notional_size = rule.get("min_notional_size")
             retval.append(
                 TradingRule(trading_pair,
-                            min_order_size=min_order_size,
-                            min_price_increment=Decimal(min_price_increment),
-                            min_base_amount_increment=Decimal(min_base_amount_increment),
-                            min_notional_size=Decimal(min_notional_size)))
+                            min_order_size=Decimal(str(min_order_size)),
+                            min_price_increment=Decimal(str(min_price_increment)),
+                            min_base_amount_increment=Decimal(str(min_base_amount_increment)),
+                            min_notional_size=Decimal(str(min_notional_size))))
 
         return retval
 
@@ -406,6 +407,12 @@ class BitprecoExchange(ExchangePyBase):
             )
             return order_update
 
+    def _is_order_not_found_during_status_update_error(self, status_update_exception: Exception) -> bool:
+        return CONSTANTS.ORDER_NOT_EXIST_MESSAGE in str(status_update_exception)
+
+    def _is_order_not_found_during_cancelation_error(self, cancelation_exception: Exception) -> bool:
+        return CONSTANTS.ORDER_NOT_EXIST_MESSAGE in str(cancelation_exception)
+
     async def _update_balances(self):
 
         local_asset_names = set(self._account_balances.keys())
@@ -443,6 +450,7 @@ class BitprecoExchange(ExchangePyBase):
             if event_message.get("event") == "flash":
                 await self._update_all_balances()
                 await self._update_order_status()
+                await self._update_lost_orders()
 
     def _create_user_stream_data_source(self) -> UserStreamTrackerDataSource:
         return BitprecoAPIUserStreamDataSource(
@@ -454,16 +462,24 @@ class BitprecoExchange(ExchangePyBase):
         )
 
     async def _initialize_trading_pair_symbol_map(self):
+        try:
+            response = await self._api_request(
+                method=RESTMethod.GET,
+                path_url=CONSTANTS.ALL_CURRENCY_TICKER_PATH_URL,
+            )
 
+            if not response["success"]:
+                raise IOError(f"BitPreco returned failure on trading pair initialization: {response}")
+
+            bitpreco_pairs = list(filter(lambda pair: pair != "success", response.keys()))
+            self._initialize_trading_pair_symbols_from_exchange_info(exchange_info=bitpreco_pairs)
+        except Exception:
+            self.logger().exception("There was an error requesting exchange info.")
+
+    async def _get_last_traded_price(self, trading_pair: str) -> float:
         response = await self._api_request(
             method=RESTMethod.GET,
             path_url=CONSTANTS.ALL_CURRENCY_TICKER_PATH_URL,
         )
-
-        if not response["success"]:
-            raise IOError(f"BitPreco returned failure on trading pair initialization: {response}")
-
-        bitpreco_pairs = list(filter(lambda pair: pair != "success", response.keys()))
-
-        self._initialize_trading_pair_symbols_from_exchange_info(exchange_info=bitpreco_pairs)
+        return float(response[trading_pair]["last"])
 

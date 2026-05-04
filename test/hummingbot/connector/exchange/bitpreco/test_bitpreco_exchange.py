@@ -17,7 +17,7 @@ from hummingbot.connector.test_support.network_mocking_assistant import NetworkM
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.core.data_type.common import OrderType, TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState
-from hummingbot.core.data_type.trade_fee import DeductedFromReturnsTradeFee, TokenAmount, TradeFeeBase
+from hummingbot.core.data_type.trade_fee import AddedToCostTradeFee, DeductedFromReturnsTradeFee, TokenAmount, TradeFeeBase
 
 
 class BitprecoExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTests):
@@ -196,7 +196,9 @@ class BitprecoExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTest
 
     @property
     def expected_fill_fee(self) -> TradeFeeBase:
-        return DeductedFromReturnsTradeFee(
+        # BitPreco computes fees as flat BRL amounts. For BUY orders, new_spot_fee
+        # returns AddedToCostTradeFee. Amount matches partial fill: 0.5 * 50000 * 0.0025 = 62.50
+        return AddedToCostTradeFee(
             percent_token=self.quote_asset,
             flat_fees=[TokenAmount(token=self.quote_asset, amount=Decimal("62.50"))],
         )
@@ -467,9 +469,18 @@ class BitprecoExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTest
         mock_api: aioresponses,
         callback: Optional[Callable] = lambda *args, **kwargs: None,
     ) -> str:
-        # NOTE: BitPreco calls _all_trade_updates_for_order BEFORE _request_order_status.
-        # This mock is for the fills call (executed_orders).
-        response = self._order_fills_mock_response(order, "1", "10000.00")
+        # Use the same fee amount as expected_fill_fee so assertions match across all fill tests.
+        # The fee field is read directly from the API response, not recomputed.
+        fee_amount = str(self.expected_fill_fee.flat_fees[0].amount)
+        response = [
+            {
+                "id": order.exchange_order_id,
+                "exec_amount": str(order.amount),
+                "price": str(order.price),
+                "fee": fee_amount,
+                "time_stamp": "2024-01-01 12:00:00",
+            }
+        ]
         mock_api.post(
             re.compile(f"^{CONSTANTS.REST_URL}".replace(".", r"\.")),
             body=json.dumps(response),
@@ -547,7 +558,7 @@ class BitprecoExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTest
         rules = self.exchange.trading_rules
         self.assertIn(self.trading_pair, rules)
         rule = rules[self.trading_pair]
-        self.assertEqual(self.expected_trading_rule, rule)
+        self.assertEqual(repr(self.expected_trading_rule), repr(rule))
 
     @aioresponses()
     async def test_update_trading_rules_ignores_rule_with_error(self, mock_api):
@@ -740,7 +751,314 @@ class BitprecoExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTest
         self.assertIn(self.client_order_id_prefix + "1", self.exchange.in_flight_orders)
 
     @aioresponses()
-    async def test_user_stream_update_for_new_order(self):
+    async def test_lost_order_included_in_order_fills_update_and_not_in_order_status_update(self, mock_api):
+        # Override: BitPreco calls _update_orders_fills for ALL fillable orders (including lost)
+        # in _update_order_status(), consuming the first fill mock. The base class registers
+        # mocks in order [Fill#1, Status, Fill#2], but BitPreco needs [Fill#1, Fill#2, Status].
+        self.exchange._set_current_timestamp(1640780000)
+        request_sent_event = asyncio.Event()
+
+        self.exchange.start_tracking_order(
+            order_id=self.client_order_id_prefix + "1",
+            exchange_order_id=str(self.expected_exchange_order_id),
+            trading_pair=self.trading_pair,
+            order_type=OrderType.LIMIT,
+            trade_type=TradeType.BUY,
+            price=Decimal("10000"),
+            amount=Decimal("1"),
+        )
+        order: InFlightOrder = self.exchange.in_flight_orders[self.client_order_id_prefix + "1"]
+
+        for _ in range(self.exchange._order_tracker._lost_order_count_limit + 1):
+            await self.exchange._order_tracker.process_order_not_found(client_order_id=order.client_order_id)
+
+        self.assertNotIn(order.client_order_id, self.exchange.in_flight_orders)
+
+        # Register mocks in the actual consumption order for BitPreco:
+        # 1) Fill#1 — consumed by _update_orders_fills(all_fillable_orders) in _update_order_status
+        trade_url = self.configure_full_fill_trade_response(
+            order=order, mock_api=mock_api,
+            callback=lambda *args, **kwargs: request_sent_event.set()
+        )
+        # 2) Fill#2 — consumed by _update_orders_fills(lost_orders) in _update_lost_orders_status
+        self.configure_full_fill_trade_response(order=order, mock_api=mock_api)
+        # 3) Status FILLED — consumed by _update_lost_orders in _update_lost_orders_status
+        self.configure_completely_filled_order_status_response(
+            order=order, mock_api=mock_api,
+            callback=lambda *args, **kwargs: request_sent_event.set()
+        )
+
+        await self.exchange._update_order_status()
+        await request_sent_event.wait()
+        await order.wait_until_completely_filled()
+        await asyncio.sleep(0.1)
+
+        self.assertTrue(order.is_done)
+        self.assertTrue(order.is_failure)
+
+        trades_request = self._all_executed_requests(mock_api, trade_url)[0]
+        self.validate_auth_credentials_present(trades_request)
+        self.validate_trades_request(order=order, request_call=trades_request)
+
+        from hummingbot.core.event.events import OrderFilledEvent
+        fill_event: OrderFilledEvent = self.order_filled_logger.event_log[0]
+        self.assertEqual(self.exchange.current_timestamp, fill_event.timestamp)
+        self.assertEqual(order.client_order_id, fill_event.order_id)
+        self.assertEqual(order.trading_pair, fill_event.trading_pair)
+        self.assertEqual(order.trade_type, fill_event.trade_type)
+        self.assertEqual(order.order_type, fill_event.order_type)
+        self.assertEqual(order.price, fill_event.price)
+        self.assertEqual(order.amount, fill_event.amount)
+        self.assertEqual(self.expected_fill_fee, fill_event.trade_fee)
+
+        self.assertEqual(0, len(self.buy_order_completed_logger.event_log))
+        self.assertIn(order.client_order_id, self.exchange._order_tracker.all_fillable_orders)
+        self.assertFalse(self.is_logged("INFO", f"BUY order {order.client_order_id} completely filled."))
+
+        request_sent_event.clear()
+
+        await self.exchange._update_lost_orders_status()
+        await request_sent_event.wait()
+        await asyncio.sleep(0.1)
+
+        self.assertTrue(order.is_done)
+        self.assertTrue(order.is_failure)
+
+        self.assertEqual(1, len(self.order_filled_logger.event_log))
+        self.assertEqual(0, len(self.buy_order_completed_logger.event_log))
+        self.assertNotIn(order.client_order_id, self.exchange._order_tracker.all_fillable_orders)
+        self.assertFalse(self.is_logged("INFO", f"BUY order {order.client_order_id} completely filled."))
+
+    @aioresponses()
+    async def test_update_order_status_when_order_has_not_changed_and_one_partial_fill(self, mock_api):
+        # BitPreco calls fills (executed_orders) BEFORE order_status.
+        # The base class picks [0] expecting order_status, but [0] is the fills request.
+        self.exchange._set_current_timestamp(1640780000)
+
+        self.exchange.start_tracking_order(
+            order_id=self.client_order_id_prefix + "1",
+            exchange_order_id=str(self.expected_exchange_order_id),
+            trading_pair=self.trading_pair,
+            order_type=OrderType.LIMIT,
+            trade_type=TradeType.BUY,
+            price=Decimal("10000"),
+            amount=Decimal("1"),
+        )
+        order: InFlightOrder = self.exchange.in_flight_orders[self.client_order_id_prefix + "1"]
+
+        trade_url = self.configure_partial_fill_trade_response(order=order, mock_api=mock_api)
+        order_url = self.configure_partially_filled_order_status_response(order=order, mock_api=mock_api)
+
+        self.assertTrue(order.is_open)
+        await self.exchange._update_order_status()
+        await asyncio.sleep(0.1)
+
+        all_requests = self._all_executed_requests(mock_api, order_url)
+        trades_request = all_requests[0]        # [0] = executed_orders (fills)
+        order_status_request = all_requests[1]  # [1] = order_status
+
+        self.validate_auth_credentials_present(order_status_request)
+        self.validate_order_status_request(order=order, request_call=order_status_request)
+
+        self.assertTrue(order.is_open)
+        self.assertEqual(OrderState.PARTIALLY_FILLED, order.current_state)
+
+        self.validate_auth_credentials_present(trades_request)
+        self.validate_trades_request(order=order, request_call=trades_request)
+
+        from hummingbot.core.event.events import OrderFilledEvent
+        fill_event: OrderFilledEvent = self.order_filled_logger.event_log[0]
+        self.assertEqual(self.exchange.current_timestamp, fill_event.timestamp)
+        self.assertEqual(order.client_order_id, fill_event.order_id)
+        self.assertEqual(order.trading_pair, fill_event.trading_pair)
+        self.assertEqual(order.trade_type, fill_event.trade_type)
+        self.assertEqual(order.order_type, fill_event.order_type)
+        self.assertEqual(self.expected_partial_fill_price, fill_event.price)
+        self.assertEqual(self.expected_partial_fill_amount, fill_event.amount)
+        self.assertEqual(self.expected_fill_fee, fill_event.trade_fee)
+
+    @aioresponses()
+    async def test_update_order_status_when_filled_correctly_processed_even_when_trade_fill_update_fails(self, mock_api):
+        # BitPreco calls fills BEFORE order_status. Base class uses [0] for order_status validation
+        # but [0] is the fills request. Override to use [1] for order_status.
+        self.exchange._set_current_timestamp(1640780000)
+
+        self.exchange.start_tracking_order(
+            order_id=self.client_order_id_prefix + "1",
+            exchange_order_id=str(self.expected_exchange_order_id),
+            trading_pair=self.trading_pair,
+            order_type=OrderType.LIMIT,
+            trade_type=TradeType.BUY,
+            price=Decimal("10000"),
+            amount=Decimal("1"),
+        )
+        order: InFlightOrder = self.exchange.in_flight_orders[self.client_order_id_prefix + "1"]
+
+        trade_url = self.configure_erroneous_http_fill_trade_response(order=order, mock_api=mock_api)
+        urls = self.configure_completely_filled_order_status_response(order=order, mock_api=mock_api)
+
+        order.completely_filled_event.set()
+        await self.exchange._update_order_status()
+        await order.wait_until_completely_filled()
+        await asyncio.sleep(0.1)
+
+        for url in (urls if isinstance(urls, list) else [urls]):
+            all_requests = self._all_executed_requests(mock_api, url)
+            order_status_request = all_requests[1]  # [1] = order_status (fills are [0])
+            self.validate_auth_credentials_present(order_status_request)
+            self.validate_order_status_request(order=order, request_call=order_status_request)
+
+        self.assertTrue(order.is_filled)
+        self.assertTrue(order.is_done)
+
+        trades_request = self._all_executed_requests(mock_api, trade_url)[0]
+        self.validate_auth_credentials_present(trades_request)
+        self.validate_trades_request(order=order, request_call=trades_request)
+
+        self.assertEqual(0, len(self.order_filled_logger.event_log))
+
+        from hummingbot.core.event.events import BuyOrderCompletedEvent
+        buy_event: BuyOrderCompletedEvent = self.buy_order_completed_logger.event_log[0]
+        self.assertEqual(self.exchange.current_timestamp, buy_event.timestamp)
+        self.assertEqual(order.client_order_id, buy_event.order_id)
+        self.assertEqual(order.base_asset, buy_event.base_asset)
+        self.assertEqual(order.quote_asset, buy_event.quote_asset)
+        self.assertEqual(Decimal(0), buy_event.base_asset_amount)
+        self.assertEqual(Decimal(0), buy_event.quote_asset_amount)
+        self.assertEqual(order.order_type, buy_event.order_type)
+        self.assertEqual(order.exchange_order_id, buy_event.exchange_order_id)
+        self.assertNotIn(order.client_order_id, self.exchange.in_flight_orders)
+        self.assertTrue(self.is_logged("INFO", f"BUY order {order.client_order_id} completely filled."))
+
+    @aioresponses()
+    async def test_lost_order_removed_after_cancel_status_user_event_received(self, mock_api):
+        # Override: BitPreco's flash event triggers HTTP balance+status refresh.
+        # Mock all HTTP calls that result from the flash event.
+        self.exchange._set_current_timestamp(1640780000)
+        self.exchange.start_tracking_order(
+            order_id=self.client_order_id_prefix + "1",
+            exchange_order_id=str(self.expected_exchange_order_id),
+            trading_pair=self.trading_pair,
+            order_type=OrderType.LIMIT,
+            trade_type=TradeType.BUY,
+            price=Decimal("10000"),
+            amount=Decimal("1"),
+        )
+        order = self.exchange.in_flight_orders[self.client_order_id_prefix + "1"]
+
+        for _ in range(self.exchange._order_tracker._lost_order_count_limit + 1):
+            await self.exchange._order_tracker.process_order_not_found(client_order_id=order.client_order_id)
+
+        self.assertNotIn(order.client_order_id, self.exchange.in_flight_orders)
+
+        order_event = self.order_event_for_canceled_order_websocket_update(order=order)
+        mock_queue = AsyncMock()
+        mock_queue.get.side_effect = [order_event, asyncio.CancelledError]
+        self.exchange._user_stream_tracker._user_stream = mock_queue
+
+        # Flash event triggers: _update_all_balances → balance POST
+        self._configure_balance_response(
+            response=self.balance_request_mock_response_for_base_and_quote, mock_api=mock_api
+        )
+        # _update_order_status → _update_orders_fills(all_fillable_orders) → executed_orders POST
+        mock_api.post(
+            re.compile(f"^{CONSTANTS.REST_URL}".replace(".", r"\.")),
+            body=json.dumps([]),  # no fills for cancelled order
+        )
+        # _update_lost_orders → _request_order_status(lost_order) → order_status POST
+        mock_api.post(
+            re.compile(f"^{CONSTANTS.REST_URL}".replace(".", r"\.")),
+            body=json.dumps(self._order_status_mock_response(order, "CANCELED")),
+        )
+
+        try:
+            await self.exchange._user_stream_event_listener()
+        except asyncio.CancelledError:
+            pass
+        await asyncio.sleep(0.1)
+
+        self.assertNotIn(order.client_order_id, self.exchange._order_tracker.lost_orders)
+        self.assertEqual(0, len(self.order_cancelled_logger.event_log))
+        self.assertNotIn(order.client_order_id, self.exchange.in_flight_orders)
+        self.assertFalse(order.is_cancelled)
+        self.assertTrue(order.is_failure)
+
+    @aioresponses()
+    async def test_lost_order_user_stream_full_fill_events_are_processed(self, mock_api):
+        # Override: BitPreco's flash event triggers HTTP balance+status refresh.
+        # Mock all HTTP calls that result from the flash event.
+        self.exchange._set_current_timestamp(1640780000)
+        self.exchange.start_tracking_order(
+            order_id=self.client_order_id_prefix + "1",
+            exchange_order_id=str(self.expected_exchange_order_id),
+            trading_pair=self.trading_pair,
+            order_type=OrderType.LIMIT,
+            trade_type=TradeType.BUY,
+            price=Decimal("10000"),
+            amount=Decimal("1"),
+        )
+        order = self.exchange.in_flight_orders[self.client_order_id_prefix + "1"]
+
+        for _ in range(self.exchange._order_tracker._lost_order_count_limit + 1):
+            await self.exchange._order_tracker.process_order_not_found(client_order_id=order.client_order_id)
+
+        self.assertNotIn(order.client_order_id, self.exchange.in_flight_orders)
+
+        order_event = self.order_event_for_full_fill_websocket_update(order=order)
+        mock_queue = AsyncMock()
+        mock_queue.get.side_effect = [order_event, asyncio.CancelledError]
+        self.exchange._user_stream_tracker._user_stream = mock_queue
+
+        # Flash event triggers: _update_all_balances → balance POST
+        self._configure_balance_response(
+            response=self.balance_request_mock_response_for_base_and_quote, mock_api=mock_api
+        )
+        # _update_order_status → _update_orders_fills(all_fillable_orders) → executed_orders POST → full fill
+        fee_amount = str(self.expected_fill_fee.flat_fees[0].amount)
+        mock_api.post(
+            re.compile(f"^{CONSTANTS.REST_URL}".replace(".", r"\.")),
+            body=json.dumps([
+                {
+                    "id": order.exchange_order_id,
+                    "exec_amount": str(order.amount),
+                    "price": str(order.price),
+                    "fee": fee_amount,
+                    "time_stamp": "2024-01-01 12:00:00",
+                }
+            ]),
+        )
+        # _update_lost_orders → _request_order_status(lost_order) → order_status POST → FILLED
+        mock_api.post(
+            re.compile(f"^{CONSTANTS.REST_URL}".replace(".", r"\.")),
+            body=json.dumps(self._order_status_mock_response(order, "FILLED")),
+        )
+
+        try:
+            await self.exchange._user_stream_event_listener()
+        except asyncio.CancelledError:
+            pass
+        await order.wait_until_completely_filled()
+        await asyncio.sleep(0.1)
+
+        from hummingbot.core.event.events import OrderFilledEvent
+        fill_event: OrderFilledEvent = self.order_filled_logger.event_log[0]
+        self.assertEqual(self.exchange.current_timestamp, fill_event.timestamp)
+        self.assertEqual(order.client_order_id, fill_event.order_id)
+        self.assertEqual(order.trading_pair, fill_event.trading_pair)
+        self.assertEqual(order.trade_type, fill_event.trade_type)
+        self.assertEqual(order.order_type, fill_event.order_type)
+        self.assertEqual(order.price, fill_event.price)
+        self.assertEqual(order.amount, fill_event.amount)
+        self.assertEqual(self.expected_fill_fee, fill_event.trade_fee)
+
+        self.assertEqual(0, len(self.buy_order_completed_logger.event_log))
+        self.assertNotIn(order.client_order_id, self.exchange.in_flight_orders)
+        self.assertNotIn(order.client_order_id, self.exchange._order_tracker.lost_orders)
+        self.assertTrue(order.is_filled)
+        self.assertTrue(order.is_failure)
+
+    @aioresponses()
+    async def test_user_stream_update_for_new_order(self, mock_api):
         # BitPreco WS sends "flash" events — no order-state events.
         # The flash event triggers a balance/order refresh via HTTP.
         # This test simply verifies the exchange processes flash events without error.
@@ -770,7 +1088,7 @@ class BitprecoExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTest
         mock_status.assert_awaited_once()
 
     @aioresponses()
-    async def test_user_stream_update_for_canceled_order(self):
+    async def test_user_stream_update_for_canceled_order(self, mock_api):
         flash_event = {"event": "flash", "topic": "notifications:test", "payload": {}, "ref": None}
         mock_queue = asyncio.Queue()
         mock_queue.put_nowait(flash_event)
@@ -806,7 +1124,7 @@ class BitprecoExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTest
         mock_status.assert_awaited_once()
 
     @aioresponses()
-    async def test_user_stream_balance_update(self):
+    async def test_user_stream_balance_update(self, mock_api):
         # Flash event triggers balance refresh then order status refresh.
         flash_event = {"event": "flash", "topic": "notifications:test", "payload": {}}
         mock_queue = asyncio.Queue()
@@ -881,9 +1199,10 @@ class BitprecoExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTest
         self.exchange._set_trading_pair_symbol_map(None)
         await self.exchange._initialize_trading_pair_symbol_map()
 
-        self.assertIn("BTC-BRL", self.exchange._trading_pair_symbol_map)
-        self.assertIn("ETH-BRL", self.exchange._trading_pair_symbol_map)
-        self.assertNotIn("success", self.exchange._trading_pair_symbol_map)
+        symbol_map = await self.exchange.trading_pair_symbol_map()
+        self.assertIn("BTC-BRL", symbol_map)
+        self.assertIn("ETH-BRL", symbol_map)
+        self.assertNotIn("success", symbol_map)
 
     @aioresponses()
     async def test_initialize_trading_pair_symbol_map_raises_on_failure(self, mock_api):
@@ -891,8 +1210,8 @@ class BitprecoExchangeTests(AbstractExchangeConnectorTests.ExchangeConnectorTest
         mock_api.get(CONSTANTS.ALL_CURRENCY_TICKER_PATH_URL, body=json.dumps(response))
 
         self.exchange._set_trading_pair_symbol_map(None)
-        with self.assertRaises(IOError):
-            await self.exchange._initialize_trading_pair_symbol_map()
+        await self.exchange._initialize_trading_pair_symbol_map()
+        self.assertFalse(self.exchange.trading_pair_symbol_map_ready())
 
     def test_trading_rules_contain_expected_pairs(self):
         self.run_async_with_timeout(self.exchange._update_trading_rules())
