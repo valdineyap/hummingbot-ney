@@ -25,7 +25,7 @@ def is_exchange_information_valid(exchange_info: Dict[str, Any]) -> bool:
 
 
 class BitprecoConfigMap(BaseConnectorConfigMap):
-    connector: str = Field(default="bitpreco", const=True, client_data=None)
+    connector: str = Field(default="bitpreco", client_data=None)
     bitpreco_api_key: SecretStr = Field(
         default=...,
         client_data=ClientFieldData(

@@ -57,6 +57,8 @@ CMD_BUY = "buy"
 CMD_SELL = "sell"
 CMD_CANCEL_ORDER = "order_cancel"
 
+ORDER_NOT_EXIST_MESSAGE = "order not found"
+
 
 RATE_LIMITS = [
     RateLimit(limit_id=REST_URL, limit=100, time_interval=1,

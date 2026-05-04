@@ -31,6 +31,8 @@ class BitprecoAPIOrderBookDataSourceTests(TestCase):
             connector=self.connector,
             api_factory=web_utils.build_api_factory(),
         )
+        from bidict import bidict
+        self.connector._set_trading_pair_symbol_map(bidict({"BTC-BRL": "BTC-BRL"}))
 
     def tearDown(self) -> None:
         self.loop.close()

@@ -33,11 +33,11 @@ class BitprecoOrderBookTests(TestCase):
         self.assertEqual(2, len(snapshot.asks))
         self.assertEqual(100000.0, snapshot.bids[0].price)
         self.assertEqual(0.5, snapshot.bids[0].amount)
-        self.assertEqual(1, snapshot.bids[0].update_id)
+        self.assertEqual(timestamp, snapshot.bids[0].update_id)
         self.assertEqual(99000.0, snapshot.bids[1].price)
         self.assertEqual(101000.0, snapshot.asks[0].price)
         self.assertEqual(0.3, snapshot.asks[0].amount)
-        self.assertEqual(3, snapshot.asks[0].update_id)
+        self.assertEqual(timestamp, snapshot.asks[0].update_id)
 
     def test_snapshot_message_from_exchange_rest_update_id_is_timestamp(self):
         msg = {

@@ -125,13 +125,12 @@ class BitprecoAPIOrderBookDataSource(OrderBookTrackerDataSource):
     async def _process_websocket_messages(self, websocket_assistant: WSAssistant):
         for trading_pair in self._trading_pairs:
             order_book = await self._request_order_book_snapshot(trading_pair=trading_pair)
-            snapshot = {
-                "event": "snapshot",
-                "payload": {"asks": order_book.get("asks"), "bids": order_book.get("bids")},
-                "timestamp": order_book.get("timestamp"),
-                "topic": f'orderbook:{trading_pair}'
-            }
-            self._message_queue[self._diff_messages_queue_key].put_nowait(snapshot)
+            snapshot_msg: OrderBookMessage = BitprecoOrderBook.snapshot_message_from_exchange_rest(
+                msg=order_book,
+                timestamp=self._time(),
+                metadata={"trading_pair": trading_pair},
+            )
+            self._message_queue[self._diff_messages_queue_key].put_nowait(snapshot_msg)
 
     async def _subscribe_channels(self, ws: WSAssistant):
         """
@@ -176,6 +175,12 @@ class BitprecoAPIOrderBookDataSource(OrderBookTrackerDataSource):
                 channel = topic.split(":", 1)[0]
 
         return channel
+
+    async def subscribe_to_trading_pair(self, trading_pair: str) -> bool:
+        return True
+
+    async def unsubscribe_from_trading_pair(self, trading_pair: str) -> bool:
+        return True
 
     def _time(self):
         return time.time()
