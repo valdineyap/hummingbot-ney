@@ -20,7 +20,7 @@ if os.environ.get('BITPRECO_TRADING_URL') is not None:
 
 MAX_ORDER_ID_LEN = 100
 
-HBOT_ORDER_ID_PREFIX = ""
+HBOT_ORDER_ID_PREFIX = "HBOT-BP-"
 
 # Websocket event types TODO
 DIFF_EVENT_TYPE = "diffDepth"
@@ -34,6 +34,7 @@ ORDER_STATE = {
     "FILLED": OrderState.FILLED,
     "CANCELED": OrderState.CANCELED,
     "EMPTY": OrderState.OPEN,
+    "PARTIALLY_FILLED": OrderState.PARTIALLY_FILLED,
 }
 
 REQUEST_WEIGHT = "REQUEST_WEIGHT"

@@ -147,7 +147,8 @@ class BitprecoExchange(ExchangePyBase):
         response = await self._api_request(
             method=RESTMethod.POST,
             path_url=CONSTANTS.REST_URL,
-            data=self._add_auth_token_to_req_body(data),
+            data=data,
+            is_auth_required=True,
         )
 
         o_id = str(response["order_id"])
@@ -162,7 +163,8 @@ class BitprecoExchange(ExchangePyBase):
         response = await self._api_request(
             method=RESTMethod.POST,
             path_url=CONSTANTS.REST_URL,
-            data=self._add_auth_token_to_req_body(data),
+            data=data,
+            is_auth_required=True,
         )
         if response.get("message_cod") == "ORDER_CANCELED":
             return True
@@ -190,13 +192,6 @@ class BitprecoExchange(ExchangePyBase):
                 "min_order_size": 0.1,
                 "min_price_increment": 0.00000001,
                 "min_base_amount_increment": 0.00000001,
-                "min_notional_size": 10
-            },
-            {
-                "symbol": "BUSD-BRL",
-                "min_order_size": 1,
-                "min_price_increment": 0.0001,
-                "min_base_amount_increment": 0.0001,
                 "min_notional_size": 10
             },
             {
@@ -235,13 +230,6 @@ class BitprecoExchange(ExchangePyBase):
                 "min_notional_size": 10
             },
             {
-                "symbol": "ABFY-BRL",
-                "min_order_size": 10,
-                "min_price_increment": 0.0001,
-                "min_base_amount_increment": 0.0001,
-                "min_notional_size": 10
-            },
-            {
                 "symbol": "SOL-BRL",
                 "min_order_size": 0.01,
                 "min_price_increment": 0.00000001,
@@ -249,45 +237,10 @@ class BitprecoExchange(ExchangePyBase):
                 "min_notional_size": 10
             },
             {
-                "symbol": "GMT-BRL",
-                "min_order_size": 0.01,
-                "min_price_increment": 0.00000001,
-                "min_base_amount_increment": 0.00000001,
-                "min_notional_size": 10
-            },
-            {
-                "symbol": "POLIS-BRL",
-                "min_order_size": 0.01,
-                "min_price_increment": 0.00000001,
-                "min_base_amount_increment": 0.00000001,
-                "min_notional_size": 10
-            },
-            {
-                "symbol": "ATLAS-BRL",
-                "min_order_size": 10,
-                "min_price_increment": 0.0001,
-                "min_base_amount_increment": 0.0001,
-                "min_notional_size": 10
-            },
-            {
                 "symbol": "AXS-BRL",
                 "min_order_size": 0.01,
                 "min_price_increment": 0.00000001,
                 "min_base_amount_increment": 0.00000001,
-                "min_notional_size": 10
-            },
-            {
-                "symbol": "SLP-BRL",
-                "min_order_size": 10,
-                "min_price_increment": 0.0001,
-                "min_base_amount_increment": 0.0001,
-                "min_notional_size": 10
-            },
-            {
-                "symbol": "CRZO-BRL",
-                "min_order_size": 0.5,
-                "min_price_increment": 0.5,
-                "min_base_amount_increment": 0.1,
                 "min_notional_size": 10
             },
         ]
@@ -363,7 +316,8 @@ class BitprecoExchange(ExchangePyBase):
             response = await self._api_request(
                 method=RESTMethod.POST,
                 path_url=CONSTANTS.REST_URL,
-                data=self._add_auth_token_to_req_body(data),
+                data=data,
+                is_auth_required=True,
                 limit_id=CONSTANTS.REST_URL)
 
             for executed_order in list(response):
@@ -377,9 +331,9 @@ class BitprecoExchange(ExchangePyBase):
                     fill_quote_amount = Decimal(executed_order.get("exec_amount")) * Decimal(executed_order.get("price"))
                     timestamp = datetime.datetime.strptime(executed_order.get("time_stamp"),
                                                            "%Y-%m-%d %H:%M:%S").timestamp()
-                    fill_timestamp = timestamp * 1e-3
+                    fill_timestamp = timestamp
                     trade_update = TradeUpdate(
-                        trade_id=order.client_order_id,
+                        trade_id=str(executed_order.get("id")),
                         client_order_id=order.client_order_id,
                         exchange_order_id=order.exchange_order_id,
                         trading_pair=market,
@@ -431,7 +385,8 @@ class BitprecoExchange(ExchangePyBase):
             response = await self._api_request(
                 method=RESTMethod.POST,
                 path_url=CONSTANTS.REST_URL,
-                data=self._add_auth_token_to_req_body(data)
+                data=data,
+                is_auth_required=True,
             )
 
             order = response.get("order")
@@ -459,7 +414,8 @@ class BitprecoExchange(ExchangePyBase):
         balances = await self._api_request(
             method=RESTMethod.POST,
             path_url=CONSTANTS.REST_URL,
-            data=self._add_auth_token_to_req_body(data),
+            data=data,
+            is_auth_required=True,
         )
         for item in balances:
             if item != "success" and item != "timestamp" and "locked" not in item:
@@ -486,7 +442,6 @@ class BitprecoExchange(ExchangePyBase):
         async for event_message in self._iter_user_event_queue():
             if event_message.get("event") == "flash":
                 await self._update_all_balances()
-                await self._sleep(5.0)
                 await self._update_order_status()
 
     def _create_user_stream_data_source(self) -> UserStreamTrackerDataSource:
@@ -506,12 +461,9 @@ class BitprecoExchange(ExchangePyBase):
         )
 
         if not response["success"]:
-            raise
+            raise IOError(f"BitPreco returned failure on trading pair initialization: {response}")
 
         bitpreco_pairs = list(filter(lambda pair: pair != "success", response.keys()))
 
         self._initialize_trading_pair_symbols_from_exchange_info(exchange_info=bitpreco_pairs)
 
-    def _add_auth_token_to_req_body(self, data: Dict[str, Any]) -> Dict[str, Any]:
-        data["auth_token"] = f'{self.secret_key}{self.api_key}'
-        return data

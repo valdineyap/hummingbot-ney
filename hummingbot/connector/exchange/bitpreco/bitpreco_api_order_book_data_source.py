@@ -56,7 +56,7 @@ class BitprecoAPIOrderBookDataSource(OrderBookTrackerDataSource):
         Return a dictionary the trading_pair as key and the current price as value for each trading pair passed as
         parameter
         :param trading_pairs: list of trading pairs to get the prices for
-        :param domain: which Bybit domain we are connecting to (the default value is 'bybit_main')
+        :param domain: which BitPreco domain we are connecting to (the default value is 'bitpreco_trading')
         :param api_factory: the instance of the web assistant factory to be used when doing requests to the server.
             If no instance is provided then a new one will be created.
         :param throttler: the instance of the throttler to use to limit request to the server. If it is not specified

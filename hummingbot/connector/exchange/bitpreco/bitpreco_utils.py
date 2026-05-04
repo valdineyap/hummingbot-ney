@@ -10,8 +10,8 @@ CENTRALIZED = True
 EXAMPLE_PAIR = "BTC-BRL"
 
 DEFAULT_FEES = TradeFeeSchema(
-    maker_percent_fee_decimal=Decimal("0"),
-    taker_percent_fee_decimal=Decimal("0"),
+    maker_percent_fee_decimal=Decimal("0.0025"),
+    taker_percent_fee_decimal=Decimal("0.0025"),
 )
 
 

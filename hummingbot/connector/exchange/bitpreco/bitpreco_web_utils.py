@@ -8,14 +8,14 @@ from hummingbot.core.web_assistant.connections.data_types import RESTMethod, RES
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 
 
-def public_rest_url(path_url: str, domain: str) -> str:
-    if path_url != CONSTANTS.REST_URL:
+def public_rest_url(path_url: str, domain: str = CONSTANTS.DEFAULT_DOMAIN) -> str:
+    if path_url.startswith("http"):
         return path_url
     return CONSTANTS.REST_URL
 
 
-def private_rest_url(path_url: str, domain: str) -> str:
-    if path_url != CONSTANTS.REST_URL:
+def private_rest_url(path_url: str, domain: str = CONSTANTS.DEFAULT_DOMAIN) -> str:
+    if path_url.startswith("http"):
         return path_url
     return CONSTANTS.REST_URL
 
