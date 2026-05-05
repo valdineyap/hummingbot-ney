@@ -3,7 +3,7 @@ import copy
 import datetime
 import time
 from decimal import Decimal
-from typing import TYPE_CHECKING, Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional, Tuple
 
 from bidict import bidict
 
@@ -23,9 +23,6 @@ from hummingbot.core.utils.estimate_fee import build_trade_fee
 from hummingbot.core.web_assistant.connections.data_types import RESTMethod
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 
-if TYPE_CHECKING:
-    from hummingbot.client.config.config_helpers import ClientConfigAdapter
-
 s_logger = None
 s_decimal_0 = Decimal(0)
 s_decimal_NaN = Decimal("nan")
@@ -37,19 +34,20 @@ class BitprecoExchange(ExchangePyBase):
     web_utils = web_utils
 
     def __init__(self,
-                 client_config_map: "ClientConfigAdapter",
                  bitpreco_api_key: str,
                  bitpreco_api_secret: str,
+                 balance_asset_limit: Optional[Dict[str, Dict[str, Decimal]]] = None,
+                 rate_limits_share_pct: Decimal = Decimal("100"),
                  trading_pairs: Optional[List[str]] = None,
                  trading_required: bool = True,
-                 domain: str = CONSTANTS.DEFAULT_DOMAIN
+                 domain: str = CONSTANTS.DEFAULT_DOMAIN,
                  ):
         self.api_key = bitpreco_api_key
         self.secret_key = bitpreco_api_secret
         self._domain = domain
         self._trading_pairs = trading_pairs
         self._trading_required = trading_required
-        super().__init__(client_config_map)
+        super().__init__(balance_asset_limit, rate_limits_share_pct)
         self._throttler = AsyncThrottler(CONSTANTS.RATE_LIMITS)
         self._api_factory = web_utils.build_api_factory(
             throttler=self._throttler,
@@ -117,7 +115,13 @@ class BitprecoExchange(ExchangePyBase):
         return CONSTANTS.REST_URL
 
     def supported_order_types(self):
-        return [OrderType.MARKET, OrderType.LIMIT]
+        # NOTE: BitPreco's REST API has no native post-only flag, so LIMIT_MAKER
+        # is mapped internally to a regular LIMIT order (see _place_order). We
+        # advertise LIMIT_MAKER support for compatibility with strategies that
+        # require it (e.g., XEMMLeadLagExecutor); callers must accept that an
+        # order priced at/across the book may fill as a taker. This is a safe
+        # trade-off given BitPreco currently charges zero fees on both sides.
+        return [OrderType.MARKET, OrderType.LIMIT, OrderType.LIMIT_MAKER]
 
     async def _update_trading_fees(self):
         """
@@ -135,10 +139,13 @@ class BitprecoExchange(ExchangePyBase):
                            **kwargs) -> Tuple[str, float]:
         amount_str = f"{amount:f}"
         price_str = f"{price:f}"
+        # BitPreco has no native LIMIT_MAKER (post-only) flag; treat LIMIT_MAKER
+        # as a regular LIMIT order. See supported_order_types() for the rationale.
+        is_limited = order_type in (OrderType.LIMIT, OrderType.LIMIT_MAKER)
         data = {
             "cmd": CONSTANTS.CMD_BUY if trade_type is TradeType.BUY else CONSTANTS.CMD_SELL,
             "market": await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair),
-            "limited": True if order_type is OrderType.LIMIT else False,
+            "limited": is_limited,
             "amount": amount_str,
             "price": price_str
         }
@@ -421,6 +428,42 @@ class BitprecoExchange(ExchangePyBase):
     def _is_request_exception_related_to_time_synchronizer(self, request_exception: Exception) -> bool:
         return False
 
+    async def _make_network_check_request(self):
+        """
+        Override base: BitPreco's PING_PATH_URL is a PUBLIC ticker endpoint
+        that responds 200 regardless of credentials. The base implementation
+        (`_api_get(check_network_request_path)`) would therefore accept any
+        api_key/secret during the network check, leading to the user only
+        discovering bad credentials when the bot tries to trade.
+
+        Use `cmd: "balance"` instead — an authenticated endpoint that, after
+        the BitPreco-side fix (May 2026), correctly returns
+        `{"success": false, "message_cod": "INVALID_TOKEN"}` for invalid
+        credentials.
+        """
+        response = await self._api_request(
+            method=RESTMethod.POST,
+            path_url=CONSTANTS.REST_URL,
+            data=self._add_auth_token_to_req_body({"cmd": "balance"}),
+            limit_id=CONSTANTS.REST_URL,
+        )
+        if isinstance(response, dict) and response.get("success") is not True:
+            raise IOError(f"BitPreco auth/network check failed: {response}")
+
+    def _is_order_not_found_during_status_update_error(self, status_update_exception: Exception) -> bool:
+        # BitPreco does not document a stable "order not found" error code/message.
+        # Returning False causes the framework to treat any status-update error as
+        # a real failure (with retries), which is the safe conservative behaviour
+        # — at the cost of slightly noisier logs when an order has just been
+        # filled or cancelled. Tighten this if/when error semantics are confirmed.
+        return False
+
+    def _is_order_not_found_during_cancelation_error(self, cancelation_exception: Exception) -> bool:
+        # Same rationale as above. _place_cancel already returns False on a
+        # non-success response, so the framework rarely needs to introspect the
+        # exception in practice.
+        return False
+
     async def _request_order_status(self, tracked_order: InFlightOrder) -> OrderUpdate:
         if tracked_order.exchange_order_id:
             data = {
@@ -452,7 +495,6 @@ class BitprecoExchange(ExchangePyBase):
             return order_update
 
     async def _update_balances(self):
-
         local_asset_names = set(self._account_balances.keys())
         remote_asset_names = set()
         data = {"cmd": "balance"}
@@ -461,14 +503,47 @@ class BitprecoExchange(ExchangePyBase):
             path_url=CONSTANTS.REST_URL,
             data=self._add_auth_token_to_req_body(data),
         )
+        self.logger().debug(
+            f"bitpreco _update_balances raw response: type={type(balances).__name__} "
+            f"keys={list(balances.keys()) if isinstance(balances, dict) else 'n/a'}"
+        )
+        # Validate auth/shape. After the BitPreco-side fix (May 2026), an
+        # invalid auth_token returns {"success": false, "message_cod":
+        # "INVALID_TOKEN"} rather than the previous silent-zero response.
+        if not isinstance(balances, dict) or balances.get("success") is not True:
+            raise IOError(
+                f"BitPreco balance fetch failed (likely invalid credentials): {balances}"
+            )
+        # The response is a flat dict mixing metadata (`success`, `timestamp`,
+        # possibly `message_cod`, etc.) with balance entries (`BTC`, `BTC_locked`,
+        # `BRL`, `BRL_locked`, ...). The original loop tried to Decimal()-cast
+        # every key whose name didn't match the explicit skip-list, which
+        # surfaced as `decimal.ConversionSyntax` when BitPreco added new
+        # non-numeric metadata fields. Coerce defensively and log the raw
+        # response on failure so the cause is visible.
+        # We also only consider keys whose `<asset>_locked` counterpart exists
+        # — that pairing is what marks the entry as a balance row.
         for item in balances:
-            if item != "success" and item != "timestamp" and "locked" not in item:
-                asset_name = item
-                free_balance = Decimal(balances[item])
-                total_balance = Decimal(balances[item]) + Decimal(balances[f'{item}_locked'])
-                self._account_available_balances[asset_name] = free_balance
-                self._account_balances[asset_name] = total_balance
-                remote_asset_names.add(asset_name)
+            if item == "success" or item == "timestamp" or "_locked" in item:
+                continue
+            locked_key = f"{item}_locked"
+            if locked_key not in balances:
+                # Not a balance entry (e.g., 'message', 'message_cod', 'data').
+                continue
+            try:
+                free_amount = Decimal(str(balances[item]))
+                locked_amount = Decimal(str(balances[locked_key]))
+            except Exception as e:
+                self.logger().warning(
+                    f"bitpreco _update_balances: skipping non-numeric entry "
+                    f"{item!r}={balances[item]!r} (err={e}); raw response keys="
+                    f"{list(balances.keys())}"
+                )
+                continue
+            asset_name = item
+            self._account_available_balances[asset_name] = free_amount
+            self._account_balances[asset_name] = free_amount + locked_amount
+            remote_asset_names.add(asset_name)
         asset_names_to_remove = local_asset_names.difference(remote_asset_names)
         for asset_name in asset_names_to_remove:
             del self._account_available_balances[asset_name]

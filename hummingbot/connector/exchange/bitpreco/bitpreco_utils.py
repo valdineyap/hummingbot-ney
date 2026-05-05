@@ -1,9 +1,9 @@
 from decimal import Decimal
 from typing import Any, Dict
 
-from pydantic import Field, SecretStr
+from pydantic import ConfigDict, Field, SecretStr
 
-from hummingbot.client.config.config_data_types import BaseConnectorConfigMap, ClientFieldData
+from hummingbot.client.config.config_data_types import BaseConnectorConfigMap
 from hummingbot.core.data_type.trade_fee import TradeFeeSchema
 
 CENTRALIZED = True
@@ -25,28 +25,26 @@ def is_exchange_information_valid(exchange_info: Dict[str, Any]) -> bool:
 
 
 class BitprecoConfigMap(BaseConnectorConfigMap):
-    connector: str = Field(default="bitpreco", const=True, client_data=None)
+    connector: str = "bitpreco"
     bitpreco_api_key: SecretStr = Field(
         default=...,
-        client_data=ClientFieldData(
-            prompt=lambda cm: "Enter your BitPreco API key",
-            is_secure=True,
-            is_connect_key=True,
-            prompt_on_new=True,
-        )
+        json_schema_extra={
+            "prompt": lambda cm: "Enter your BitPreco API key",
+            "is_secure": True,
+            "is_connect_key": True,
+            "prompt_on_new": True,
+        }
     )
     bitpreco_api_secret: SecretStr = Field(
         default=...,
-        client_data=ClientFieldData(
-            prompt=lambda cm: "Enter your BitPreco API secret",
-            is_secure=True,
-            is_connect_key=True,
-            prompt_on_new=True,
-        )
+        json_schema_extra={
+            "prompt": lambda cm: "Enter your BitPreco API secret",
+            "is_secure": True,
+            "is_connect_key": True,
+            "prompt_on_new": True,
+        }
     )
-
-    class Config:
-        title = "bitpreco"
+    model_config = ConfigDict(title="bitpreco")
 
 
-KEYS = BitprecoConfigMap.construct()
+KEYS = BitprecoConfigMap.model_construct()
