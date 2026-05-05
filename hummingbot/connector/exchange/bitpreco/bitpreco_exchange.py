@@ -16,7 +16,7 @@ from hummingbot.connector.exchange_py_base import ExchangePyBase
 from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.core.api_throttler.async_throttler import AsyncThrottler
 from hummingbot.core.data_type.common import OrderType, TradeType
-from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderUpdate, TradeUpdate
+from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, OrderUpdate, TradeUpdate
 from hummingbot.core.data_type.trade_fee import DeductedFromReturnsTradeFee, TokenAmount, TradeFeeBase
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
 from hummingbot.core.utils.estimate_fee import build_trade_fee
@@ -129,6 +129,111 @@ class BitprecoExchange(ExchangePyBase):
         """
         pass
 
+    async def _try_recover_placement(
+        self,
+        market: str,
+        trade_type: TradeType,
+        amount_str: str,
+        price_str: str,
+        since_ts: float,
+    ) -> Optional[str]:
+        """
+        Defensive recovery for ambiguous placement failures.
+
+        When `_place_order` is about to raise (network error, malformed
+        response, missing order_id), the order MAY still have been accepted
+        and queued by BitPreco — leaving an unhedged order on the book is the
+        worst outcome (no taker leg, guaranteed slippage at unwind). Wait
+        briefly for the matching engine to settle, then query `open_orders`
+        and look for an order matching (market, side, price, amount, recent
+        timestamp). If found, return its exchange_order_id so the framework
+        tracks it instead of treating it as failed.
+
+        Returns None if no matching order is on the exchange — in that case
+        the caller propagates the original failure as-is.
+        """
+        # Give BitPreco's matching engine a moment to internalize the placement.
+        await asyncio.sleep(0.7)
+
+        expected_side = "buy" if trade_type is TradeType.BUY else "sell"
+        body = {"cmd": "open_orders", "market": market}
+        try:
+            response = await self._api_request(
+                method=RESTMethod.POST,
+                path_url=CONSTANTS.REST_URL,
+                data=self._add_auth_token_to_req_body(body),
+            )
+        except Exception as e:
+            self.logger().warning(
+                f"BitPreco placement recovery: open_orders fetch failed: {e}"
+            )
+            return None
+
+        # BitPreco returns either a list, {"orders": [...]}, or a failure dict.
+        if isinstance(response, list):
+            orders = response
+        elif isinstance(response, dict):
+            inner = response.get("orders")
+            if isinstance(inner, list):
+                orders = inner
+            else:
+                self.logger().warning(
+                    f"BitPreco placement recovery: unexpected response shape: {response}"
+                )
+                return None
+        else:
+            return None
+
+        try:
+            target_price = Decimal(price_str)
+            target_amount = Decimal(amount_str)
+        except Exception:
+            return None
+
+        # Match: same side, price within 0.5 BRL (tick is 1 BRL for BTC-BRL),
+        # amount within 1e-7 BTC, time_stamp not older than `since_ts - 5s`.
+        candidates: List[Tuple[str, float]] = []
+        for o in orders:
+            if not isinstance(o, dict):
+                continue
+            oid = o.get("id")
+            if oid is None:
+                continue
+            if str(o.get("side", "")).lower() != expected_side:
+                continue
+            try:
+                o_price = Decimal(str(o.get("price", "0")))
+                o_amount = Decimal(str(o.get("amount", "0")))
+            except Exception:
+                continue
+            if abs(o_price - target_price) > Decimal("0.5"):
+                continue
+            if abs(o_amount - target_amount) > Decimal("0.0000001"):
+                continue
+            ts_str = o.get("time_stamp")
+            try:
+                o_ts = datetime.datetime.strptime(
+                    str(ts_str), "%Y-%m-%d %H:%M:%S"
+                ).timestamp()
+            except (TypeError, ValueError):
+                o_ts = 0.0
+            if o_ts and o_ts < since_ts - 5:
+                continue
+            candidates.append((str(oid), o_ts))
+
+        if not candidates:
+            return None
+        # Most recent matching candidate.
+        candidates.sort(key=lambda x: x[1], reverse=True)
+        recovered_id = candidates[0][0]
+        self.logger().warning(
+            f"BitPreco placement RECOVERED orphan in-flight: "
+            f"exchange_order_id={recovered_id} side={expected_side} "
+            f"price={price_str} amount={amount_str} — adopting as tracked order "
+            f"instead of leaving it orphan on the book."
+        )
+        return recovered_id
+
     async def _place_order(self,
                            order_id: str,
                            trading_pair: str,
@@ -138,41 +243,176 @@ class BitprecoExchange(ExchangePyBase):
                            price: Decimal,
                            **kwargs) -> Tuple[str, float]:
         amount_str = f"{amount:f}"
-        price_str = f"{price:f}"
+        # BitPreco rejects fractional prices for BTC-BRL. We must send integer
+        # BRL prices, with SIDE-AWARE rounding to keep LIMIT_MAKER intent:
+        #   BUY  → floor (stays below the ask, won't cross)
+        #   SELL → ceil  (stays above the bid, won't cross)
+        # Without this, BitPreco would silently round (typically up), which
+        # could flip a LIMIT_MAKER BUY into a taker fill and drain inventory.
+        # Only applied to BTC-BRL where the integer-price rule is confirmed;
+        # other pairs keep the price as-is for now.
+        market = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+        if market.upper() in ("BTC-BRL", "BTCBRL"):
+            if trade_type is TradeType.BUY:
+                price_to_send = price.quantize(Decimal("1"), rounding="ROUND_DOWN")
+            else:
+                price_to_send = price.quantize(Decimal("1"), rounding="ROUND_UP")
+        else:
+            price_to_send = price
+        price_str = f"{price_to_send:f}"
         # BitPreco has no native LIMIT_MAKER (post-only) flag; treat LIMIT_MAKER
         # as a regular LIMIT order. See supported_order_types() for the rationale.
         is_limited = order_type in (OrderType.LIMIT, OrderType.LIMIT_MAKER)
         data = {
             "cmd": CONSTANTS.CMD_BUY if trade_type is TradeType.BUY else CONSTANTS.CMD_SELL,
-            "market": await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair),
+            "market": market,
             "limited": is_limited,
             "amount": amount_str,
             "price": price_str
         }
 
         transact_time = time.time()
-        response = await self._api_request(
-            method=RESTMethod.POST,
-            path_url=CONSTANTS.REST_URL,
-            data=self._add_auth_token_to_req_body(data),
-        )
 
-        o_id = str(response["order_id"])
+        # Wrap the request itself: on network/parse exceptions the order may
+        # have been accepted by BitPreco anyway. Try to recover before
+        # propagating, otherwise we leave an unhedged orphan on the book.
+        try:
+            response = await self._api_request(
+                method=RESTMethod.POST,
+                path_url=CONSTANTS.REST_URL,
+                data=self._add_auth_token_to_req_body(data),
+            )
+        except Exception as net_err:
+            self.logger().warning(
+                f"BitPreco place_order request raised "
+                f"({type(net_err).__name__}: {net_err}) — attempting recovery via open_orders."
+            )
+            recovered = await self._try_recover_placement(
+                market, trade_type, amount_str, price_str, transact_time)
+            if recovered is not None:
+                return (recovered, transact_time)
+            raise
+
+        # Defensive parsing — BitPreco returns different shapes for success/failure
+        # and we were silently raising KeyError, leaving orphan orders on the
+        # exchange whenever the response was unexpected.
+        if not isinstance(response, dict):
+            self.logger().error(
+                f"BitPreco place_order returned non-dict response (orphan risk): "
+                f"type={type(response).__name__} value={response!r}"
+            )
+            recovered = await self._try_recover_placement(
+                market, trade_type, amount_str, price_str, transact_time)
+            if recovered is not None:
+                return (recovered, transact_time)
+            raise IOError(f"BitPreco place_order: non-dict response: {response!r}")
+
+        if response.get("success") is False:
+            # Explicit rejection — order was NOT placed. No recovery needed:
+            # BitPreco's `success: false` is a guaranteed-not-on-book signal
+            # (rate limit, balance, market closed, etc.).
+            msg = response.get("message") or response.get("message_cod") or "<no message>"
+            self.logger().warning(
+                f"BitPreco rejected {data['cmd']} order (amount={amount_str} price={price_str}): "
+                f"{msg} | response={response}"
+            )
+            raise IOError(f"BitPreco rejected order: {msg}")
+
+        # On success the canonical key is 'order_id' but be tolerant of 'id'.
+        # If neither is present we have no way to track the order — but the
+        # order may have been placed anyway, so try to recover before raising.
+        oid_value = response.get("order_id") or response.get("id")
+        if oid_value is None:
+            self.logger().error(
+                f"BitPreco place_order: response missing order_id/id "
+                f"(attempting recovery) — full response: {response}"
+            )
+            recovered = await self._try_recover_placement(
+                market, trade_type, amount_str, price_str, transact_time)
+            if recovered is not None:
+                return (recovered, transact_time)
+            raise IOError(f"BitPreco place_order: no order id in response: {response}")
+
+        o_id = str(oid_value)
         return (o_id, transact_time)
 
     async def _place_cancel(self, order_id: str, tracked_order: InFlightOrder):
+        # Robust cancel — confirm the cancel actually happened, retry on
+        # transient failures, and log every response so the cause is visible
+        # when something goes wrong. Returning False here causes the framework
+        # to retry; we only return True when the cancel is confirmed (or the
+        # order is gone for any reason — already cancelled, already filled).
+        exchange_order_id = tracked_order.exchange_order_id
         data = {
             "cmd": CONSTANTS.CMD_CANCEL_ORDER,
-            "order_id": tracked_order.exchange_order_id
+            "order_id": exchange_order_id,
         }
 
-        response = await self._api_request(
-            method=RESTMethod.POST,
-            path_url=CONSTANTS.REST_URL,
-            data=self._add_auth_token_to_req_body(data),
+        # Responses BitPreco may return for cancels:
+        #   {success: true,  message_cod: "ORDER_CANCELED"}      → confirmed cancelled
+        #   {success: false, message_cod: "ORDER_NOT_FOUND"}     → already gone (treat as success)
+        #   {success: false, message_cod: "RATE_LIMIT_EXCEEDED"} → retry
+        #   {success: false, message_cod: "INVALID_TOKEN"/...}   → don't retry, log error
+        # Anything else with success=true that doesn't say ORDER_CANCELED is
+        # ambiguous — log it loudly and treat as not-cancelled (framework will
+        # retry on its next cancel cycle).
+        GONE_CODES = {"ORDER_CANCELED", "ORDER_NOT_FOUND", "ORDER_ALREADY_CANCELED",
+                      "ORDER_FILLED", "ORDER_ALREADY_FILLED"}
+        TRANSIENT_CODES = {"RATE_LIMIT_EXCEEDED"}
+        max_attempts = 3
+        backoff_sec = 0.5
+        last_response = None
+
+        for attempt in range(1, max_attempts + 1):
+            try:
+                response = await self._api_request(
+                    method=RESTMethod.POST,
+                    path_url=CONSTANTS.REST_URL,
+                    data=self._add_auth_token_to_req_body(data),
+                )
+            except Exception as e:
+                self.logger().warning(
+                    f"BitPreco cancel attempt {attempt}/{max_attempts} for "
+                    f"exchange_order_id={exchange_order_id} raised: {type(e).__name__}: {e}"
+                )
+                if attempt < max_attempts:
+                    await asyncio.sleep(backoff_sec * attempt)
+                    continue
+                return False
+
+            last_response = response
+            code = response.get("message_cod") if isinstance(response, dict) else None
+
+            if code in GONE_CODES:
+                self.logger().info(
+                    f"BitPreco cancel confirmed for exchange_order_id={exchange_order_id} "
+                    f"(code={code}, attempt={attempt}): {response}"
+                )
+                return True
+
+            if code in TRANSIENT_CODES and attempt < max_attempts:
+                self.logger().warning(
+                    f"BitPreco cancel transient failure for exchange_order_id={exchange_order_id} "
+                    f"(code={code}, attempt={attempt}/{max_attempts}) — retrying after "
+                    f"{backoff_sec * attempt}s: {response}"
+                )
+                await asyncio.sleep(backoff_sec * attempt)
+                continue
+
+            # Unrecognised response shape OR non-transient failure: don't keep
+            # retrying inside this call — let the framework decide.
+            self.logger().error(
+                f"BitPreco cancel UNCONFIRMED for exchange_order_id={exchange_order_id} "
+                f"(code={code}, attempt={attempt}/{max_attempts}) — returning False so the "
+                f"framework retries. Full response: {response}"
+            )
+            return False
+
+        # Exhausted retries without confirmation
+        self.logger().error(
+            f"BitPreco cancel FAILED for exchange_order_id={exchange_order_id} after "
+            f"{max_attempts} attempts. Last response: {last_response}"
         )
-        if response.get("message_cod") == "ORDER_CANCELED":
-            return True
         return False
 
     async def _format_trading_rules(self, exchange_info_dict: Dict[str, Any]) -> List[TradingRule]:
@@ -181,7 +421,14 @@ class BitprecoExchange(ExchangePyBase):
             {
                 "symbol": "BTC-BRL",
                 "min_order_size": 0.0001,
-                "min_price_increment": 0.00000001,
+                # BitPreco rejects fractional prices for BTC-BRL ("Fractional
+                # prices are not allowed by tradding API"). The framework's
+                # default quantize is floor — fine for BUY but unsafe for SELL
+                # (would cross the bid). _place_order applies SIDE-AWARE
+                # integer rounding (floor for BUY, ceil for SELL); we keep the
+                # framework quantum at 0.01 so we don't lose sub-integer
+                # precision before that side-aware rounding step.
+                "min_price_increment": Decimal("0.01"),
                 "min_base_amount_increment": 0.00000001,
                 "min_notional_size": 10
             },
@@ -374,6 +621,10 @@ class BitprecoExchange(ExchangePyBase):
                 limit_id=CONSTANTS.REST_URL)
 
             for executed_order in list(response):
+                # BitPreco may return non-dict items (e.g. strings) when there
+                # are no fills or the response shape is unexpected — skip them.
+                if not isinstance(executed_order, dict):
+                    continue
                 if (order.exchange_order_id == executed_order.get("id")):
                     fee = TradeFeeBase.new_spot_fee(
                         fee_schema=self.trade_fee_schema(),
@@ -465,34 +716,70 @@ class BitprecoExchange(ExchangePyBase):
         return False
 
     async def _request_order_status(self, tracked_order: InFlightOrder) -> OrderUpdate:
-        if tracked_order.exchange_order_id:
-            data = {
-                "cmd": "order_status",
-                "order_id": tracked_order.exchange_order_id
-            }
-
-            response = await self._api_request(
-                method=RESTMethod.POST,
-                path_url=CONSTANTS.REST_URL,
-                data=self._add_auth_token_to_req_body(data)
+        # If the order doesn't yet have an exchange_order_id (still in
+        # PENDING_CREATE — placement ack hasn't returned), there's nothing
+        # to poll on the exchange. Return a no-op OrderUpdate that preserves
+        # the current state so the framework's tracker doesn't crash.
+        # Previously this branch fell through and returned None implicitly,
+        # surfacing as `'NoneType' object has no attribute 'client_order_id'`
+        # in client_order_tracker._process_order_update.
+        if not tracked_order.exchange_order_id:
+            return OrderUpdate(
+                client_order_id=tracked_order.client_order_id,
+                exchange_order_id=None,
+                trading_pair=tracked_order.trading_pair,
+                update_timestamp=time.time(),
+                new_state=tracked_order.current_state,
             )
 
-            order = response.get("order")
+        data = {
+            "cmd": "order_status",
+            "order_id": tracked_order.exchange_order_id
+        }
 
-            order_status = order["status"]
-            update_timestamp = time.time()
+        response = await self._api_request(
+            method=RESTMethod.POST,
+            path_url=CONSTANTS.REST_URL,
+            data=self._add_auth_token_to_req_body(data)
+        )
 
-            new_state = CONSTANTS.ORDER_STATE[order_status] if order_status in CONSTANTS.ORDER_STATE else \
-                CONSTANTS.ORDER_STATE["OPEN"]
+        order = response.get("order") if isinstance(response, dict) else None
 
-            order_update = OrderUpdate(
+        # If the exchange has no record of the order (e.g. it was manually
+        # cancelled and is no longer in the book), treat it as CANCELLED so
+        # the connector stops retrying and the executor can react accordingly.
+        if order is None:
+            return OrderUpdate(
                 client_order_id=tracked_order.client_order_id,
                 exchange_order_id=tracked_order.exchange_order_id,
                 trading_pair=tracked_order.trading_pair,
-                update_timestamp=update_timestamp,
-                new_state=new_state,
+                update_timestamp=time.time(),
+                new_state=OrderState.CANCELED,
             )
-            return order_update
+
+        order_status = order.get("status") if isinstance(order, dict) else None
+        update_timestamp = time.time()
+
+        if order_status and order_status in CONSTANTS.ORDER_STATE:
+            new_state = CONSTANTS.ORDER_STATE[order_status]
+        else:
+            # Unknown / missing status — keep current tracker state. Don't
+            # default to OPEN, because that could resurrect an order the
+            # tracker had already moved out of OPEN (e.g. CANCELED).
+            self.logger().warning(
+                f"BitPreco order_status response missing/unknown status for "
+                f"exchange_order_id={tracked_order.exchange_order_id}: "
+                f"order={order} — preserving tracker state {tracked_order.current_state.name}"
+            )
+            new_state = tracked_order.current_state
+
+        return OrderUpdate(
+            client_order_id=tracked_order.client_order_id,
+            exchange_order_id=tracked_order.exchange_order_id,
+            trading_pair=tracked_order.trading_pair,
+            update_timestamp=update_timestamp,
+            new_state=new_state,
+        )
 
     async def _update_balances(self):
         local_asset_names = set(self._account_balances.keys())

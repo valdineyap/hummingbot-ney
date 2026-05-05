@@ -99,6 +99,15 @@ class XEMMExecutor(ExecutorBase):
         self.maker_order = None
         self.taker_order = None
         self.failed_orders = []
+        # Tracks whether a cancel has already been issued for the current
+        # maker_order. While True, control_update_maker_order skips further
+        # profitability checks (no double-cancel) and control_maker_order
+        # waits for is_done before clearing maker_order and creating a new one.
+        # This prevents the race where the executor used to cancel + null-out
+        # the maker_order in the same tick, then immediately place a new one
+        # before the cancel was confirmed — leaving multiple orders open
+        # simultaneously on the exchange.
+        self._cancel_requested = False
         super().__init__(strategy=strategy,
                          connectors=[config.buying_market.connector_name, config.selling_market.connector_name],
                          config=config, update_interval=update_interval, max_retries=max_retries)
@@ -135,8 +144,34 @@ class XEMMExecutor(ExecutorBase):
             await self.control_shutdown_process()
 
     async def control_maker_order(self):
+        # State machine for the single maker order:
+        #   None              → place a new one
+        #   tracked & is_done → previous cancel/fill confirmed; clear and
+        #                       let next tick place a new one
+        #   tracked & live    → run profitability checks (may issue cancel)
+        #   tracked & cancel-already-requested but not yet done → wait
+        #
+        # The wait branch is critical: previously this method called
+        # create_maker_order() the moment maker_order was None, but the
+        # cancel path used to set maker_order=None synchronously *before*
+        # the cancel had been confirmed by the exchange. That caused the
+        # executor to stack multiple live orders on the maker side while the
+        # cancel was still in flight. Now we keep the reference until the
+        # cancel actually clears (is_done == True).
         if self.maker_order is None:
+            self._cancel_requested = False
             await self.create_maker_order()
+        elif self.maker_order.is_done:
+            # Cancel or fill confirmed by the exchange. Clear the slot — the
+            # next tick will create a new order (cancel case) or the executor
+            # will already be in SHUTTING_DOWN status (fill case, handled by
+            # control_task before reaching here).
+            self.maker_order = None
+            self._cancel_requested = False
+        elif self._cancel_requested:
+            # Cancel already issued, awaiting confirmation. Do nothing this
+            # tick — no new placements, no further cancels.
+            return
         else:
             await self.control_update_maker_order()
 
@@ -229,14 +264,23 @@ class XEMMExecutor(ExecutorBase):
 
     async def control_update_maker_order(self):
         await self.update_current_trade_profitability()
-        if self._current_trade_profitability - self._tx_cost_pct < self.config.min_profitability:
-            self.logger().info(f"Order {self.maker_order.order_id} profitability {self._current_trade_profitability - self._tx_cost_pct} is below minimum profitability {self.config.min_profitability}. Cancelling order.")
+        net_profitability = self._current_trade_profitability - self._tx_cost_pct
+        if net_profitability < self.config.min_profitability:
+            self.logger().info(
+                f"Order {self.maker_order.order_id} profitability {net_profitability} "
+                f"is below minimum profitability {self.config.min_profitability}. Cancelling order."
+            )
             self._strategy.cancel(self.maker_connector, self.maker_trading_pair, self.maker_order.order_id)
-            self.maker_order = None
-        elif self._current_trade_profitability - self._tx_cost_pct > self.config.max_profitability:
-            self.logger().info(f"Order {self.maker_order.order_id} profitability {self._current_trade_profitability - self._tx_cost_pct} is above maximum profitability {self.config.max_profitability}. Cancelling order.")
+            # Mark cancel-in-flight; do NOT clear maker_order. control_maker_order
+            # will hold off on creating a new order until is_done flips True.
+            self._cancel_requested = True
+        elif net_profitability > self.config.max_profitability:
+            self.logger().info(
+                f"Order {self.maker_order.order_id} profitability {net_profitability} "
+                f"is above maximum profitability {self.config.max_profitability}. Cancelling order."
+            )
             self._strategy.cancel(self.maker_connector, self.maker_trading_pair, self.maker_order.order_id)
-            self.maker_order = None
+            self._cancel_requested = True
 
     async def update_current_trade_profitability(self):
         trade_profitability = Decimal("0")

@@ -23,7 +23,7 @@ import time
 from datetime import datetime
 from decimal import Decimal
 from enum import Enum
-from typing import Dict, List, Literal, Optional, Set
+from typing import Any, Dict, List, Literal, Optional, Set, Tuple
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -430,6 +430,25 @@ class XEMMLeadLagController(ControllerBase):
         # Minimum seconds between rebalance orders for the same asset.
         self._rebalance_cooldown_sec: float = 120.0
 
+        # === Orphan order reconciliation ===
+        # Periodic check (every _orphan_check_interval_sec) that compares the
+        # exchange's open-orders list against the connector's in_flight_orders
+        # tracker. Anything on the exchange that the bot doesn't know about is
+        # an orphan and gets cancelled immediately. Acts as a safety net for
+        # races between cancel/place cycles or unconfirmed cancels.
+        self._last_orphan_check_time: float = 0.0
+        self._orphan_check_interval_sec: float = 30.0
+        # Minimum age (seconds) before a missing-from-tracker order is
+        # considered orphan. Protects against the race where a freshly placed
+        # order shows up on the exchange (open_orders) before the connector's
+        # ack updates its in_flight_orders tracker. Combined with the
+        # double-snapshot guard in _run_orphan_check, this eliminates the
+        # false-positive that was killing legitimate orders within ~500ms of
+        # placement. 5s is far longer than any observed placement→tracker lag.
+        self._orphan_min_age_sec: float = 5.0
+        # Total orphans cancelled (cumulative, for telemetry).
+        self._orphans_cancelled_total: int = 0
+
         # === Boot-paused mode (Solution C) ===
         # Bot starts in PAUSED state — only transitions to OK after:
         #   1. startup_cleanup completes (all orphan orders cancelled)
@@ -679,6 +698,215 @@ class XEMMLeadLagController(ControllerBase):
             self.logger().error(
                 f"[startup_cleanup] bitpreco/{trading_pair}: unexpected response: {data}"
             )
+
+    # ------------------------------------------------------------------ #
+    # Orphan order reconciliation (periodic safety net)                 #
+    # ------------------------------------------------------------------ #
+    async def _bitpreco_list_open_orders(self, connector, market: str) -> Optional[List[Dict[str, Any]]]:
+        """
+        Fetch the live open-orders list from BitPreco for a given market.
+        Returns a list of order dicts on success, or None on any failure
+        (the caller treats None as "skip this cycle, try again next time").
+
+        Uses raw aiohttp + simple `secret + api_key` auth like the rest of the
+        BitPreco helpers in this file (no HMAC).
+        """
+        import aiohttp
+
+        api_key = getattr(connector, "api_key", None)
+        secret = getattr(connector, "secret_key", None)
+        if not api_key or not secret:
+            self.logger().error("[orphan_check] bitpreco: missing api_key/secret on connector")
+            return None
+
+        url = "https://api.bitpreco.com/trading"
+        body = {
+            "cmd": "open_orders",
+            "market": market,
+            "auth_token": f"{secret}{api_key}",
+        }
+        timeout = aiohttp.ClientTimeout(total=10)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(url, json=body) as resp:
+                    data = await resp.json()
+        except Exception as e:
+            self.logger().warning(f"[orphan_check] bitpreco/open_orders request failed: {e}")
+            return None
+
+        # BitPreco returns either a list of order dicts (success) or a dict
+        # with success=false on auth/rate-limit failure. Be tolerant.
+        if isinstance(data, list):
+            return data
+        if isinstance(data, dict):
+            if data.get("success") is False:
+                self.logger().warning(
+                    f"[orphan_check] bitpreco/open_orders rejected: {data}"
+                )
+                return None
+            # Sometimes wrapped: {"orders": [...]} — handle both shapes.
+            inner = data.get("orders")
+            if isinstance(inner, list):
+                return inner
+            self.logger().warning(
+                f"[orphan_check] bitpreco/open_orders unexpected dict shape: keys={list(data.keys())}"
+            )
+            return None
+        self.logger().warning(
+            f"[orphan_check] bitpreco/open_orders non-list/dict response: {type(data).__name__}"
+        )
+        return None
+
+    async def _bitpreco_cancel_one_orphan(self, connector, exchange_order_id: str) -> bool:
+        """Cancel a single order by exchange_order_id via BitPreco's order_cancel endpoint."""
+        import aiohttp
+        api_key = getattr(connector, "api_key", None)
+        secret = getattr(connector, "secret_key", None)
+        if not api_key or not secret:
+            return False
+        url = "https://api.bitpreco.com/trading"
+        body = {
+            "cmd": "order_cancel",
+            "order_id": exchange_order_id,
+            "auth_token": f"{secret}{api_key}",
+        }
+        timeout = aiohttp.ClientTimeout(total=10)
+        try:
+            async with aiohttp.ClientSession(timeout=timeout) as session:
+                async with session.post(url, json=body) as resp:
+                    data = await resp.json()
+        except Exception as e:
+            self.logger().error(
+                f"[orphan_check] cancel of orphan {exchange_order_id} raised: {e}"
+            )
+            return False
+        ok_codes = {"ORDER_CANCELED", "ORDER_NOT_FOUND", "ORDER_ALREADY_CANCELED"}
+        code = data.get("message_cod") if isinstance(data, dict) else None
+        if code in ok_codes:
+            self.logger().warning(
+                f"[orphan_check] cancelled orphan exchange_order_id={exchange_order_id} (code={code})"
+            )
+            return True
+        self.logger().error(
+            f"[orphan_check] failed to cancel orphan {exchange_order_id}: {data}"
+        )
+        return False
+
+    @staticmethod
+    def _snapshot_tracker_ids(connector) -> Set[str]:
+        """Snapshot the set of exchange_order_ids currently in the connector's tracker."""
+        ids: Set[str] = set()
+        in_flight = getattr(connector, "in_flight_orders", {}) or {}
+        for o in in_flight.values():
+            xid = getattr(o, "exchange_order_id", None)
+            if xid:
+                ids.add(str(xid))
+        return ids
+
+    @staticmethod
+    def _parse_bitpreco_timestamp(value: Any) -> Optional[float]:
+        """
+        BitPreco's open_orders entries carry a `time_stamp` field formatted as
+        "YYYY-MM-DD HH:MM:SS" (UTC). Returns the epoch seconds, or None if the
+        field is missing/unparseable. We use this to apply a minimum-age filter
+        to orphan candidates so we don't race with in-flight placements.
+        """
+        if not value:
+            return None
+        try:
+            return datetime.strptime(str(value), "%Y-%m-%d %H:%M:%S").timestamp()
+        except (TypeError, ValueError):
+            return None
+
+    async def _run_orphan_check(self, now: float) -> None:
+        """
+        Periodic reconciliation with two race-resistance guards:
+
+        1. **Double-snapshot tracker reads.** The connector's in_flight_orders
+           tracker is read both BEFORE and AFTER the open_orders REST call.
+           A candidate is only considered an orphan if it's missing from BOTH
+           snapshots — anything that appeared in the tracker during the API
+           round-trip is treated as a legitimately-tracked order whose ack
+           was racing with our snapshot.
+
+        2. **Minimum-age filter.** Orders younger than `_orphan_min_age_sec`
+           are skipped entirely. Placement → tracker-update → next-tick is a
+           sub-second flow; a 5s floor is more than enough to absorb any race
+           window without leaving real orphans alive too long (the periodic
+           cycle still runs every `_orphan_check_interval_sec`).
+
+        Without these guards, the orphan_check itself was killing legitimate
+        orders during their first ~500ms of life (false-positive orphan).
+
+        Only runs for the maker connector when it's BitPreco — Bybit/Binance
+        use different (and well-tested) cancel flows.
+        """
+        if self.config.maker_connector != "bitpreco":
+            return
+        if (now - self._last_orphan_check_time) < self._orphan_check_interval_sec:
+            return
+        self._last_orphan_check_time = now
+
+        connector = self.market_data_provider.get_connector(self.config.maker_connector)
+        if connector is None:
+            return
+
+        # exchange_symbol here is "BTC-BRL" — BitPreco uses dashed form.
+        try:
+            market = await connector.exchange_symbol_associated_to_pair(
+                trading_pair=self.config.maker_trading_pair
+            )
+        except Exception:
+            market = self.config.maker_trading_pair
+
+        # Race-resistance guard #1: snapshot tracker BEFORE the API call.
+        tracked_before = self._snapshot_tracker_ids(connector)
+        # API call to BitPreco — typically 100-300ms; any placement happening
+        # concurrently can land in the tracker after this returns.
+        exchange_orders = await self._bitpreco_list_open_orders(connector, market)
+        # Race-resistance guard #1: snapshot tracker AFTER the API call.
+        tracked_after = self._snapshot_tracker_ids(connector)
+
+        if exchange_orders is None:
+            return  # transient error, try again next cycle
+
+        # Each BitPreco entry has an "id" field for the exchange order id and
+        # a "time_stamp" field for placement time.
+        exchange_entries: List[Tuple[str, Optional[float]]] = []
+        for entry in exchange_orders:
+            if isinstance(entry, dict) and entry.get("id") is not None:
+                ts = self._parse_bitpreco_timestamp(entry.get("time_stamp"))
+                exchange_entries.append((str(entry["id"]), ts))
+
+        # Combined tracked set. Anything in EITHER snapshot is "known" to the bot.
+        tracked_combined = tracked_before | tracked_after
+
+        # Race-resistance guard #2: only flag as orphan if older than min_age.
+        # If we can't parse the timestamp, default to "young" (skip this cycle).
+        orphans: List[str] = []
+        skipped_too_young = 0
+        for eid, ts in exchange_entries:
+            if eid in tracked_combined:
+                continue
+            age = (now - ts) if ts is not None else 0.0
+            if age < self._orphan_min_age_sec:
+                skipped_too_young += 1
+                continue
+            orphans.append(eid)
+
+        # Heartbeat — gives a clear picture of the racing-aware reconciliation.
+        self.logger().info(
+            f"[orphan_check] tracker_before={len(tracked_before)} "
+            f"tracker_after={len(tracked_after)} "
+            f"exchange_open={len(exchange_entries)} "
+            f"orphans={len(orphans)} skipped_young={skipped_too_young} "
+            f"(interval={self._orphan_check_interval_sec}s, min_age={self._orphan_min_age_sec}s)"
+        )
+
+        for orphan_id in orphans:
+            ok = await self._bitpreco_cancel_one_orphan(connector, orphan_id)
+            if ok:
+                self._orphans_cancelled_total += 1
 
     # ------------------------------------------------------------------ #
     # Graceful shutdown (SIGTERM / SIGINT)                              #
@@ -1253,6 +1481,16 @@ class XEMMLeadLagController(ControllerBase):
                 and self.config.inventory_audit.enabled
                 and (now - self._last_audit_time) >= self.config.inventory_audit.audit_interval_sec):
             self._run_inventory_audit(now, source="periodic")
+
+        # === Periodic orphan-order reconciliation (every 30s) ===
+        # Safety net for any race between cancel/place cycles or unconfirmed
+        # cancels: queries the exchange's open-orders list, compares with the
+        # tracker, and cancels anything that's on the book but not tracked.
+        if self._initial_audit_done and not self._boot_paused:
+            try:
+                await self._run_orphan_check(now)
+            except Exception as e:
+                self.logger().error(f"[orphan_check] unexpected failure: {e}", exc_info=True)
 
         # === Execute pending auto-rebalance orders ===
         if self._pending_rebalances:
