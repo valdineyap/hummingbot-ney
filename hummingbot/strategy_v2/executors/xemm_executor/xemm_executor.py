@@ -108,6 +108,10 @@ class XEMMExecutor(ExecutorBase):
         # before the cancel was confirmed — leaving multiple orders open
         # simultaneously on the exchange.
         self._cancel_requested = False
+        # True once the cancel has been (re-)issued with a valid exchange_order_id.
+        # Prevents spamming re-cancels every tick when _cancel_requested=True.
+        # Cleared alongside _cancel_requested whenever maker_order slot is freed.
+        self._cancel_sent_with_id = False
         super().__init__(strategy=strategy,
                          connectors=[config.buying_market.connector_name, config.selling_market.connector_name],
                          config=config, update_interval=update_interval, max_retries=max_retries)
@@ -160,6 +164,7 @@ class XEMMExecutor(ExecutorBase):
         # cancel actually clears (is_done == True).
         if self.maker_order is None:
             self._cancel_requested = False
+            self._cancel_sent_with_id = False
             await self.create_maker_order()
         elif self.maker_order.is_done:
             # Cancel or fill confirmed by the exchange. Clear the slot — the
@@ -168,9 +173,35 @@ class XEMMExecutor(ExecutorBase):
             # control_task before reaching here).
             self.maker_order = None
             self._cancel_requested = False
+            self._cancel_sent_with_id = False
         elif self._cancel_requested:
             # Cancel already issued, awaiting confirmation. Do nothing this
             # tick — no new placements, no further cancels.
+            #
+            # Edge case: the cancel may have been issued while the order was
+            # still in PENDING_CREATE (exchange_order_id=None at that moment).
+            # BitPreco rejects such a call with INVALID_ORDER_ID, leaving the
+            # order live. Detect this by checking whether the cancel has been
+            # sent *with a real exchange_order_id*; if not, retry once now that
+            # the ID is known.
+            if (not self._cancel_sent_with_id
+                    and self.maker_order is not None
+                    and not self.maker_order.is_done
+                    and self.maker_order.order is not None
+                    and self.maker_order.order.exchange_order_id):
+                self._cancel_sent_with_id = True
+                self.logger().info(
+                    f"[cancel_retry] Re-issuing cancel for maker_order "
+                    f"{self.maker_order.order_id} "
+                    f"(exchange_order_id={self.maker_order.order.exchange_order_id}) — "
+                    f"initial cancel was sent during PENDING_CREATE (exchange_order_id "
+                    f"was None). Retrying now."
+                )
+                self._strategy.cancel(
+                    self.maker_connector,
+                    self.maker_trading_pair,
+                    self.maker_order.order_id,
+                )
             return
         else:
             await self.control_update_maker_order()
@@ -274,6 +305,12 @@ class XEMMExecutor(ExecutorBase):
             # Mark cancel-in-flight; do NOT clear maker_order. control_maker_order
             # will hold off on creating a new order until is_done flips True.
             self._cancel_requested = True
+            # Record whether we already sent the cancel with a real exchange_order_id.
+            # If the order is still PENDING_CREATE (exchange_order_id=None), the API
+            # call will be rejected; control_maker_order will retry once the ID arrives.
+            self._cancel_sent_with_id = bool(
+                self.maker_order.order and self.maker_order.order.exchange_order_id
+            )
         elif net_profitability > self.config.max_profitability:
             self.logger().info(
                 f"Order {self.maker_order.order_id} profitability {net_profitability} "
@@ -281,6 +318,9 @@ class XEMMExecutor(ExecutorBase):
             )
             self._strategy.cancel(self.maker_connector, self.maker_trading_pair, self.maker_order.order_id)
             self._cancel_requested = True
+            self._cancel_sent_with_id = bool(
+                self.maker_order.order and self.maker_order.order.exchange_order_id
+            )
 
     async def update_current_trade_profitability(self):
         trade_profitability = Decimal("0")

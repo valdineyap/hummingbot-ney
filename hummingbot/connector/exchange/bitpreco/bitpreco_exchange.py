@@ -343,6 +343,20 @@ class BitprecoExchange(ExchangePyBase):
         # to retry; we only return True when the cancel is confirmed (or the
         # order is gone for any reason — already cancelled, already filled).
         exchange_order_id = tracked_order.exchange_order_id
+
+        # Guard: if the order is still in PENDING_CREATE, exchange_order_id is
+        # None. Sending None to BitPreco returns INVALID_ORDER_ID (not a real
+        # error — the cancel just arrived before the creation response). Return
+        # False so the framework retries on the next cycle; the executor's
+        # _cancel_sent_with_id flag ensures a retry is issued once the real
+        # exchange_order_id is available.
+        if not exchange_order_id:
+            self.logger().warning(
+                f"_place_cancel: order_id={order_id} has no exchange_order_id yet "
+                f"(still PENDING_CREATE) — skipping API call, returning False for retry."
+            )
+            return False
+
         data = {
             "cmd": CONSTANTS.CMD_CANCEL_ORDER,
             "order_id": exchange_order_id,
