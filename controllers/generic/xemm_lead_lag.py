@@ -437,15 +437,20 @@ class XEMMLeadLagController(ControllerBase):
         # an orphan and gets cancelled immediately. Acts as a safety net for
         # races between cancel/place cycles or unconfirmed cancels.
         self._last_orphan_check_time: float = 0.0
-        self._orphan_check_interval_sec: float = 30.0
+        # Tightened from 30s → 10s to shrink the worst-case exposure window
+        # when the executor's throttled cancel retries fail to clear an order.
+        # Combined with the executor retry every 3s, this gives 3 retry
+        # attempts (t≈1,4,7s) before orphan_check kicks in at t≈10s.
+        self._orphan_check_interval_sec: float = 10.0
         # Minimum age (seconds) before a missing-from-tracker order is
         # considered orphan. Protects against the race where a freshly placed
         # order shows up on the exchange (open_orders) before the connector's
         # ack updates its in_flight_orders tracker. Combined with the
         # double-snapshot guard in _run_orphan_check, this eliminates the
         # false-positive that was killing legitimate orders within ~500ms of
-        # placement. 5s is far longer than any observed placement→tracker lag.
-        self._orphan_min_age_sec: float = 5.0
+        # placement. 3s is far longer than any observed placement→tracker lag
+        # (typically <500ms) but short enough to react quickly to true orphans.
+        self._orphan_min_age_sec: float = 3.0
         # Total orphans cancelled (cumulative, for telemetry).
         self._orphans_cancelled_total: int = 0
 

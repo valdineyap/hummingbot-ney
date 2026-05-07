@@ -370,8 +370,15 @@ class BitprecoExchange(ExchangePyBase):
         # Anything else with success=true that doesn't say ORDER_CANCELED is
         # ambiguous — log it loudly and treat as not-cancelled (framework will
         # retry on its next cancel cycle).
+        # INVALID_ORDER_ID is included here only because the early-exit guard
+        # above ensures we never call the API with exchange_order_id=None.
+        # So the only remaining cause for INVALID_ORDER_ID is: the order was
+        # already cancelled/filled by another code path (orphan_check, manual
+        # cancel from the UI, or a parallel cancel that won the race). Treat
+        # as gone — the framework just needs to know the order is no longer
+        # active. Returning True here also avoids the noisy ERROR log spam.
         GONE_CODES = {"ORDER_CANCELED", "ORDER_NOT_FOUND", "ORDER_ALREADY_CANCELED",
-                      "ORDER_FILLED", "ORDER_ALREADY_FILLED"}
+                      "ORDER_FILLED", "ORDER_ALREADY_FILLED", "INVALID_ORDER_ID"}
         TRANSIENT_CODES = {"RATE_LIMIT_EXCEEDED"}
         max_attempts = 3
         backoff_sec = 0.5
