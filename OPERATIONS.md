@@ -95,52 +95,175 @@ jq -r .side logs/xemm_lead_lag/trades.jsonl | sort | uniq -c
 
 ## 3. Ciclo de vida do bot
 
-### Iniciar
+### Iniciar (caminho recomendado)
+
 ```bash
 cd /home/ubuntu/hummingbot-ney
 bash start_xemm_lead_lag.sh Senha123 > /tmp/start.log 2>&1 &
 disown
 ```
-O script `start_xemm_lead_lag.sh` roda `tools/precleanup.py` antes (cancela
-ordens órfãs no boot) e só então sobe o bot principal.
 
-### Parar (graceful)
+`Senha123` é o **master password** do Hummingbot (decifra os conectores em
+`conf/connectors/*.yml`). Mude se sua instalação usa outro.
+
+O que o script faz, em ordem:
+1. **Detecta instância em curso** (`pgrep -f conf_xemm_lead_lag_shadow`).
+   Se existe: cria kill switch → espera até 12s → SIGTERM → SIGKILL se
+   ainda vivo.
+2. **Remove kill switch** (`rm -f /tmp/xemm_lead_lag_pause`).
+3. **Rotaciona o log atual** para `..._<timestamp>.log`.
+4. **Roda `tools/precleanup.py`** que cancela ordens órfãs em
+   bitpreco+binance via `all_orders_cancel`. Exit codes:
+   - `0` → ok, segue
+   - `1` → erro de auth/config → ABORTA o boot
+   - `2` → falha parcial → continua (startup_cleanup do bot retenta)
+5. **Sobe o bot** em `--headless` com `conf_xemm_lead_lag_shadow.yml`.
+6. **Aguarda até 60s pela primeira ordem maker** e imprime sucesso/erro.
+
+> ⚠️ **`shadow_mode: false` no YAML = bot LIVE.** O nome do arquivo
+> `conf_xemm_lead_lag_shadow.yml` é histórico — a flag real está dentro
+> dele. Sempre conferir `grep "^shadow_mode:" conf/conf_xemm_lead_lag_shadow.yml`.
+
+### Parar
+
+**Graceful (preferido):**
 ```bash
-# Opção A: kill switch (pausa, mantém ordens em curso até serem canceladas)
-touch /tmp/xemm_lead_lag_pause
+./stop_xemm_bot.sh
+# Cria /tmp/xemm_lead_lag_pause, espera até 30s pelo cancel das ordens,
+# faz kill -9 se passar do timeout. Sempre remove o pause file no fim.
+```
 
-# Opção B: SIGTERM direto (cancela ordens via signal handler antes de sair)
-pkill -f hummingbot_quickstart
+**Imediato (se travado):**
+```bash
+./stop_xemm_bot.sh --force
+# kill -9 direto, sem esperar cancelamento. Pode deixar ordens órfãs —
+# a próxima execução do precleanup vai limpar.
+```
+
+**Manual (kill switch sem o script):**
+```bash
+touch /tmp/xemm_lead_lag_pause
+# bot detecta em ≤200ms, cancela ordens, sai sozinho em ~12s.
 ```
 
 ### Reiniciar limpo
+
 ```bash
-pkill -f hummingbot_quickstart
-until ! pgrep -f hummingbot_quickstart >/dev/null; do sleep 2; done
-rm -f /tmp/xemm_lead_lag_pause   # CRÍTICO — senão o novo bot já sobe pausado
+./stop_xemm_bot.sh
+bash start_xemm_lead_lag.sh Senha123 > /tmp/start.log 2>&1 &
+disown
+```
+O `start_xemm_lead_lag.sh` já chama o stop interno se detectar instância
+viva, mas usar o `stop_xemm_bot.sh` separado dá log mais claro do que está
+parando.
+
+### Mudar shadow ↔ live (sem hot-reload)
+
+```bash
+# 1. Parar
+./stop_xemm_bot.sh
+
+# 2. Editar o YAML
+sed -i 's/^shadow_mode:.*/shadow_mode: false/' \
+    conf/controllers/xemm_lead_lag_btc_brl.yml
+# Ou abrir o arquivo e editar manualmente.
+
+# 3. Subir
 bash start_xemm_lead_lag.sh Senha123 > /tmp/start.log 2>&1 &
 disown
 ```
 
+Confira a flag aplicada no boot:
+```bash
+grep "shadow_mode" logs/logs_conf_xemm_lead_lag_shadow.log | head -3
+```
+
 ### Está vivo?
+
 ```bash
 pgrep -fa hummingbot_quickstart | grep -v grep
+# Saída esperada: 2 PIDs (conda wrapper + python real)
+```
+
+Vivo mas sem trades?
+```bash
+# Quando foi a última vez que algo aconteceu (orphan_check ou ordem)
+tail -1 logs/logs_conf_xemm_lead_lag_shadow.log
 ```
 
 ---
 
-## 4. Tail de logs em tempo real
+## 4. Logs — onde está o quê
+
+### Arquivos em `logs/`
+
+| Arquivo | Quem escreve | Conteúdo |
+|---|---|---|
+| `logs_conf_xemm_lead_lag_shadow.log` | bot principal | log textual de TUDO (eventos, erros, decisões, transições) — o "log mestre" |
+| `logs_conf_xemm_lead_lag_shadow_<UTCts>.log` | start script | rotação do anterior (1 arquivo por restart) |
+| `logs_precleanup_<UTCts>.log` | start script | log do `tools/precleanup.py` (1 por boot) |
+| `logs_hummingbot.log` | hummingbot core | logs do framework (ínfimo, raramente útil) |
+
+### Arquivos em `logs/xemm_lead_lag/`
+
+| Arquivo | Quem escreve | Conteúdo |
+|---|---|---|
+| `xemm_lead_lag_<id>_<UTCts>.csv` | controller | tick-by-tick (~1 Hz): preços, lead bps, regime, prof bands, audit, etc. |
+| `trades.jsonl` | trade ledger | append-only, 1 linha JSON por trade completo |
+| `state.json` | trade ledger | snapshot agregado, atomic overwrite |
+| `last_fill.touch` | trade ledger | beacon vazio, mtime = último fill |
+
+### Outros
+
+- `/tmp/start.log` — stdout do `start_xemm_lead_lag.sh` quando rodado em background. Útil para ver se o "Waiting for first order" terminou OK.
+- O **terminal interactivo** (sem `--headless`) escreve no mesmo log mestre — é uma alternativa para quando você quer ver o status panel.
+
+### Tail em tempo real
 
 ```bash
-# Log textual completo
+# Log mestre completo
 tail -f logs/logs_conf_xemm_lead_lag_shadow.log
 
-# Filtrado — eventos importantes
+# Filtrado — só o que importa para entender se está saudável
 tail -f logs/logs_conf_xemm_lead_lag_shadow.log | \
-  grep -E "Created maker|cancel|orphan|FILLED|hedge|ERROR|cancel_retry"
+  grep -E "Created maker|cancel|orphan|FILLED|hedge|ERROR|cancel_retry|regime"
 
 # Só erros e warnings
 tail -f logs/logs_conf_xemm_lead_lag_shadow.log | grep -E "ERROR|WARNING|CRITICAL"
+
+# Heartbeat do reconciler (a cada 10s — confirma que o loop está vivo)
+tail -f logs/logs_conf_xemm_lead_lag_shadow.log | grep "orphan_check"
+
+# CSV em tempo real (1 linha/seg)
+tail -f logs/xemm_lead_lag/$(ls -t logs/xemm_lead_lag/*.csv | head -1)
+```
+
+### CSV — colunas mais úteis
+
+O CSV é largo (~50 colunas). Para descobrir o índice de uma:
+```bash
+head -1 logs/xemm_lead_lag/xemm_lead_lag_*.csv | tr ',' '\n' | grep -n -i "regime\|lead\|prof"
+```
+
+Colunas-chave (cite o cabeçalho exato com `head -1`):
+- `regime` — OK / DEGRADED_FX / DEGRADED_LEADER / DEGRADED_LOCAL / BAD / KILLED
+- `lead_5s`, `lead_10s`, `lead_15s` — sinal lead-lag em bps por janela
+- `fair_brl_fast`, `fair_brl_slow` — preço justo BRL (sem/com EMA)
+- `local_mid`, `local_bid`, `local_ask` — book do maker (BitPreco)
+- `taker_buy_px`, `taker_sell_px` — preço resultante no taker (Binance)
+- `prof_buy_bps`, `prof_sell_bps` — profitabilidade NET por lado, em bps
+- `audit_btc_actual`, `audit_btc_target`, `audit_btc_delta` — inventory drift
+- `boot_paused` — 1 enquanto não passou do startup_cleanup + audit inicial
+
+### Logs antigos / forensics
+
+Para investigar incidente passado (não no log mestre atual):
+```bash
+ls -lt logs/logs_conf_xemm_lead_lag_shadow_*.log | head -10
+# Pega o mais próximo do timestamp do incidente.
+
+# CSVs antigos (stats finos)
+ls -lt logs/xemm_lead_lag/*.csv | head -10
 ```
 
 ---
