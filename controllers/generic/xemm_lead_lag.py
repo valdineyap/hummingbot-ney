@@ -16,11 +16,12 @@ maker orders being filled as taker due to home-latency price drift.
 """
 import asyncio
 import csv
+import json
 import os
 import signal
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timezone
 from decimal import Decimal
 from enum import Enum
 from typing import Any, Dict, List, Literal, Optional, Set, Tuple
@@ -345,6 +346,171 @@ class XEMMLeadLagCSVLogger:
             pass
 
 
+class TradeLedger:
+    """Minimalist trade ledger for fast external monitoring.
+
+    Writes three artefacts to ``log_dir`` on every completed executor that
+    actually traded (filled_amount_quote != 0):
+
+      * ``trades.jsonl``    — append-only audit trail, one JSON line per trade.
+                              Each line is self-contained and includes a
+                              monotonic ``seq`` so external tooling can
+                              detect new entries by counting lines.
+      * ``state.json``      — atomic snapshot dashboard (write-to-tmp + rename)
+                              with cumulative counters and a copy of the most
+                              recent trade. Cheapest possible "what's the
+                              current state of trading?" check.
+      * ``last_fill.touch`` — empty file whose mtime is updated on each fill.
+                              Filesystem-native heartbeat — ``stat -c %Y`` is
+                              the fastest possible "did anything happen?"
+                              probe.
+
+    Design constraints (deliberate, to keep the surface small):
+      * No anomaly classification, no rotation, no PnL recomputation. The
+        controller already knows ``net_pnl_quote`` from ExecutorInfo; we just
+        persist what we already have.
+      * No daily-bucket persistence. ``trades_today`` and ``pnl_today_brl``
+        are computed in-memory from the day-of-process-start; on restart they
+        reset. trades.jsonl is the source of truth for true historical sums.
+      * All file I/O is wrapped in try/except — a disk error must never
+        crash the strategy.
+    """
+
+    def __init__(self, log_dir: str, quote_asset: str = "BRL"):
+        os.makedirs(log_dir, exist_ok=True)
+        self._log_dir = log_dir
+        self._quote = quote_asset
+        self._jsonl_path = os.path.join(log_dir, "trades.jsonl")
+        self._state_path = os.path.join(log_dir, "state.json")
+        self._touch_path = os.path.join(log_dir, "last_fill.touch")
+        # Counters survive only for the current process — restart resets them.
+        # trades.jsonl is the durable record; state.json is a session snapshot.
+        self._seq = 0
+        self._pnl_session = Decimal("0")
+        self._pnl_today = Decimal("0")
+        self._trades_today = 0
+        self._today = self._utc_today()
+
+    @staticmethod
+    def _utc_today() -> str:
+        return datetime.now(timezone.utc).strftime("%Y-%m-%d")
+
+    @staticmethod
+    def _iso_now() -> str:
+        return datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%SZ")
+
+    @staticmethod
+    def _to_jsonable(v):
+        # Decimals → str (preserves precision), Enums → .value, leave the rest.
+        if isinstance(v, Decimal):
+            return str(v)
+        if isinstance(v, Enum):
+            return v.value if isinstance(v.value, (str, int, float)) else str(v.value)
+        return v
+
+    def record_fill(self, ex) -> None:
+        """Persist a completed executor as a trade record.
+
+        ``ex`` is an ExecutorInfo (Pydantic model). Called from the
+        controller's existing fill-detection loop; we do nothing if the
+        executor produced no fills.
+        """
+        try:
+            # Guard: only record executors that actually traded.
+            filled = getattr(ex, "filled_amount_quote", Decimal("0")) or Decimal("0")
+            if not filled:
+                return
+
+            # Roll daily bucket if the UTC date crossed.
+            today = self._utc_today()
+            if today != self._today:
+                self._today = today
+                self._pnl_today = Decimal("0")
+                self._trades_today = 0
+
+            self._seq += 1
+            net_pnl = getattr(ex, "net_pnl_quote", Decimal("0")) or Decimal("0")
+            cum_fees = getattr(ex, "cum_fees_quote", Decimal("0")) or Decimal("0")
+            self._pnl_session += net_pnl
+            self._pnl_today += net_pnl
+            self._trades_today += 1
+
+            ci = getattr(ex, "custom_info", {}) or {}
+            side = ci.get("side")
+            if hasattr(side, "name"):  # TradeType enum
+                side = side.name
+
+            record = {
+                "ts": self._iso_now(),
+                "seq": self._seq,
+                "executor_id": getattr(ex, "id", None),
+                "side": side,
+                "trading_pair": ci.get("maker_trading_pair") or getattr(ex, "trading_pair", None),
+                "maker_connector": ci.get("maker_connector"),
+                "taker_connector": ci.get("taker_connector"),
+                "filled_amount_quote": self._to_jsonable(filled),
+                "net_pnl_quote": self._to_jsonable(net_pnl),
+                "cum_fees_quote": self._to_jsonable(cum_fees),
+                "close_type": self._to_jsonable(getattr(ex, "close_type", None)),
+                "close_timestamp": getattr(ex, "close_timestamp", None),
+                "quote_asset": self._quote,
+            }
+            self._append_jsonl(record)
+            self._write_state(record)
+            self._touch()
+        except Exception as e:
+            # Never let ledger I/O crash the strategy.
+            try:
+                from hummingbot.logger import HummingbotLogger  # noqa: F401
+                import logging
+                logging.getLogger(__name__).error(
+                    f"[trade_ledger] failed to record fill: {type(e).__name__}: {e}"
+                )
+            except Exception:
+                pass
+
+    def _append_jsonl(self, record: dict) -> None:
+        # Append + fsync so a kill -9 doesn't lose the line.
+        line = json.dumps(record, separators=(",", ":")) + "\n"
+        with open(self._jsonl_path, "a", buffering=1) as f:
+            f.write(line)
+            try:
+                f.flush()
+                os.fsync(f.fileno())
+            except Exception:
+                pass
+
+    def _write_state(self, last_record: dict) -> None:
+        # Atomic overwrite: write to .tmp then rename. Readers always see
+        # either the previous full file or the new full file — never half.
+        state = {
+            "updated_at": self._iso_now(),
+            "trades_total_session": self._seq,
+            "trades_today": self._trades_today,
+            "pnl_today": self._to_jsonable(self._pnl_today),
+            "pnl_session": self._to_jsonable(self._pnl_session),
+            "quote_asset": self._quote,
+            "last_trade": last_record,
+        }
+        tmp = self._state_path + ".tmp"
+        with open(tmp, "w") as f:
+            json.dump(state, f, indent=2)
+            try:
+                f.flush()
+                os.fsync(f.fileno())
+            except Exception:
+                pass
+        os.replace(tmp, self._state_path)
+
+    def _touch(self) -> None:
+        # Empty file; only mtime matters. Idempotent.
+        try:
+            with open(self._touch_path, "a"):
+                os.utime(self._touch_path, None)
+        except Exception:
+            pass
+
+
 class XEMMLeadLagController(ControllerBase):
     """XEMM controller with synthetic lead-lag signal."""
 
@@ -371,6 +537,17 @@ class XEMMLeadLagController(ControllerBase):
         except Exception as e:
             self.logger().error(f"Failed to init CSV logger: {e}")
             self._csv = None
+
+        # Trade ledger — tiny, fast-readable record of completed trades.
+        # See the TradeLedger class docstring for the file layout.
+        try:
+            quote = config.maker_trading_pair.split("-")[-1] if config.maker_trading_pair else "BRL"
+            self._trade_ledger: Optional[TradeLedger] = TradeLedger(
+                config.log_dir, quote_asset=quote
+            )
+        except Exception as e:
+            self.logger().error(f"Failed to init trade ledger: {e}")
+            self._trade_ledger = None
 
         self._started_at: Optional[float] = None
         self._last_action_time: float = 0.0
@@ -1446,6 +1623,10 @@ class XEMMLeadLagController(ControllerBase):
                 if filled and filled != 0:
                     self._last_fill_time = time.time()
                     self._balance_version += 1
+                    # Persist to the trade ledger (trades.jsonl + state.json +
+                    # last_fill.touch). Never let ledger I/O block the loop.
+                    if self._trade_ledger is not None:
+                        self._trade_ledger.record_fill(ex)
 
         # === Initial inventory audit (Solution C: boot-paused mode) ===
         # Once startup cleanup has confirmed 0 orphan orders, run the audit
