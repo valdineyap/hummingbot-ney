@@ -18,6 +18,7 @@ profitability monitoring) is inherited unchanged.
 """
 import time
 from decimal import Decimal, ROUND_DOWN, ROUND_UP
+from typing import Optional
 
 from hummingbot.core.data_type.common import OrderType, PriceType, TradeType
 from hummingbot.core.data_type.order_candidate import OrderCandidate
@@ -110,6 +111,45 @@ class XEMMLeadLagExecutor(XEMMExecutor):
         if maker_done and taker_done:
             self.logger().info("Both orders are done, executor terminated.")
             self.stop()
+
+    def place_taker_order(self, amount: Optional[Decimal] = None):
+        """Override base: quantize the amount to the taker connector's
+        LOT_SIZE BEFORE placing.
+
+        Without this, a maker fill of 0.0001999 BTC sent as a Binance MARKET
+        order is silently truncated to 0.00019 (LOT_SIZE = 0.00001 BTC) —
+        leaving ~9.9 sats of residual drift per cycle. Observed in prod
+        2026-05-11 19:41: cycle 4 left positive drift, auto_rebalance
+        truncated again in the opposite direction, flipped sign, audit hit
+        HEDGE_FAILURES_3 → KILLED → bot stuck.
+
+        Quantizing here makes the truncation explicit (logged) and
+        deterministic (matches Binance's behaviour). The maker-side residual
+        remains until the next natural fill or audit-driven rebalance
+        absorbs it (Fix A 2026-05-11: audit can rebalance in killed mode).
+        """
+        order_amount = amount if amount is not None else self.config.order_amount
+        try:
+            taker_conn = self.connectors[self.taker_connector]
+            amount_q = taker_conn.quantize_order_amount(
+                self.taker_trading_pair, order_amount
+            )
+            if amount_q != order_amount:
+                residual = order_amount - amount_q
+                self.logger().info(
+                    f"[lot_align] taker amount {order_amount} → {amount_q} "
+                    f"(quantized to {self.taker_connector} LOT_SIZE; "
+                    f"residual {residual:+f} stays as maker-side drift "
+                    f"to be absorbed by next audit cycle)"
+                )
+            order_amount = amount_q
+        except Exception as e:
+            self.logger().warning(
+                f"[lot_align] failed to quantize via {self.taker_connector}: "
+                f"{type(e).__name__}: {e}. "
+                f"Proceeding with raw amount (exchange will truncate silently)."
+            )
+        super().place_taker_order(amount=order_amount)
 
     async def control_maker_order(self):
         """Override: place taker hedge IMMEDIATELY when maker is detected

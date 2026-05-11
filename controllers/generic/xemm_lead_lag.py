@@ -1870,60 +1870,70 @@ class XEMMLeadLagController(ControllerBase):
 
             any_drift = True
 
-            # In killed mode we ONLY needed any_drift updated for the
-            # auto_terminate gate — skip all the noisy/destructive paths
-            # below (CRITICAL spam, drift_stuck counter, kill re-trip,
-            # rebalance queue). The state-change log fires once at the
-            # end if _drift_active flipped this cycle.
-            if killed:
-                continue
+            action = cfg.on_drift_action
 
-            # Circuit-breaker: count consecutive audits with unresolved drift
-            # for this asset. If rebalance keeps failing (BELOW_MINIMUM_VOLUME
-            # in prod 2026-05-11), drift persists across many audits — at the
-            # threshold we trip the kill switch instead of looping forever.
-            stuck_count = self._drift_consecutive_audits.get(asset, 0) + 1
-            self._drift_consecutive_audits[asset] = stuck_count
-            if stuck_count >= self._drift_max_consecutive_audits:
-                if self._kill_reason is None:
-                    self._kill_reason = f"DRIFT_STUCK_{asset}_{stuck_count}_audits"
+            if not killed:
+                # === Normal-mode-only paths ===
+                # Circuit-breaker: count consecutive audits with unresolved drift
+                # for this asset. If rebalance keeps failing (BELOW_MINIMUM_VOLUME
+                # in prod 2026-05-11), drift persists across many audits — at the
+                # threshold we trip the kill switch instead of looping forever.
+                stuck_count = self._drift_consecutive_audits.get(asset, 0) + 1
+                self._drift_consecutive_audits[asset] = stuck_count
+                if stuck_count >= self._drift_max_consecutive_audits:
+                    if self._kill_reason is None:
+                        self._kill_reason = f"DRIFT_STUCK_{asset}_{stuck_count}_audits"
+                    self.logger().critical(
+                        f"[audit/{source}] {asset} drift unresolved for "
+                        f"{stuck_count} consecutive audits "
+                        f"(~{stuck_count * cfg.audit_interval_sec:.0f}s) — "
+                        f"tripping kill switch (KILL_REASON={self._kill_reason}). "
+                        f"Likely cause: rebalance MARKET order keeps failing — "
+                        f"check connector WARN/ERROR logs for the asset's pair."
+                    )
+
                 self.logger().critical(
-                    f"[audit/{source}] {asset} drift unresolved for "
-                    f"{stuck_count} consecutive audits "
-                    f"(~{stuck_count * cfg.audit_interval_sec:.0f}s) — "
-                    f"tripping kill switch (KILL_REASON={self._kill_reason}). "
-                    f"Likely cause: rebalance MARKET order keeps failing — "
-                    f"check connector WARN/ERROR logs for the asset's pair."
+                    f"[audit/{source}] {asset} DRIFT actual={actual:f} "
+                    f"(maker={maker_bal:f} taker={taker_bal:f}) target={target:f} "
+                    f"delta={delta:+f} ({delta/target*100:+.3f}%) tolerance={tolerance_abs:f} "
+                    f"— action={cfg.on_drift_action}"
                 )
 
-            self.logger().critical(
-                f"[audit/{source}] {asset} DRIFT actual={actual:f} "
-                f"(maker={maker_bal:f} taker={taker_bal:f}) target={target:f} "
-                f"delta={delta:+f} ({delta/target*100:+.3f}%) tolerance={tolerance_abs:f} "
-                f"— action={cfg.on_drift_action}"
-            )
+                if action == "pause":
+                    # Trip kill switch — same path as the watchdog and other
+                    # circuit breakers. The regime gate transitions to KILLED on
+                    # the next regime evaluation; orders are cancelled gracefully.
+                    if self._kill_reason is None:
+                        self._kill_reason = f"INVENTORY_DRIFT_{asset}"
 
-            action = cfg.on_drift_action
-            if action == "pause":
-                # Trip kill switch — same path as the watchdog and other
-                # circuit breakers. The regime gate transitions to KILLED on
-                # the next regime evaluation; orders are cancelled gracefully.
-                if self._kill_reason is None:
-                    self._kill_reason = f"INVENTORY_DRIFT_{asset}"
-            elif action == "auto_rebalance":
+            # === auto_rebalance path runs in BOTH normal and killed mode ===
+            # In killed mode this is essential: without rebalancing, residual
+            # drift (e.g. LOT_SIZE truncation, partial fills) never resolves,
+            # and the auto_terminate gate stays BLOCKED forever — bot vivo but
+            # inerte. Observed 2026-05-11 19:41–21:48 (2h+ deadlock). Cooldown
+            # still applies so we don't spam orders. Kill-related side-effects
+            # (drift_consecutive increment, kill_reason re-trip) are suppressed
+            # in killed mode above; rebalance itself is safe to run.
+            if action == "auto_rebalance":
                 # Queue a corrective MARKET order (executed async by
                 # _execute_pending_rebalances on the next tick).
-                # Cooldown prevents repeated orders if a prior rebalance is
-                # still pending fill or the exchange is slow to update balances.
                 last = self._rebalance_last_time.get(asset, 0.0)
                 if (now - last) < self._rebalance_cooldown_sec:
-                    self.logger().info(
-                        f"[audit/{source}] {asset} auto_rebalance cooldown active "
-                        f"({self._rebalance_cooldown_sec - (now - last):.0f}s remaining)"
-                    )
+                    # Only log cooldown in normal mode — in killed we'd
+                    # spam every audit_interval_sec.
+                    if not killed:
+                        self.logger().info(
+                            f"[audit/{source}] {asset} auto_rebalance cooldown active "
+                            f"({self._rebalance_cooldown_sec - (now - last):.0f}s remaining)"
+                        )
                 else:
                     self._pending_rebalances[asset] = delta
-            # action == "alert" → already logged CRITICAL above; no further action
+                    if killed:
+                        self.logger().warning(
+                            f"[audit/killed] {asset} drift {delta:+f} → "
+                            f"queueing rebalance to unblock auto_terminate"
+                        )
+            # action == "pause" or "alert" → no rebalance needed
 
         # In killed mode log only the state transition so an operator
         # following the log sees when auto_terminate becomes unblocked

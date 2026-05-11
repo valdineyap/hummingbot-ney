@@ -1783,16 +1783,48 @@ class TestAuditPassiveModeWhenKilled(_AuditBaseTest):
         self.controller._run_inventory_audit(now=1700000000.0, source="periodic")
         self.assertTrue(self.controller._last_audit_results["_drift_active"])
 
-    def test_killed_audit_does_not_queue_rebalance(self):
-        """Killed mode must NOT queue auto_rebalance — we're shutting down."""
+    def test_killed_audit_DOES_queue_rebalance_to_unblock_auto_terminate(self):
+        """Killed mode MUST queue auto_rebalance — that's how the bot
+        recovers from drift-deadlock (Fix A, 2026-05-11 19:41).
+
+        Original logic skipped rebalance in killed mode ("we're shutting
+        down"), but the auto_terminate gate requires `_drift_active=False`
+        to fire. With no rebalance, drift never resolves, gate stays
+        BLOCKED, bot is alive but inert for hours (observed prod 2026-05-11
+        19:41–21:48). Now rebalance fires (with cooldown) so drift can
+        resolve and auto_terminate eventually triggers.
+
+        The destructive side-effects are still suppressed in killed mode
+        (drift_consecutive increment, kill_reason re-trip, CRITICAL spam).
+        """
         self.config.inventory_audit.on_drift_action = "auto_rebalance"
         self.controller._kill_reason = "HEDGE_FAILURES_3"
         self.controller._last_audit_results = {"_drift_active": True}
         self._mock_total_balance(Decimal("0.001"), Decimal("0.0008"))
         self.controller._has_inflight_activity = MagicMock(return_value=False)
-        # Pre-condition: no pending rebalances.
+        # Pre-condition: no recent rebalance (cooldown elapsed).
+        self.controller._rebalance_last_time = {}
         self.controller._pending_rebalances = {}
         self.controller._run_inventory_audit(now=1700000000.0, source="periodic")
+        # Rebalance MUST be queued for BTC.
+        self.assertIn("BTC", self.controller._pending_rebalances)
+
+    def test_killed_audit_respects_rebalance_cooldown(self):
+        """In killed mode the cooldown still applies — we don't want to
+        spam rebalance orders if a previous one is still in flight."""
+        self.config.inventory_audit.on_drift_action = "auto_rebalance"
+        self.controller._kill_reason = "HEDGE_FAILURES_3"
+        self.controller._last_audit_results = {"_drift_active": True}
+        self._mock_total_balance(Decimal("0.001"), Decimal("0.0008"))
+        self.controller._has_inflight_activity = MagicMock(return_value=False)
+        # Recent rebalance within cooldown window.
+        now = 1700000000.0
+        self.controller._rebalance_last_time = {
+            "BTC": now - 30.0  # 30s ago, cooldown is 120s default
+        }
+        self.controller._pending_rebalances = {}
+        self.controller._run_inventory_audit(now=now, source="periodic")
+        # No new rebalance queued — cooldown still active.
         self.assertEqual(self.controller._pending_rebalances, {})
 
     def test_killed_audit_does_not_retrip_kill_reason(self):
