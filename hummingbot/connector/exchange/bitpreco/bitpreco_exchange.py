@@ -1037,14 +1037,27 @@ class BitprecoExchange(ExchangePyBase):
                         f"(pending_orders={len(self._place_order_submit_times)})"
                     )
                 await self._update_all_balances()
-                # NOTE: This 5-second sleep is the dominant source of fill-
-                # detection latency observed 2026-05-11 (arb leg-2 only
-                # discovered as filled ~5 s after BitPreco actually matched).
-                # Kept conservatively until the timing logs above confirm
-                # whether REST `_update_order_status` is reliable without
-                # the buffer. Adjusting here is the single-line fix; do
-                # NOT remove without verifying via [bp_timing] log diff.
-                await self._sleep(5.0)
+                # === FOLLOW-UP REQUIRED — see DEVELOPMENT_STATUS.md ===
+                # Reduced from 5.0s → 0.5s on 2026-05-11. Original 5s was
+                # undocumented (present since the connector's first commit
+                # 461dc29e6). Hypothesized purposes (without ground truth):
+                #   H1. REST eventual-consistency window after WS notify
+                #   H2. Debouncing burst flashes to avoid REST rate-limit
+                #   H3. Avoid races with periodic `_status_polling_task`
+                #   H4. Empirical workaround the original author didn't note
+                # Validation criteria to reduce FURTHER (100ms or remove):
+                #   (a) ≥ 24h of [bp_timing] logs showing fill_detected
+                #       arriving cleanly after the 500ms wait (no stale
+                #       "still OPEN" reads, no missed fills picked up by
+                #       inventory_audit instead).
+                #   (b) No new 429 / rate-limit responses in REST logs.
+                #   (c) Especially watch arb MARKET fills — those are the
+                #       only ones where the wait actually hurts (LIMIT
+                #       cycles tolerate 500ms fine).
+                # When reducing further, halve in steps (500→250→100) and
+                # re-validate (a)/(b)/(c) for ≥ 12h between steps.
+                # Memory pointer: ~/.claude/projects/.../memory/project_bitpreco_flash_sleep.md
+                await self._sleep(0.5)
                 await self._update_order_status()
 
     def _create_user_stream_data_source(self) -> UserStreamTrackerDataSource:

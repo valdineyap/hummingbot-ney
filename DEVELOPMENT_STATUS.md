@@ -214,6 +214,14 @@ tail -1000 logs/xemm_lead_lag/xemm_lead_lag_btcbrl_v1_*.csv | \
 | 7 | Live arb com `order_amount` mínimo (`0.00005`, `max/hora=3`) | pendente |
 | 8 | Calibrar `arb_max_per_hour` e `arb_order_amount` com base no hit rate | pendente |
 
+### Follow-ups técnicos pendentes
+
+| Item | Onde | Validação para fechar |
+|------|------|------------------------|
+| **BitPreco `_sleep(0.5)` no flash listener** — reduzido de 5s → 0.5s em 2026-05-11. Ainda há buffer para hipóteses de eventual-consistency / debouncing / race com `_status_polling_task`. | `hummingbot/connector/exchange/bitpreco/bitpreco_exchange.py` — comentário `FOLLOW-UP REQUIRED` | (a) ≥24h de `[bp_timing]` logs sem fill stale ou perdido; (b) sem 429 nos logs REST; (c) arb MARKET fills detectados consistentemente <1s após placement. Se passar, halve para 250ms → 100ms → 0 (12h entre steps). |
+| **Arb executor age-out de 60s** — band-aid. O design correto é "shoot or quit" no primeiro poll (sem polling-until-opportunity). | `hummingbot/strategy_v2/executors/arbitrage_executor/arbitrage_executor.py:163-170` | Quando `_sleep(0.5)` for validado (item acima), reescrever `control_task` como single-shot: 1º poll → execute OU terminate (sem retry de oportunidade). |
+| **Arb spawn-race grace de 30s** — pode ser apertado para 5-10s após observação em prod de quanto tempo realmente leva `executors_info` atualizar. | `_arb_spawn_pending_until` em `controllers/generic/xemm_lead_lag.py` | Logar tempo entre `[arb_spawn]` e primeiro `[arb_gate_skip] active arb executor present`. Se for consistentemente <5s, reduzir o grace. |
+
 ---
 
 ## Arquitetura resumida
