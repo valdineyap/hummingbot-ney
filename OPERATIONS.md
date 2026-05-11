@@ -8,7 +8,31 @@ ver [`DEVELOPMENT_STATUS.md`](DEVELOPMENT_STATUS.md).
 
 ## 1. Quick start: "Algo aconteceu desde minha última checagem?"
 
-Três verificações em ordem crescente de detalhe:
+### Atalho preferido — `monitor_digest.sh`
+
+Um único comando devolve todo o digest processado (ideal para loops de
+monitoramento de Claude e shells humanos):
+
+```bash
+bash tools/monitor_digest.sh
+```
+
+Imprime: status do processo, fills (lê `state.json` se houver),
+freshness do master log, ERRORs recentes, anomalias de `cancel_retry`
+(>= 3 retries no mesmo order_id), último `[orphan_check]` e últimos 2
+eventos do executor.
+
+Exit codes (use em loops):
+| código | significado |
+|---|---|
+| 0 | saudável |
+| 1 | fill detectado — analisar |
+| 2 | bot caiu |
+| 3 | master log travado (>120s sem writes) |
+
+### Comandos manuais
+
+Se precisar de algo específico, três verificações em ordem crescente de detalhe:
 
 ```bash
 # (a) Beacon de filesystem — apenas mtime. Custo zero.
@@ -383,3 +407,114 @@ restart** — não há hot-reload. Knobs mais usados:
 
 Comentários extensos no YAML explicam cada um. Mudou? Reinicie pelo bloco
 "Reiniciar limpo" da seção 3.
+
+---
+
+## 8. Monitoramento contínuo durante sessões Claude
+
+> **TL;DR para o agente**: Quando o usuário pedir "ligue o monitoramento" ou
+> "monitore a cada N minutos", **não use `CronCreate` do Claude sozinho** —
+> ele só dispara em momentos idle e perde ticks em conversas longas. Use
+> as **3 camadas** abaixo. Validado em prod 2026-05-11.
+
+### Por que esse protocolo existe
+
+Tentativas anteriores (`ScheduleWakeup` em loop manual, `CronCreate` sozinho)
+falharam várias vezes por causa do design "idle-only" do scheduler do harness
+Claude. Sintoma típico: usuário vê o cron "ativo" no painel mas mensagens
+não aparecem nem o bot é checado. Solução é triangular determinismo (cron OS)
+com visibilidade (Monitor + CronCreate paralelo).
+
+### Arquitetura — 3 camadas
+
+| Camada | Mecanismo | Função | Confiabilidade |
+|---|---|---|---|
+| 1. Cron OS | `crontab -e` | Roda `tools/monitor_heartbeat.sh` a cada 5min, escreve linha em `logs/monitor_heartbeat.log` | **100%** — independe do Claude |
+| 2. Monitor persistent | Harness Claude `Monitor` tool | Tail-a o arquivo do (1) → cada linha vira notificação no chat | Alta — só falha se Claude morrer |
+| 3. CronCreate Claude | Harness `CronCreate` `*/5 * * * *` | Aparece no painel "Loops ativos" (visual). Quando dispara, lê o tail do arquivo e confirma | Best-effort (idle-only) — só pra UI |
+
+### Como armar (passo a passo)
+
+**Pré-requisito**: o bot está rodando (`pgrep -fa hummingbot_quickstart` retorna pids).
+
+**1. Verificar script de heartbeat existe e funciona:**
+```bash
+ls -la tools/monitor_heartbeat.sh   # se ausente, criar (ver schema abaixo)
+bash tools/monitor_heartbeat.sh
+tail -1 logs/monitor_heartbeat.log
+```
+Saída esperada (1 linha ≤100 chars):
+```
+2026-05-11T10:45:01Z OK bot_pid=143433 fills=4 anomalies=0 log_lines=2167
+```
+
+Status possíveis: `OK` | `FILL_NEW seq=N` | `ANOMALY n=N` | `DOWN`.
+
+**2. Instalar cron OS (idempotente):**
+```bash
+crontab -l 2>/dev/null > /tmp/cb.before
+grep -q monitor_heartbeat /tmp/cb.before || (cat /tmp/cb.before; cat <<EOF
+# XEMM Lead-Lag — heartbeat every 5 minutes
+*/5 * * * * /home/ubuntu/hummingbot-ney/tools/monitor_heartbeat.sh >> /tmp/cron_heartbeat.err 2>&1
+EOF
+) | crontab -
+crontab -l | grep heartbeat
+```
+
+**3. Armar Monitor persistent no Claude:**
+```
+Monitor tool, persistent=true, timeout_ms=3600000:
+  cd /home/ubuntu/hummingbot-ney
+  HEARTBEAT=logs/monitor_heartbeat.log
+  LOG=logs/logs_conf_xemm_lead_lag_shadow.log
+  echo "monitor_armed heartbeat=$HEARTBEAT log=$LOG"
+  tail -n 0 -F "$HEARTBEAT" 2>/dev/null &
+  tail -n 0 -F "$LOG" 2>/dev/null | grep -E --line-buffered \
+    "CRITICAL|ERROR|Traceback|REBALANCE_STUCK|DRIFT_STUCK|EVENT_LOOP_LAG|KILL_SWITCH|orphans=[1-9]|\[ghost_fill\]" &
+  wait
+```
+
+**4. Armar CronCreate paralelo (só pra UI):**
+```
+CronCreate, cron="*/5 * * * *", recurring=true, prompt:
+  Heartbeat check — leia tail -3 de /home/ubuntu/hummingbot-ney/logs/monitor_heartbeat.log e me mostre.
+  Se a linha mais recente for ANOMALY ou DOWN ou FILL_NEW, rode bash tools/monitor_digest.sh e analise.
+  Caso contrário, apenas mostre as 3 linhas e confirme "monitoramento OK".
+```
+
+### Como desligar
+
+```bash
+# 1. Cron OS
+crontab -l | grep -v monitor_heartbeat | crontab -
+
+# 2. Monitor Claude — usar TaskStop <task_id> (id retornado quando armado)
+# 3. Cron Claude — usar CronList para descobrir id, depois CronDelete <id>
+```
+
+### Schema de `tools/monitor_heartbeat.sh`
+
+Faz exatamente uma coisa: escreve 1 linha em `logs/monitor_heartbeat.log` a cada chamada.
+
+Coleta: timestamp UTC, status, `bot_pid`, `fills` (de state.json), `anomalies`
+(contagem de CRITICAL/ERROR/orphans=N>0/etc nas últimas 400 linhas do log do
+bot), `log_lines` (total). Estado entre execuções: `logs/xemm_lead_lag/.heartbeat_last_fill_seq`
+(para detectar `FILL_NEW`).
+
+Se mudar formato de output, manter ≤100 chars/linha (cabe em notification do Monitor).
+
+### Auditoria a qualquer momento
+
+```bash
+tail -20 logs/monitor_heartbeat.log    # últimos 20 ticks
+grep -v " OK " logs/monitor_heartbeat.log | tail   # só não-OK (fills, anomalias, downs)
+```
+
+Esses arquivos sobrevivem mesmo se Claude crashar — o cron OS continua escrevendo.
+
+### Anti-padrões — não usar isoladamente
+
+- ❌ **`ScheduleWakeup` em loop manual** (reagendar a cada turno): esquece, perde ticks
+- ❌ **`CronCreate` sozinho**: idle-only, perde ticks em conversa longa
+- ❌ **Monitor persistent sem cron OS por trás**: silêncio é ambíguo, usuário perde confiança
+- ✅ **As 3 camadas juntas**: cron OS garante determinismo, Monitor garante visibilidade contínua, CronCreate fornece confirmação visual no painel
