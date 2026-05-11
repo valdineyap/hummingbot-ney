@@ -156,6 +156,53 @@ class TestLeadLagArbitrageExecutor(IsolatedAsyncioWrapperTestCase, LoggerMixinFo
         self.assertEqual(self.executor.close_type, CloseType.UNWIND_ABORTED)
         mock_stop.assert_called_once()
 
+    async def test_estimate_unwind_slippage_uses_exchange_kwarg(self):
+        """Regression pin (2026-05-11 18:06 incident): the base method
+        ``ArbitrageExecutor.get_resulting_price_for_amount`` takes
+        ``exchange`` as the connector-name kwarg, not ``connector``.
+        Calling with the wrong name raised TypeError, which the unwind
+        path's outer try caught and turned into UNWIND_ABORTED — leaving
+        partial-leg failures with an open position.
+        """
+        market = MagicMock()
+        market.connector_name = "binance"
+        market.trading_pair = "BTC-USDT"
+        # Override the spec'd connector with a free-form mock so we can
+        # add the get_order_book attribute the call path needs after
+        # the kwarg-typing check passes. ExecutorBase copies the
+        # strategy.connectors dict into self.connectors at __init__
+        # time (see executor_base.py:53), so we patch the executor's
+        # own dict directly.
+        free_conn = MagicMock()
+        ob_mock = MagicMock()
+        ob_mock.get_price.return_value = 50_000.0
+        free_conn.get_order_book.return_value = ob_mock
+        self.executor.connectors["binance"] = free_conn
+
+        called_with = {}
+
+        async def _fake_get_price(**kw):
+            called_with.update(kw)
+            return Decimal("50050")  # 10 bps over best ask
+
+        with patch.object(self.executor, "get_resulting_price_for_amount",
+                          new=AsyncMock(side_effect=_fake_get_price)):
+            slip = await self.executor._estimate_unwind_slippage(
+                market=market,
+                side=TradeType.BUY,
+                amount=Decimal("0.001"),
+            )
+
+        # The kwarg name passed by the call site MUST match the base signature.
+        # Asserting on the captured kwargs is the actual regression guard:
+        # if someone re-introduces ``connector=...`` the base would reject
+        # it as TypeError and we'd never reach this assert.
+        self.assertIn("exchange", called_with)
+        self.assertEqual(called_with["exchange"], "binance")
+        self.assertNotIn("connector", called_with)
+        # And slippage is computed correctly: 10 bps.
+        self.assertAlmostEqual(float(slip), 10.0, places=1)
+
     def test_partial_failure_detection_buy_filled_sell_failed(self):
         """When buy already filled and sell fails → unwind_attempted=True (partial failure path)."""
         # Set buy_order to have executed amount

@@ -208,9 +208,13 @@ class LeadLagArbitrageExecutor(ArbitrageExecutor):
         """
         connector = self.connectors[market.connector_name]
         is_buy = (side == TradeType.BUY)
-        # VWAP-based execution price
+        # VWAP-based execution price.
+        # Note: base ``ArbitrageExecutor.get_resulting_price_for_amount`` takes
+        # ``exchange``, not ``connector`` — using the wrong kwarg here was the
+        # bug that made every unwind path raise TypeError, leaving partial-leg
+        # failures with an open position (observed prod 2026-05-11 18:06:53).
         vwap_price = await self.get_resulting_price_for_amount(
-            connector=market.connector_name,
+            exchange=market.connector_name,
             trading_pair=market.trading_pair,
             is_buy=is_buy,
             order_amount=amount,

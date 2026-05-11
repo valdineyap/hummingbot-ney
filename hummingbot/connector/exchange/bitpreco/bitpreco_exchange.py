@@ -263,46 +263,44 @@ class BitprecoExchange(ExchangePyBase):
         amount_str = f"{amount:f}"
         market = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
 
-        # BitPreco's MARKET BUY API differs from MARKET SELL: the `amount`
-        # field is interpreted as the VOLUME to spend in quote currency (BRL),
-        # NOT the base amount to buy (BTC). Empirically confirmed by every
-        # MARKET BUY attempt in the log history (2026-05-05 through 2026-05-11)
-        # being rejected with `BELOW_MINIMUM_VOLUME` and
-        # `requested_volume: 0` — BitPreco couldn't read a non-zero volume
-        # from our payload because we were sending 0.0002 (BTC) where they
-        # expected a value in BRL (which they then read as essentially 0).
+        # BitPreco MARKET orders require a `volume` (BRL) field per the API
+        # docs (https://apidocs.bitpreco.com/, "limited" section):
+        #   > When limited is set to false, the price and amount are not
+        #   > considered, therefore, ignored. ... Turns volume mandatory.
         #
-        # Fix: convert the requested base amount to quote currency before
-        # sending. Use best_ask * 1.01 as the ceiling price (1% buffer for
-        # book walking) so the final fill amount in BTC is >= what was
-        # requested. BitPreco refunds unused BRL after the market order
-        # completes, so over-spending the buffer is safe.
+        # Prior attempts (all wrong):
+        #   - 2026-05-11 01:10: synthesized price = best_ask * 1.01, kept
+        #     amount as BTC. Hypothesis: BitPreco computes volume = amount*price.
+        #     Hypothesis was wrong; price is ignored per docs.
+        #   - 2026-05-11 (commit 29a2a186e): converted `amount` to BRL,
+        #     price=0. Hypothesis: BitPreco's `amount` field is BRL for
+        #     MARKET BUY. Also wrong; `amount` is ignored, the field name
+        #     is `volume`. Server response confirmed: `requested_volume: 0`
+        #     because BitPreco never saw a `volume` field at all.
         #
-        # SELL MARKET does NOT need this conversion: BitPreco accepts
-        # `amount` in base (BTC) for sells, and that path has many
-        # successful executions in the log history.
-        #
-        # The previous "synthesized price" attempt (2026-05-11 01:10) was
-        # based on the wrong assumption that BitPreco computes
-        # `volume = amount * price` — it doesn't, hence the rejections
-        # continued unchanged after that fix landed.
-        if (order_type is OrderType.MARKET
-                and trade_type is TradeType.BUY):
+        # Correct (per docs): for MARKET BUY add `volume=<BRL>` to the
+        # payload. Convert from the framework's BTC `amount` using
+        # best_ask * 1.01 (1% buffer for book walk) so the resulting BTC
+        # fill is >= what we wanted. BitPreco refunds unused BRL.
+        # For MARKET SELL: history shows `amount` (BTC) without `volume`
+        # works in practice (many successful prod fills). Keep that path
+        # unchanged to avoid regressing.
+        volume_str: Optional[str] = None
+        if order_type is OrderType.MARKET and trade_type is TradeType.BUY:
             try:
                 ceiling_price = self.get_price(trading_pair, True)  # best_ask
                 if ceiling_price is None or ceiling_price <= 0 or ceiling_price.is_nan():
                     raise ValueError(f"get_price returned {ceiling_price!r}")
                 ceiling_price = ceiling_price * Decimal("1.01")
-                amount_brl = (amount * ceiling_price).quantize(
+                volume_brl = (amount * ceiling_price).quantize(
                     Decimal("0.01"), rounding="ROUND_UP"
                 )
+                volume_str = f"{volume_brl:f}"
                 self.logger().info(
-                    f"[market_buy_volume] converted {amount:f} BTC "
-                    f"→ {amount_brl} BRL volume "
-                    f"(ceiling_price={ceiling_price:f}) for MARKET BUY on BitPreco."
+                    f"[market_buy_volume] {amount:f} BTC → "
+                    f"volume={volume_str} BRL (ceiling_price={ceiling_price:f}) "
+                    f"for MARKET BUY on BitPreco."
                 )
-                amount_str = f"{amount_brl:f}"
-                price = Decimal("0")  # not used by BitPreco for MARKET BUY
             except Exception as e:
                 self.logger().error(
                     f"[market_buy_volume] failed to compute BRL volume for "
@@ -316,10 +314,8 @@ class BitprecoExchange(ExchangePyBase):
         #   LIMIT SELL → ceil  (stays above the bid, won't cross)
         # Without this, BitPreco would silently round (typically up), which
         # could flip a LIMIT_MAKER BUY into a taker fill and drain inventory.
-        # MARKET BUY now sets price=0 (BRL volume is in `amount` field per
-        # the conversion above) so the rounding is a no-op for it.
-        # Only applied to BTC-BRL where the integer-price rule is confirmed;
-        # other pairs keep the price as-is for now.
+        # MARKET orders: price is ignored per docs but we still send a
+        # quantized value to keep the payload well-formed.
         if market.upper() in ("BTC-BRL", "BTCBRL"):
             if trade_type is TradeType.BUY:
                 price_to_send = price.quantize(Decimal("1"), rounding="ROUND_DOWN")
@@ -338,6 +334,10 @@ class BitprecoExchange(ExchangePyBase):
             "amount": amount_str,
             "price": price_str
         }
+        # MARKET BUY: add the mandatory `volume` field per BitPreco docs.
+        # `amount` and `price` above are ignored server-side for limited=False.
+        if volume_str is not None:
+            data["volume"] = volume_str
 
         transact_time = time.time()
 
