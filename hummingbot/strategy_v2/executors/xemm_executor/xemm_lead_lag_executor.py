@@ -23,6 +23,7 @@ from hummingbot.core.data_type.common import OrderType, PriceType, TradeType
 from hummingbot.core.data_type.order_candidate import OrderCandidate
 from hummingbot.logger import HummingbotLogger
 from hummingbot.strategy_v2.executors.xemm_executor.xemm_executor import XEMMExecutor
+from hummingbot.strategy_v2.models.base import RunnableStatus
 from hummingbot.strategy_v2.models.executors import CloseType
 from hummingbot.strategy_v2.models.executors import TrackedOrder
 
@@ -100,6 +101,70 @@ class XEMMLeadLagExecutor(XEMMExecutor):
         if maker_done and taker_done:
             self.logger().info("Both orders are done, executor terminated.")
             self.stop()
+
+    async def control_maker_order(self):
+        """Override: place taker hedge IMMEDIATELY when maker is detected
+        done with executed_amount > 0, BEFORE the base class clears
+        ``self.maker_order``.
+
+        Why this matters: fills can be discovered via REST reconcile (the
+        controller's orphan_check / connector status poll) when the
+        WebSocket account-stream is lagging or dropped. In that flow the
+        connector updates ``maker_order.order.is_done = True`` first, then
+        emits ``OrderCompletedEvent`` asynchronously on a later tick.
+
+        Without this override, the base class's ``control_maker_order``
+        clears ``self.maker_order`` on the very next tick (its
+        ``elif self.maker_order.is_done`` branch), and a new maker is
+        created before the event arrives. By the time
+        ``process_order_completed_event`` fires, ``self.maker_order.order_id``
+        no longer matches ``event.order_id`` and the hedge is never placed
+        — leaving inventory drift that only the slower auto_rebalance path
+        recovers, often with worse PnL (it can rebalance on the SAME
+        exchange where the maker filled, missing the cross-exchange edge).
+
+        Observed in prod 2026-05-11 12:07:18: maker BUY filled via REST
+        reconcile, no hedge ever placed, audit detected drift 20s later and
+        rebalanced MARKET SELL on BitPreco (the maker side) losing ~4 BRL
+        vs. the proper cross-exchange hedge that would have made ~+0.025 BRL.
+
+        Anti-double-hedge: the order_id is registered in
+        ``_ghost_maker_order_ids`` here, so when the delayed
+        OrderCompletedEvent arrives later, the ghost path in
+        ``process_order_completed_event`` sees ``taker_order is not None``
+        and skips with a warning instead of placing a second hedge.
+        """
+        if (self.maker_order is not None
+                and self.maker_order.order is not None
+                and self.maker_order.order.is_done
+                and self.taker_order is None):
+            executed = self.maker_order.order.executed_amount_base or Decimal("0")
+            if executed > 0:
+                order_id = self.maker_order.order_id
+                self.logger().warning(
+                    f"[reconcile_hedge] Maker order {order_id} done with "
+                    f"executed={executed} (likely REST-reconciled fill or "
+                    f"event arriving on same tick); placing taker hedge NOW "
+                    f"before base clears maker_order."
+                )
+                # Anti-double-hedge: register so the delayed event no-ops.
+                self._ghost_maker_order_ids.add(order_id)
+                # Activate audit's 10s inflight window — avoids double action
+                # from inventory_audit while the taker MARKET is settling.
+                self._touch_controller_last_fill_time()
+                try:
+                    self.place_taker_order(amount=executed)
+                    # Match base's flow after place_taker_order: transition
+                    # so the next tick goes through control_shutdown_process.
+                    self._status = RunnableStatus.SHUTTING_DOWN
+                except Exception as e:
+                    self.logger().error(
+                        f"[reconcile_hedge] place_taker_order failed for "
+                        f"{order_id}: {type(e).__name__}: {e}. "
+                        f"inventory_audit will reconcile (worse PnL)."
+                    )
+        # Delegate to base for the normal state machine (cancel/refresh/etc).
+        await super().control_maker_order()
 
     # ------------------------------------------------------------------
     # Ghost fill guard — BitPreco CANT_CANCEL_FILLED_ORDER race fix

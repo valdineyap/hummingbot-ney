@@ -2,7 +2,7 @@
 from decimal import Decimal
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
 from test.logger_mixin_for_test import LoggerMixinForTest
-from unittest.mock import MagicMock, PropertyMock, patch
+from unittest.mock import AsyncMock, MagicMock, PropertyMock, patch
 
 from hummingbot.connector.exchange_py_base import ExchangePyBase
 from hummingbot.connector.trading_rule import TradingRule
@@ -671,3 +671,104 @@ class TestXEMMLeadLagExecutor(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest
 
         self.assertGreaterEqual(mock_ctrl._last_fill_time, before)
         self.assertLessEqual(mock_ctrl._last_fill_time, after)
+
+    # ------------------------------------------------------------------ #
+    # Reconcile-hedge tests (REST-reconciled fill before event arrives)    #
+    # ------------------------------------------------------------------ #
+
+    async def test_reconcile_hedge_fires_on_maker_done_with_executed(self):
+        """When control_maker_order runs and finds maker.is_done with
+        executed > 0 and taker not yet placed, it must fire the taker hedge
+        immediately — before the base class clears self.maker_order."""
+        from hummingbot.strategy_v2.models.executors import TrackedOrder
+        from hummingbot.strategy_v2.models.base import RunnableStatus
+        from unittest.mock import MagicMock, patch
+
+        maker_order_id = "MAKER-RECONCILED-1"
+        self.executor.maker_order = TrackedOrder(order_id=maker_order_id)
+        # Simulate REST-reconciled fill: order.is_done=True, executed > 0,
+        # but no OrderCompletedEvent has fired yet.
+        mock_order = MagicMock()
+        mock_order.is_done = True
+        mock_order.executed_amount_base = Decimal("0.0002")
+        self.executor.maker_order.order = mock_order
+        self.executor.taker_order = None
+
+        placed = []
+
+        def _place(connector_name, trading_pair, order_type, side, amount, **kw):
+            placed.append((connector_name, side.name, amount))
+            return f"TAKER-{len(placed)}"
+
+        with patch.object(self.executor, "place_order", side_effect=_place), \
+             patch.object(self.executor, "_touch_controller_last_fill_time") as mock_touch, \
+             patch.object(self.executor.__class__.__bases__[0], "control_maker_order",
+                          new=AsyncMock()):
+            await self.executor.control_maker_order()
+
+        # Hedge placed on taker connector with the correct amount
+        self.assertEqual(len(placed), 1)
+        connector, side_name, amount = placed[0]
+        self.assertEqual(connector, "binance")
+        self.assertEqual(side_name, "SELL")
+        self.assertEqual(amount, Decimal("0.0002"))
+        # Order id registered in ghost set so the delayed event no-ops
+        self.assertIn(maker_order_id, self.executor._ghost_maker_order_ids)
+        # Audit suppression window activated
+        mock_touch.assert_called_once()
+        # Status transitioned to SHUTTING_DOWN (matches base flow after hedge)
+        self.assertEqual(self.executor._status, RunnableStatus.SHUTTING_DOWN)
+
+    async def test_reconcile_hedge_skipped_when_taker_already_placed(self):
+        """If taker_order is already set, the reconcile_hedge path must NOT
+        place a second hedge (anti-double-hedge guard)."""
+        from hummingbot.strategy_v2.models.executors import TrackedOrder
+        from unittest.mock import MagicMock, patch
+
+        self.executor.maker_order = TrackedOrder(order_id="MAKER-RECONCILED-2")
+        mock_order = MagicMock()
+        mock_order.is_done = True
+        mock_order.executed_amount_base = Decimal("0.0002")
+        self.executor.maker_order.order = mock_order
+        self.executor.taker_order = TrackedOrder(order_id="TAKER-ALREADY")
+
+        with patch.object(self.executor, "place_order") as mock_place, \
+             patch.object(self.executor.__class__.__bases__[0], "control_maker_order",
+                          new=AsyncMock()):
+            await self.executor.control_maker_order()
+
+        mock_place.assert_not_called()
+
+    async def test_reconcile_hedge_skipped_when_executed_zero(self):
+        """If maker is done but executed == 0 (pure cancel, no fill), the
+        reconcile_hedge path must NOT place a hedge."""
+        from hummingbot.strategy_v2.models.executors import TrackedOrder
+        from unittest.mock import MagicMock, patch
+
+        self.executor.maker_order = TrackedOrder(order_id="MAKER-RECONCILED-3")
+        mock_order = MagicMock()
+        mock_order.is_done = True
+        mock_order.executed_amount_base = Decimal("0")
+        self.executor.maker_order.order = mock_order
+        self.executor.taker_order = None
+
+        with patch.object(self.executor, "place_order") as mock_place, \
+             patch.object(self.executor.__class__.__bases__[0], "control_maker_order",
+                          new=AsyncMock()):
+            await self.executor.control_maker_order()
+
+        mock_place.assert_not_called()
+
+    async def test_reconcile_hedge_delegates_to_base_when_no_fill(self):
+        """control_maker_order must still call super().control_maker_order()
+        when there's no reconcile-fill to handle (normal placement path)."""
+        from unittest.mock import patch
+
+        self.executor.maker_order = None  # nothing to reconcile
+        self.executor.taker_order = None
+
+        with patch.object(self.executor.__class__.__bases__[0], "control_maker_order",
+                          new=AsyncMock()) as mock_base:
+            await self.executor.control_maker_order()
+
+        mock_base.assert_awaited_once()
