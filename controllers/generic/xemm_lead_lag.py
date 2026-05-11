@@ -1755,15 +1755,19 @@ class XEMMLeadLagController(ControllerBase):
         if not cfg.enabled or not cfg.base_targets:
             return
 
-        # Skip the audit completely when the kill switch is already tripped —
-        # the bot is stopping; further CRITICAL drift logs are pure noise (and
-        # poison any human/agent reviewing the log). Observed in prod
-        # 2026-05-11: ~250 CRITICAL lines emitted in the 25 minutes between
-        # DRIFT_STUCK trip and operator intervention.
-        if self._kill_reason is not None:
-            self._last_audit_time = now  # advance so the next check spaces out
-            return
-
+        # When the kill switch is already tripped we still need to compute
+        # drift — the auto_terminate gate reads ``_last_audit_results
+        # ["_drift_active"]`` and would deadlock on a frozen-True snapshot
+        # if the audit stopped refreshing it. Observed 2026-05-11 16:51:
+        # HEDGE_FAILURES_3 trip → audit stopped → a later natural fill
+        # resolved the drift but ``_drift_active`` stayed True → auto_
+        # terminate never fired → bot stuck in KILLED indefinitely.
+        # In killed mode we suppress the noisy/destructive side-effects:
+        #   - no CRITICAL spam (only state-change INFO at the end)
+        #   - no rebalance queueing (we're shutting down)
+        #   - no drift_consecutive_audits increment / re-trip of kill
+        # but we DO update ``_last_audit_results`` so the gate stays live.
+        killed = self._kill_reason is not None
         self._last_audit_time = now
         inflight = self._has_inflight_activity()
         results: Dict[str, Dict[str, Decimal]] = {"_inflight_active": inflight}
@@ -1824,8 +1828,9 @@ class XEMMLeadLagController(ControllerBase):
             # only trades one direction until a natural fill restores
             # parity (3 min outage observed in prod 2026-05-11 14:08).
             # Surface it explicitly so an operator knows what to expect
-            # without grep'ing balance_gate WARNINGs.
-            if within and target > 0 and source == "boot":
+            # without grep'ing balance_gate WARNINGs.  Suppressed in
+            # killed mode (operator already knows something's wrong).
+            if (not killed) and within and target > 0 and source == "boot":
                 low_side_ratio = (
                     min(maker_bal, taker_bal) / target
                     if target > 0 else Decimal("1")
@@ -1844,17 +1849,33 @@ class XEMMLeadLagController(ControllerBase):
                     )
 
             if within:
-                # Drift resolved → reset circuit-breaker counter.
-                self._drift_consecutive_audits[asset] = 0
+                # Drift resolved. In normal mode reset the circuit breaker
+                # counter; in killed mode just record the no-drift state
+                # so auto_terminate sees a clear gate next tick.
+                if not killed:
+                    self._drift_consecutive_audits[asset] = 0
                 continue
 
-            # Drift detected — defer if a legitimate trade can explain it
-            if inflight:
+            # Drift detected — defer if a legitimate trade can explain it.
+            # In killed mode we DON'T defer: any drift, transient or not,
+            # blocks auto_terminate, and there's no auto_rebalance to race
+            # with (kill suppresses it below). Just record the drift.
+            if inflight and not killed:
                 self.logger().info(
                     f"[audit/{source}] {asset} drift {delta:+f} BUT in-flight "
                     f"activity present — deferring action (target={target}, "
                     f"actual={actual}, tolerance={tolerance_abs})"
                 )
+                continue
+
+            any_drift = True
+
+            # In killed mode we ONLY needed any_drift updated for the
+            # auto_terminate gate — skip all the noisy/destructive paths
+            # below (CRITICAL spam, drift_stuck counter, kill re-trip,
+            # rebalance queue). The state-change log fires once at the
+            # end if _drift_active flipped this cycle.
+            if killed:
                 continue
 
             # Circuit-breaker: count consecutive audits with unresolved drift
@@ -1875,7 +1896,6 @@ class XEMMLeadLagController(ControllerBase):
                     f"check connector WARN/ERROR logs for the asset's pair."
                 )
 
-            any_drift = True
             self.logger().critical(
                 f"[audit/{source}] {asset} DRIFT actual={actual:f} "
                 f"(maker={maker_bal:f} taker={taker_bal:f}) target={target:f} "
@@ -1904,6 +1924,18 @@ class XEMMLeadLagController(ControllerBase):
                 else:
                     self._pending_rebalances[asset] = delta
             # action == "alert" → already logged CRITICAL above; no further action
+
+        # In killed mode log only the state transition so an operator
+        # following the log sees when auto_terminate becomes unblocked
+        # (or re-blocks) — without spamming every audit cycle.
+        if killed:
+            prev_drift = bool(self._last_audit_results.get("_drift_active", False))
+            if prev_drift != any_drift:
+                gate = "BLOCKED (drift persists)" if any_drift else "CLEAR (drift resolved)"
+                self.logger().info(
+                    f"[audit/killed] _drift_active {prev_drift} → {any_drift}; "
+                    f"auto_terminate gate now {gate}"
+                )
 
         results["_drift_active"] = any_drift
         self._last_audit_results = results

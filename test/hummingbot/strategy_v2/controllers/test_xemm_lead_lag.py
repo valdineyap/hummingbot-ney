@@ -1739,6 +1739,94 @@ class TestInventoryAuditAlertAction(_AuditBaseTest):
         self.assertTrue(self.controller._last_audit_results["_drift_active"])
 
 
+class TestAuditPassiveModeWhenKilled(_AuditBaseTest):
+    """Regression pin (2026-05-11 16:51 incident).
+
+    The auto_terminate gate reads ``_last_audit_results["_drift_active"]``.
+    Before this fix, the audit early-returned the moment ``_kill_reason``
+    was set — which froze ``_drift_active`` at its last pre-kill value.
+    HEDGE_FAILURES_3 trip → audit stopped → a later natural fill resolved
+    the drift but the flag stayed True forever → auto_terminate deadlock.
+
+    Fixed by switching to passive mode in killed state: still refresh
+    ``_last_audit_results`` so the gate sees current reality, but skip
+    the destructive side-effects (rebalance queue, drift_consecutive
+    increment, kill re-trip, CRITICAL spam).
+    """
+
+    def test_killed_audit_still_updates_drift_active_on_refresh(self):
+        """Drift cleared after kill → audit must flip _drift_active to False."""
+        # Setup: bot is KILLED with drift previously detected.
+        self.controller._kill_reason = "HEDGE_FAILURES_3"
+        self.controller._last_audit_results = {"_drift_active": True}
+        # Balances now perfectly match target (natural fill resolved drift).
+        self._mock_total_balance(
+            Decimal("0.001"),   # maker
+            Decimal("0.001"),   # taker — total 0.002 = target
+        )
+        self.controller._has_inflight_activity = MagicMock(return_value=False)
+        self.controller._run_inventory_audit(now=1700000000.0, source="periodic")
+        # Auto_terminate gate should now see clear state.
+        self.assertFalse(self.controller._last_audit_results["_drift_active"])
+
+    def test_killed_audit_still_flags_drift_when_present(self):
+        """If drift persists post-kill, gate stays BLOCKED."""
+        self.controller._kill_reason = "HEDGE_FAILURES_3"
+        self.controller._last_audit_results = {"_drift_active": False}
+        # Drift large enough to exceed tolerance (target 0.002, max_drift_quote=3
+        # BRL with mid≈300050 → tolerance ~1e-5 BTC; we set delta ~0.0002).
+        self._mock_total_balance(
+            Decimal("0.001"),
+            Decimal("0.0008"),  # total 0.0018 < target → 0.0002 drift
+        )
+        self.controller._has_inflight_activity = MagicMock(return_value=False)
+        self.controller._run_inventory_audit(now=1700000000.0, source="periodic")
+        self.assertTrue(self.controller._last_audit_results["_drift_active"])
+
+    def test_killed_audit_does_not_queue_rebalance(self):
+        """Killed mode must NOT queue auto_rebalance — we're shutting down."""
+        self.config.inventory_audit.on_drift_action = "auto_rebalance"
+        self.controller._kill_reason = "HEDGE_FAILURES_3"
+        self.controller._last_audit_results = {"_drift_active": True}
+        self._mock_total_balance(Decimal("0.001"), Decimal("0.0008"))
+        self.controller._has_inflight_activity = MagicMock(return_value=False)
+        # Pre-condition: no pending rebalances.
+        self.controller._pending_rebalances = {}
+        self.controller._run_inventory_audit(now=1700000000.0, source="periodic")
+        self.assertEqual(self.controller._pending_rebalances, {})
+
+    def test_killed_audit_does_not_retrip_kill_reason(self):
+        """Existing kill_reason preserved — we don't overwrite it with
+        a DRIFT_STUCK or INVENTORY_DRIFT during shutdown."""
+        self.config.inventory_audit.on_drift_action = "pause"
+        self.controller._kill_reason = "HEDGE_FAILURES_3"
+        self._mock_total_balance(Decimal("0.001"), Decimal("0.0008"))
+        self.controller._has_inflight_activity = MagicMock(return_value=False)
+        self.controller._run_inventory_audit(now=1700000000.0, source="periodic")
+        self.assertEqual(self.controller._kill_reason, "HEDGE_FAILURES_3")
+
+    def test_killed_audit_does_not_increment_drift_consecutive(self):
+        """Drift counter freezes at kill time — we're not actively
+        managing the asset anymore."""
+        self.controller._kill_reason = "HEDGE_FAILURES_3"
+        self.controller._drift_consecutive_audits = {"BTC": 3}
+        self._mock_total_balance(Decimal("0.001"), Decimal("0.0008"))
+        self.controller._has_inflight_activity = MagicMock(return_value=False)
+        self.controller._run_inventory_audit(now=1700000000.0, source="periodic")
+        # Still 3 — not incremented.
+        self.assertEqual(self.controller._drift_consecutive_audits["BTC"], 3)
+
+    def test_normal_mode_still_runs_full_audit(self):
+        """Sanity guard: non-killed mode behavior unchanged."""
+        self.controller._kill_reason = None
+        self._mock_total_balance(Decimal("0.001"), Decimal("0.0008"))
+        self.controller._has_inflight_activity = MagicMock(return_value=False)
+        self.controller._run_inventory_audit(now=1700000000.0, source="periodic")
+        # Drift action="pause" (default in _AuditBaseTest) → kill_reason set.
+        self.assertEqual(self.controller._kill_reason, "INVENTORY_DRIFT_BTC")
+        self.assertTrue(self.controller._last_audit_results["_drift_active"])
+
+
 class TestInflightActivityDetection(_AuditBaseTest):
     def test_active_executor_alone_is_NOT_inflight(self):
         # KEY REGRESSION TEST: an XEMM executor sitting with an open maker order
