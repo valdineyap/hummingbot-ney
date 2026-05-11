@@ -8,7 +8,9 @@ from hummingbot.connector.trading_rule import TradingRule
 from hummingbot.core.data_type.common import OrderType, TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState
 from hummingbot.core.data_type.order_candidate import OrderCandidate
-from hummingbot.core.event.events import BuyOrderCompletedEvent, BuyOrderCreatedEvent, MarketOrderFailureEvent
+from hummingbot.core.event.events import (
+    BuyOrderCompletedEvent, BuyOrderCreatedEvent, MarketOrderFailureEvent, OrderCancelledEvent,
+)
 from hummingbot.strategy.strategy_v2_base import StrategyV2Base
 from hummingbot.strategy_v2.executors.data_types import ConnectorPair
 from hummingbot.strategy_v2.executors.xemm_executor.data_types import XEMMExecutorConfig
@@ -224,6 +226,75 @@ class TestXEMMExecutor(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest):
         await self.executor.control_task()
         self.assertEqual(self.executor._status, RunnableStatus.TERMINATED)
 
+    async def test_cancel_stale_reissues_after_window(self):
+        """When a cancel sits unconfirmed past
+        ``_cancel_stale_warn_after_sec`` (5s), the executor re-issues
+        ``_strategy.cancel`` (Sprint 5 / Bug D). Without this, production
+        logs showed orders sitting alive 3min46s after a single failed
+        cancel — eventually filling unhedged."""
+        import time as _t
+        # Set up: a maker order is in flight, cancel was requested 6s ago.
+        self.executor._status = RunnableStatus.RUNNING
+        in_flight = MagicMock()
+        in_flight.is_done = False
+        in_flight.exchange_order_id = "EX-12345"
+        order = TrackedOrder(order_id="OID-BUY-1")
+        order.order = in_flight
+        self.executor.maker_order = order
+        self.executor._cancel_requested = True
+        self.executor._cancel_requested_ts = _t.time() - 6.0  # 6s ago
+        self.executor._last_stale_cancel_log_ts = 0.0
+        self.strategy.cancel.reset_mock()
+
+        await self.executor.control_maker_order()
+
+        # Re-issue happened.
+        self.strategy.cancel.assert_called_once()
+        args = self.strategy.cancel.call_args.args
+        self.assertEqual(args[2], "OID-BUY-1")  # order_id
+
+    async def test_cancel_stale_does_not_reissue_within_window(self):
+        """If the cancel was requested only 2s ago (< 5s window), no
+        re-issue — the connector's internal retry is still running."""
+        import time as _t
+        self.executor._status = RunnableStatus.RUNNING
+        in_flight = MagicMock()
+        in_flight.is_done = False
+        in_flight.exchange_order_id = "EX-12345"
+        order = TrackedOrder(order_id="OID-BUY-1")
+        order.order = in_flight
+        self.executor.maker_order = order
+        self.executor._cancel_requested = True
+        self.executor._cancel_requested_ts = _t.time() - 2.0  # 2s ago
+        self.strategy.cancel.reset_mock()
+
+        await self.executor.control_maker_order()
+
+        # No re-issue — connector's retry budget hasn't been exhausted yet.
+        self.strategy.cancel.assert_not_called()
+
+    async def test_cancel_stale_throttles_repeated_reissues(self):
+        """Re-issue is throttled to once per stale window (5s) so we don't
+        spam the connector with same cancel every tick."""
+        import time as _t
+        self.executor._status = RunnableStatus.RUNNING
+        in_flight = MagicMock()
+        in_flight.is_done = False
+        in_flight.exchange_order_id = "EX-12345"
+        order = TrackedOrder(order_id="OID-BUY-1")
+        order.order = in_flight
+        self.executor.maker_order = order
+        self.executor._cancel_requested = True
+        self.executor._cancel_requested_ts = _t.time() - 6.0
+        # Already re-issued once moments ago.
+        self.executor._last_stale_cancel_log_ts = _t.time() - 1.0
+        self.strategy.cancel.reset_mock()
+
+        await self.executor.control_maker_order()
+
+        # Throttled — only 1s passed since last re-issue, window is 5s.
+        self.strategy.cancel.assert_not_called()
+
     @patch.object(XEMMExecutor, "get_in_flight_order")
     def test_process_order_created_event(self, in_flight_order_mock):
         self.executor._status = RunnableStatus.RUNNING
@@ -292,6 +363,148 @@ class TestXEMMExecutor(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest):
         self.assertEqual(self.executor.status, RunnableStatus.SHUTTING_DOWN)
         self.assertEqual(self.executor.taker_order.order_id, "OID-SELL-1")
 
+    def test_process_order_canceled_with_partial_fill_places_taker(self):
+        """Cancel-with-partial-fill must trigger a taker hedge for the
+        executed_amount_base (Task 3.3). Without this, partial fills sit
+        unhedged until inventory_audit dumps them via MARKET (slippage)."""
+        self.executor._status = RunnableStatus.RUNNING
+        self.executor.maker_order = TrackedOrder(order_id="OID-BUY-1")
+        # Stub the maker_order's underlying InFlightOrder with a partial
+        # executed_amount_base — this is what the connector's tracker has
+        # propagated by the time the cancel event lands.
+        in_flight = MagicMock()
+        in_flight.executed_amount_base = Decimal("37.5")  # partial fill
+        self.executor.maker_order.order = in_flight
+
+        cancel_event = OrderCancelledEvent(timestamp=1234, order_id="OID-BUY-1",
+                                           exchange_order_id="ex-OID-BUY-1")
+        self.executor.process_order_canceled_event(1, MagicMock(), cancel_event)
+
+        # Hedge must have been placed for the partial amount, not the
+        # configured order_amount (100). place_order calls
+        # strategy.sell(connector, pair, amount, order_type, price, pos),
+        # so args[2] is the amount.
+        self.assertIsNotNone(self.executor.taker_order)
+        self.strategy.sell.assert_called_once()
+        self.assertEqual(self.strategy.sell.call_args.args[2], Decimal("37.5"))
+        # Status moves to SHUTTING_DOWN so control_task switches to the
+        # shutdown path (waiting for taker to settle).
+        self.assertEqual(self.executor.status, RunnableStatus.SHUTTING_DOWN)
+
+    def test_process_order_canceled_no_fill_no_hedge(self):
+        """Cancel with zero executed amount must not place a hedge."""
+        self.executor._status = RunnableStatus.RUNNING
+        self.executor.maker_order = TrackedOrder(order_id="OID-BUY-1")
+        in_flight = MagicMock()
+        in_flight.executed_amount_base = Decimal("0")
+        self.executor.maker_order.order = in_flight
+
+        cancel_event = OrderCancelledEvent(timestamp=1234, order_id="OID-BUY-1",
+                                           exchange_order_id="ex-OID-BUY-1")
+        self.executor.process_order_canceled_event(1, MagicMock(), cancel_event)
+
+        self.assertIsNone(self.executor.taker_order)
+        self.strategy.sell.assert_not_called()
+        # Status stays RUNNING — control_maker_order will create a fresh
+        # maker order on the next tick.
+        self.assertEqual(self.executor.status, RunnableStatus.RUNNING)
+
+    def test_process_order_canceled_does_not_double_hedge(self):
+        """If the taker_order already exists (e.g. completed_event fired
+        first), cancel must not place a second hedge."""
+        self.executor._status = RunnableStatus.RUNNING
+        self.executor.maker_order = TrackedOrder(order_id="OID-BUY-1")
+        in_flight = MagicMock()
+        in_flight.executed_amount_base = Decimal("100")
+        self.executor.maker_order.order = in_flight
+        # Pre-existing taker — the completed_event path placed it.
+        self.executor.taker_order = TrackedOrder(order_id="OID-SELL-pre")
+
+        cancel_event = OrderCancelledEvent(timestamp=1234, order_id="OID-BUY-1",
+                                           exchange_order_id="ex-OID-BUY-1")
+        self.executor.process_order_canceled_event(1, MagicMock(), cancel_event)
+
+        # No new sell — the pre-existing taker_order stays.
+        self.assertEqual(self.executor.taker_order.order_id, "OID-SELL-pre")
+        self.strategy.sell.assert_not_called()
+
+    def test_process_order_canceled_unknown_order_ignored(self):
+        """Cancel for an order_id that's not our maker_order is a no-op."""
+        self.executor._status = RunnableStatus.RUNNING
+        self.executor.maker_order = TrackedOrder(order_id="OID-BUY-1")
+        in_flight = MagicMock()
+        in_flight.executed_amount_base = Decimal("50")
+        self.executor.maker_order.order = in_flight
+
+        cancel_event = OrderCancelledEvent(timestamp=1234, order_id="STRANGER",
+                                           exchange_order_id="ex-STRANGER")
+        self.executor.process_order_canceled_event(1, MagicMock(), cancel_event)
+
+        self.assertIsNone(self.executor.taker_order)
+        self.strategy.sell.assert_not_called()
+
+    def test_fill_to_hedge_latency_captured(self):
+        """``process_order_filled_event`` stamps first-fill ts; the next
+        ``place_taker_order`` computes the latency in ms and exposes it
+        in custom_info (Task 3.4)."""
+        import time as _time
+        self.executor._status = RunnableStatus.RUNNING
+        self.executor.maker_order = TrackedOrder(order_id="OID-BUY-1")
+        # Simulate the framework firing OrderFilledEvent for a partial fill.
+        # We don't need a real OrderFilledEvent — only event.order_id is read.
+        fill_event = MagicMock()
+        fill_event.order_id = "OID-BUY-1"
+        before = _time.time()
+        self.executor.process_order_filled_event(1, MagicMock(), fill_event)
+        self.assertGreaterEqual(self.executor._first_fill_ts, before)
+
+        # Place the taker hedge — latency must be a non-negative int ms.
+        self.executor.place_taker_order(amount=Decimal("0.5"))
+        self.assertIsNotNone(self.executor._fill_to_hedge_latency_ms)
+        self.assertIsInstance(self.executor._fill_to_hedge_latency_ms, int)
+        self.assertGreaterEqual(self.executor._fill_to_hedge_latency_ms, 0)
+        # Surfaces in custom_info for the ledger / digest.
+        self.assertEqual(
+            self.executor.get_custom_info()["fill_to_hedge_latency_ms"],
+            self.executor._fill_to_hedge_latency_ms,
+        )
+
+    def test_fill_to_hedge_latency_not_set_without_fill(self):
+        """If the maker order never reported a fill (e.g. the executor was
+        early-stopped), latency stays None — never a negative or zero value
+        that could be misread."""
+        self.executor.place_taker_order(amount=Decimal("0.5"))
+        self.assertIsNone(self.executor._fill_to_hedge_latency_ms)
+        self.assertIsNone(
+            self.executor.get_custom_info()["fill_to_hedge_latency_ms"]
+        )
+
+    def test_fill_to_hedge_latency_only_first_fill_counts(self):
+        """Subsequent fills on the same maker order don't reset the timer —
+        the first fill is what created the unhedged exposure."""
+        self.executor.maker_order = TrackedOrder(order_id="OID-BUY-1")
+        ev = MagicMock(); ev.order_id = "OID-BUY-1"
+        self.executor.process_order_filled_event(1, MagicMock(), ev)
+        first_ts = self.executor._first_fill_ts
+        # Time passes, a second partial fill comes through.
+        import time as _t
+        _t.sleep(0.01)
+        self.executor.process_order_filled_event(1, MagicMock(), ev)
+        self.assertEqual(self.executor._first_fill_ts, first_ts)
+
+    def test_place_taker_order_with_explicit_amount(self):
+        """The new ``amount`` parameter overrides the config order_amount."""
+        self.executor.place_taker_order(amount=Decimal("12.34"))
+        self.strategy.sell.assert_called_once()
+        # place_order → strategy.sell(connector, pair, amount, type, price, pos)
+        self.assertEqual(self.strategy.sell.call_args.args[2], Decimal("12.34"))
+
+    def test_place_taker_order_default_uses_config_amount(self):
+        """Backward compat: no amount → config.order_amount (100)."""
+        self.executor.place_taker_order()
+        self.strategy.sell.assert_called_once()
+        self.assertEqual(self.strategy.sell.call_args.args[2], Decimal("100"))
+
     def test_process_order_failed_event(self):
         self.executor.maker_order = TrackedOrder(order_id="OID-BUY-1")
         maker_failure_event = MarketOrderFailureEvent(
@@ -326,7 +539,9 @@ class TestXEMMExecutor(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest):
                                                            'target_profitability_pct': Decimal('0.015'),
                                                            'trade_profitability': Decimal('0'),
                                                            'tx_cost': Decimal('1'),
-                                                           'tx_cost_pct': Decimal('1')})
+                                                           'tx_cost_pct': Decimal('1'),
+                                                           'fill_to_hedge_latency_ms': None,
+                                                           'taker_expected_price': None})
 
     def test_to_format_status(self):
         self.assertIn("Maker Side: TradeType.BUY", self.executor.to_format_status())

@@ -17,7 +17,7 @@
 #       - Bybit VIP4 spot fiat-crypto: ~0.050% maker / ~0.060% taker
 #     Round-trip cost ≈ 9–11 bps; min_profitability=7 bps NET means the bot
 #     refreshes when the gross edge falls below ~16 bps gross.
-#   * The controller uses XEMMBRLExecutor (LIMIT_MAKER), not XEMMExecutor
+#   * The controller uses XEMMLeadLagExecutor (LIMIT_MAKER), not XEMMExecutor
 #     (LIMIT). This is a hard requirement to avoid maker→taker conversion
 #     under home latency.
 
@@ -49,9 +49,9 @@ order_amount: "0.0002"
 # Profitability (NET of fees — XEMMExecutor adds tx_cost_pct)  #
 # All values are decimals: 0.001 = 10 bps                      #
 # ============================================================ #
-min_profitability: "0.0007"     # 7 bps net floor
-target_profitability: "0.0020"  # 20 bps net target
-max_profitability: "0.0080"     # 80 bps net ceiling (refresh above)
+min_profitability: "0.0007"     # 7 bps net floor (cancel below)
+target_profitability: "0.0012"  # 12 bps net target (= max recommended)
+max_profitability: "0.0012"     # 12 bps net ceiling (refresh above)
 
 # ============================================================ #
 # Lead-lag signal                                              #
@@ -82,17 +82,22 @@ max_local_spread_bps: "200"
 # ============================================================ #
 # Anti-churn                                                   #
 # ============================================================ #
-min_requote_interval_sec: 3.0
+min_requote_interval_sec: 2.0   # lower to 1.0 after 24h of healthy OTR
+
+# ============================================================ #
+# Book-aware placement                                         #
+# ============================================================ #
+placement_profitability_buffer: "0.0002"  # 2 bps hysteresis above min_profitability
 
 # ============================================================ #
 # Inventory (per-exchange)                                     #
 # ============================================================ #
 inventory_target_pct: "0.5"
 inventory_skew_strength: "0.001"
-# Minimum balances on the TAKER exchange to allow each maker side
-# (because a fill on maker triggers the opposite hedge on taker).
-min_taker_base_for_sell_hedge: "0.0005"   # need BTC on Binance for BUY-maker
-min_taker_quote_for_buy_hedge: "200"      # need BRL on Binance for SELL-maker
+# Taker balance gate as fraction of one hedge size.
+# required_balance = order_amount * taker_mid * (1 + taker_hedge_buffer_pct)
+# 0.01 → 1% buffer over a single hedge; 1.01 → covers two consecutive fills.
+taker_hedge_buffer_pct: "0.01"
 
 # ============================================================ #
 # Warmup                                                       #
@@ -103,8 +108,31 @@ warmup_seconds: 25.0
 # ============================================================ #
 # Circuit breakers                                             #
 # ============================================================ #
-max_consecutive_hedge_failures: 1
+max_consecutive_hedge_failures: 3   # was 1; more permissive for transient errors
 max_daily_loss_quote: "100"     # BRL
+
+# ============================================================ #
+# Operational modes (independent switches)                     #
+# ============================================================ #
+enable_market_making: true
+enable_pure_arb: false
+
+# ============================================================ #
+# Pure arbitrage (taker:taker)                                 #
+# ============================================================ #
+arb_order_amount: "0.0002"
+arb_min_profitability: "0.0015"     # 15 bps GROSS — executor deducts fees
+arb_lead_aggressive_delta: "0.0003"
+arb_lead_conservative_delta: "0.0005"
+arb_lead_signal_threshold_bps: "5"
+arb_max_per_hour: 10
+arb_min_interval_sec: 5.0
+arb_capital_strategy: "skip_if_insufficient"
+arb_max_unwind_slippage_bps: "50"
+arb_unwind_strategy: "abort_and_alert"
+arb_failure_pause_sec: 1800.0
+arb_max_failures_per_day: 3
+arb_daily_loss_limit_quote: "100"
 
 # ============================================================ #
 # Operational                                                  #

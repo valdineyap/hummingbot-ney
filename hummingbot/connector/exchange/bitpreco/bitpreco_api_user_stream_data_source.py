@@ -58,6 +58,24 @@ class BitprecoAPIUserStreamDataSource(UserStreamTrackerDataSource):
             await websocket_assistant.send(subscribe_notifications_request)
 
             self.logger().info("Subscribed to private notification channel of bitpreco...")
+
+            # ----- Post-reconnect catch-up (Task 2.2) -----
+            # The WS user-stream drops every ~70-90s in production. Each
+            # reconnect creates a window where order state changes (fills,
+            # cancels) emitted by the exchange are not delivered. After
+            # subscribe success, fire a one-shot REST status poll to
+            # reconcile any in-flight orders. The connector's
+            # ``_update_order_status`` walks ``in_flight_orders`` and pulls
+            # current status from REST — anything that changed during the
+            # gap surfaces here. We schedule it as a fire-and-forget task
+            # so it doesn't block the WS handshake.
+            try:
+                if self._connector is not None and getattr(self._connector, "in_flight_orders", None):
+                    asyncio.create_task(self._post_reconnect_catch_up())
+            except Exception as e:
+                self.logger().warning(
+                    f"[ws_catchup] failed to schedule post-reconnect catch-up: {e}"
+                )
         except asyncio.CancelledError:
             raise
         except Exception:
@@ -66,6 +84,29 @@ class BitprecoAPIUserStreamDataSource(UserStreamTrackerDataSource):
                 exc_info=True
             )
             raise
+
+    async def _post_reconnect_catch_up(self) -> None:
+        """One-shot REST status poll triggered after every WS reconnect.
+
+        Hummingbot's tracker reconciles the result against in-flight orders
+        and emits ``OrderFilledEvent`` / ``OrderCancelledEvent`` for any
+        state change discovered. Idempotent: re-poll of an unchanged order
+        is a no-op for downstream consumers.
+        """
+        try:
+            n = len(self._connector.in_flight_orders) if hasattr(self._connector, "in_flight_orders") else 0
+            if n == 0:
+                return  # nothing to reconcile (cold connect)
+            self.logger().info(
+                f"[ws_catchup] post-reconnect REST status poll for "
+                f"{n} in-flight orders"
+            )
+            await self._connector._update_order_status()
+        except Exception as e:
+            # Never let the catch-up crash the listener loop.
+            self.logger().warning(
+                f"[ws_catchup] REST status poll failed: {type(e).__name__}: {e}"
+            )
 
     async def _get_ws_assistant(self) -> WSAssistant:
         if self._ws_assistant is None:

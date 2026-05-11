@@ -1367,9 +1367,9 @@ Após revisão por outra IA, fiz verificações adicionais no código do `XEMMEx
 **Verificação no código**: `XEMMExecutor` usa `OrderType.LIMIT` (linha 112 no order candidate, linha 218 no `place_order`). **Não usa `LIMIT_MAKER`**.
 **Risco real**: latência home (100–300ms) + book volátil → cálculo de `_maker_target_price` baseado em snapshot pode resultar em ordem que cruza o book na chegada à exchange. Resultado: 2× taker fee, ~10 bps a mais por fill — mata a economia.
 **Mitigação obrigatória v1** (escolher uma):
-1. **Subclasse `XEMMBRLExecutor(XEMMExecutor)`** que sobrescreve `place_maker_order()` para usar `OrderType.LIMIT_MAKER` (Binance) e validar `time_in_force=PostOnly` (Bybit). Custo: ~30 linhas.
+1. **Subclasse `XEMMLeadLagExecutor(XEMMExecutor)`** que sobrescreve `place_maker_order()` para usar `OrderType.LIMIT_MAKER` (Binance) e validar `time_in_force=PostOnly` (Bybit). Custo: ~30 linhas.
 2. **Buffer adicional no preço**: na controller, somar margem extra ao `target_profitability` proporcional ao spread local (ex: `effective_target = target + 0.5 * local_spread_bps / 10000`). Reduz risco de cruzamento mas não elimina.
-**Decisão**: escolher (1). Adicionar arquivo `hummingbot/strategy_v2/executors/xemm_executor/xemm_brl_executor.py` à estrutura. Atualizar `CreateExecutorAction` no controller para usar essa subclasse.
+**Decisão**: escolher (1). Adicionar arquivo `hummingbot/strategy_v2/executors/xemm_executor/xemm_lead_lag_executor.py` à estrutura. Atualizar `CreateExecutorAction` no controller para usar essa subclasse.
 **Critério de aceite**: log de cada `BuyOrderCreatedEvent`/`SellOrderCreatedEvent` deve mostrar `order_type == LIMIT_MAKER`. Qualquer ordem que executar como taker deve disparar pause.
 
 ### 15.3 Inventário por exchange — ACEITO
@@ -1624,12 +1624,12 @@ max_unhedged_time_ms: 3000
 | Arquivo | Mudanças |
 |---|---|
 | `lead_lag_signal.py` | +`fair_brl_fast`/`fair_brl_slow`; FeedHealth aceita `uid` opcional |
-| `xemm_brl_executor.py` (NOVO) | Subclasse de `XEMMExecutor` com `OrderType.LIMIT_MAKER` |
-| `xemm_lead_lag.py` | +Regime enum; +inventário por exchange; +warmup state; +HedgeMonitor; +circuit breakers; +taker book L1; usa `XEMMBRLExecutor` em vez de `XEMMExecutor` |
+| `xemm_lead_lag_executor.py` (NOVO) | Subclasse de `XEMMExecutor` com `OrderType.LIMIT_MAKER` |
+| `xemm_lead_lag.py` | +Regime enum; +inventário por exchange; +warmup state; +HedgeMonitor; +circuit breakers; +taker book L1; usa `XEMMLeadLagExecutor` em vez de `XEMMExecutor` |
 | `test_lead_lag_signal.py` | +Testes para `fair_brl_fast/slow`; +Testes para FeedHealth com uid |
 | `test_xemm_lead_lag.py` | Correção G1/G2; +C9–C12 (stop edge cases); +Testes para Regime states; +Testes para inventory por exchange gates |
 | `xemm_lead_lag_btc_brl.yml` | YAML em listas; novos campos; defaults conservadores; comentários de fees corrigidos |
-| `test_xemm_brl_executor.py` (NOVO) | Testes para garantir `OrderType.LIMIT_MAKER` no order candidate |
+| `test_xemm_lead_lag_executor.py` (NOVO) | Testes para garantir `OrderType.LIMIT_MAKER` no order candidate |
 
 ### 15.17 Crítica REJEITADA / RESSALVADA
 

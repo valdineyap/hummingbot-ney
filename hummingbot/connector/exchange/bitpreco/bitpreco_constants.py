@@ -29,11 +29,24 @@ SNAPSHOT_EVENT_TYPE = "depth"
 
 # Order States
 
+# BitPreco status values observed in production:
+#   OPEN     — resting on the book (no fills yet)
+#   FILLED   — fully executed
+#   CANCELED — fully canceled (no fills) OR canceled after partial fill
+#   EMPTY    — book entry not yet visible to status endpoint (treated as OPEN)
+#   PARTIAL  — partially executed AND still resting on the book
+#
+# When BitPreco returns ``status: "PARTIAL"`` together with ``canceled: "1"``,
+# the order is no longer on the book — the partial fill is what we got and the
+# remainder was cancelled. ``_request_order_status`` post-processes that case
+# and overrides the state to CANCELED so the tracker reaches a terminal state
+# and the executor can proceed with hedging the partial executed amount.
 ORDER_STATE = {
     "OPEN": OrderState.OPEN,
     "FILLED": OrderState.FILLED,
     "CANCELED": OrderState.CANCELED,
     "EMPTY": OrderState.OPEN,
+    "PARTIAL": OrderState.PARTIALLY_FILLED,
 }
 
 REQUEST_WEIGHT = "REQUEST_WEIGHT"

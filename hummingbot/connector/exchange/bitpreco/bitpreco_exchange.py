@@ -29,7 +29,19 @@ s_decimal_NaN = Decimal("nan")
 
 
 class BitprecoExchange(ExchangePyBase):
-    UPDATE_ORDER_STATUS_MIN_INTERVAL = 10.0
+    # ----- Polling cadence (Task 2.3) -----
+    # BitPreco's WS user-stream drops frequently (we measured ~46 disconnects
+    # in 80min on a single session). When the framework decides WS is healthy
+    # it polls every ``LONG_POLL_INTERVAL``; with the 120s default a fill that
+    # the WS misses can sit unhedged for two minutes before the connector
+    # notices. We tighten both intervals — the 100 req/s rate limit makes
+    # this trivially affordable at our order volume.
+    SHORT_POLL_INTERVAL = 3.0
+    LONG_POLL_INTERVAL = 30.0
+    # Minimum gap between two ``_update_order_status`` calls. Below this the
+    # connector skips the call and waits — a guard against frantic polling
+    # when both the user-stream listener and the status loop fire together.
+    UPDATE_ORDER_STATUS_MIN_INTERVAL = 5.0
 
     web_utils = web_utils
 
@@ -243,18 +255,53 @@ class BitprecoExchange(ExchangePyBase):
                            price: Decimal,
                            **kwargs) -> Tuple[str, float]:
         amount_str = f"{amount:f}"
+        market = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+
+        # MARKET BUY needs a non-zero price so that BitPreco can compute
+        # `volume = amount * price` and pass the `min_volume` check. The
+        # framework passes price=0 for MARKET orders, which causes the
+        # exchange to reject with BELOW_MINIMUM_VOLUME (observed in prod
+        # 2026-05-11 01:10:34 — auto_rebalance loop stuck for 6h because
+        # every MARKET BUY rebalance was rejected). We synthesize a
+        # price = best_ask * 1.01 — 1% slippage buffer — which the
+        # matching engine ignores for execution but uses for the volume
+        # check. Falls back to mid-price * 1.01 if best_ask unavailable.
+        # SELL MARKET doesn't need this: BitPreco accepts price=0 there
+        # because the volume is calculated from the bid side at fill time.
+        if (order_type is OrderType.MARKET
+                and trade_type is TradeType.BUY
+                and price <= 0):
+            try:
+                synthesized = self.get_price(trading_pair, True)
+                if synthesized is None or synthesized <= 0 or synthesized.is_nan():
+                    raise ValueError(f"get_price returned {synthesized!r}")
+                price = synthesized * Decimal("1.01")
+                self.logger().info(
+                    f"[market_buy_price] synthesized price={price:f} "
+                    f"(best_ask*1.01) for MARKET BUY {amount_str} {market} "
+                    f"— required by BitPreco min_volume check."
+                )
+            except Exception as e:
+                self.logger().error(
+                    f"[market_buy_price] failed to synthesize price for "
+                    f"MARKET BUY {amount_str} {market}: {type(e).__name__}: {e}. "
+                    f"BitPreco will likely reject as BELOW_MINIMUM_VOLUME."
+                )
+
         # BitPreco rejects fractional prices for BTC-BRL. We must send integer
         # BRL prices, with SIDE-AWARE rounding to keep LIMIT_MAKER intent:
         #   BUY  → floor (stays below the ask, won't cross)
         #   SELL → ceil  (stays above the bid, won't cross)
         # Without this, BitPreco would silently round (typically up), which
         # could flip a LIMIT_MAKER BUY into a taker fill and drain inventory.
+        # For MARKET BUY (with synthesized price above) we ROUND_UP instead
+        # so the synthesized price stays >= best_ask*1.01 after rounding.
         # Only applied to BTC-BRL where the integer-price rule is confirmed;
         # other pairs keep the price as-is for now.
-        market = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
         if market.upper() in ("BTC-BRL", "BTCBRL"):
             if trade_type is TradeType.BUY:
-                price_to_send = price.quantize(Decimal("1"), rounding="ROUND_DOWN")
+                rounding = "ROUND_UP" if order_type is OrderType.MARKET else "ROUND_DOWN"
+                price_to_send = price.quantize(Decimal("1"), rounding=rounding)
             else:
                 price_to_send = price.quantize(Decimal("1"), rounding="ROUND_UP")
         else:
@@ -345,17 +392,34 @@ class BitprecoExchange(ExchangePyBase):
         exchange_order_id = tracked_order.exchange_order_id
 
         # Guard: if the order is still in PENDING_CREATE, exchange_order_id is
-        # None. Sending None to BitPreco returns INVALID_ORDER_ID (not a real
-        # error — the cancel just arrived before the creation response). Return
-        # False so the framework retries on the next cycle; the executor's
-        # _cancel_sent_with_id flag ensures a retry is issued once the real
-        # exchange_order_id is available.
+        # None. Sending None to BitPreco returns INVALID_ORDER_ID. Production
+        # logs (May 2026) show the create REST response typically lands in
+        # 500–700 ms after the cancel intent, so we briefly poll the tracked
+        # order for the id rather than bouncing the cancel back to the
+        # framework. This collapses the cancel-after-create race into a
+        # single self-resolving call and avoids orphan windows where the
+        # framework's outer retry cadence is slower than the create latency.
         if not exchange_order_id:
-            self.logger().warning(
-                f"_place_cancel: order_id={order_id} has no exchange_order_id yet "
-                f"(still PENDING_CREATE) — skipping API call, returning False for retry."
+            # Up to ~1.5s of polling at 100ms — covers the BitPreco p99 create
+            # latency we've measured. We deliberately do not block forever: if
+            # the create truly failed, returning False keeps the strategy in a
+            # known state.
+            for _attempt in range(15):
+                await asyncio.sleep(0.1)
+                exchange_order_id = tracked_order.exchange_order_id
+                if exchange_order_id:
+                    break
+            if not exchange_order_id:
+                self.logger().warning(
+                    f"_place_cancel: order_id={order_id} still has no exchange_order_id "
+                    f"after 1.5s wait (PENDING_CREATE timed out) — returning False for "
+                    f"framework retry."
+                )
+                return False
+            self.logger().info(
+                f"_place_cancel: order_id={order_id} resolved exchange_order_id="
+                f"{exchange_order_id} after PENDING_CREATE wait — proceeding with cancel."
             )
-            return False
 
         data = {
             "cmd": CONSTANTS.CMD_CANCEL_ORDER,
@@ -366,20 +430,35 @@ class BitprecoExchange(ExchangePyBase):
         #   {success: true,  message_cod: "ORDER_CANCELED"}      → confirmed cancelled
         #   {success: false, message_cod: "ORDER_NOT_FOUND"}     → already gone (treat as success)
         #   {success: false, message_cod: "RATE_LIMIT_EXCEEDED"} → retry
+        #   {success: false, message_cod: "INVALID_ORDER_ID"}    → race: order just created,
+        #                                                          BitPreco DB still indexing
         #   {success: false, message_cod: "INVALID_TOKEN"/...}   → don't retry, log error
         # Anything else with success=true that doesn't say ORDER_CANCELED is
         # ambiguous — log it loudly and treat as not-cancelled (framework will
         # retry on its next cancel cycle).
-        # INVALID_ORDER_ID is included here only because the early-exit guard
-        # above ensures we never call the API with exchange_order_id=None.
-        # So the only remaining cause for INVALID_ORDER_ID is: the order was
-        # already cancelled/filled by another code path (orphan_check, manual
-        # cancel from the UI, or a parallel cancel that won the race). Treat
-        # as gone — the framework just needs to know the order is no longer
-        # active. Returning True here also avoids the noisy ERROR log spam.
+        #
+        # INVALID_ORDER_ID handling — important subtlety:
+        # We previously treated INVALID_ORDER_ID as "gone" (a cousin of
+        # ORDER_NOT_FOUND). That assumption was wrong: production logs show
+        # BitPreco can also return INVALID_ORDER_ID for a freshly-created
+        # order whose ``exchange_order_id`` is known to us (we got it from
+        # the create response) but whose lookup-by-id record is not yet
+        # visible to the cancel endpoint. Treating that race as "gone" caused
+        # the local tracker to mark the order CANCELED while it was still
+        # alive on the exchange — exactly the orphan situation orphan_check
+        # then had to clean up (~500ms-3s window of mismatch). Move it to
+        # TRANSIENT so the connector's internal retry (3 × 0.5s backoff ≈ 3s)
+        # gives BitPreco time to index the order before we declare it gone.
+        # ``CANT_CANCEL_FILLED_ORDER`` is the exchange's explicit code for
+        # "the order matched right before your cancel arrived". Semantically
+        # identical to ORDER_FILLED for cancel-confirmation purposes — the
+        # order is no longer cancelable because it's gone (filled). Treating
+        # it as GONE avoids noisy ERROR logs and saves the framework a retry
+        # cycle. The fill propagates separately through OrderFilledEvent.
         GONE_CODES = {"ORDER_CANCELED", "ORDER_NOT_FOUND", "ORDER_ALREADY_CANCELED",
-                      "ORDER_FILLED", "ORDER_ALREADY_FILLED", "INVALID_ORDER_ID"}
-        TRANSIENT_CODES = {"RATE_LIMIT_EXCEEDED"}
+                      "ORDER_FILLED", "ORDER_ALREADY_FILLED",
+                      "CANT_CANCEL_FILLED_ORDER"}
+        TRANSIENT_CODES = {"RATE_LIMIT_EXCEEDED", "INVALID_ORDER_ID"}
         max_attempts = 3
         backoff_sec = 0.5
         last_response = None
@@ -793,6 +872,22 @@ class BitprecoExchange(ExchangePyBase):
                 f"order={order} — preserving tracker state {tracked_order.current_state.name}"
             )
             new_state = tracked_order.current_state
+
+        # BitPreco signals a partial-fill-then-cancel as
+        # ``status: "PARTIAL"`` + ``canceled: "1"``. Without this override the
+        # order would remain in PARTIALLY_FILLED forever (non-terminal),
+        # blocking the executor from completing its lifecycle. The partial
+        # ``exec_amount`` is independently captured by
+        # ``_all_trade_updates_for_order`` so this state change does not lose
+        # fill information — it only ensures the tracker reaches CANCELED.
+        canceled_flag = order.get("canceled") if isinstance(order, dict) else None
+        if str(canceled_flag) == "1" and new_state in (
+                OrderState.PARTIALLY_FILLED, OrderState.OPEN, OrderState.PENDING_CANCEL):
+            self.logger().info(
+                f"BitPreco order {tracked_order.exchange_order_id} reported "
+                f"status={order_status} canceled=1; coercing tracker state to CANCELED."
+            )
+            new_state = OrderState.CANCELED
 
         return OrderUpdate(
             client_order_id=tracked_order.client_order_id,

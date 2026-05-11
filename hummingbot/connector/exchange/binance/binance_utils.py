@@ -10,8 +10,11 @@ CENTRALIZED = True
 EXAMPLE_PAIR = "ZRX-ETH"
 
 DEFAULT_FEES = TradeFeeSchema(
-    maker_percent_fee_decimal=Decimal("0.001"),
-    taker_percent_fee_decimal=Decimal("0.001"),
+    # Conta VIP4: 3 bps maker / 4 bps taker.
+    # `_update_trading_fees` no binance_exchange.py é no-op, então o conector
+    # usa este DEFAULT_FEES estático — atualizar aqui se o tier mudar.
+    maker_percent_fee_decimal=Decimal("0.0003"),
+    taker_percent_fee_decimal=Decimal("0.0004"),
     buy_percent_fee_deducted_from_returns=True
 )
 

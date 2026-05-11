@@ -21,7 +21,7 @@ import os
 import signal
 import sys
 import time
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from enum import Enum
 from typing import Any, Dict, List, Literal, Optional, Set, Tuple
@@ -30,6 +30,8 @@ from pydantic import BaseModel, ConfigDict, Field, field_validator, model_valida
 
 from hummingbot.connector.utils import split_hb_trading_pair
 from hummingbot.core.data_type.common import MarketDict, OrderType, PriceType, TradeType
+from hummingbot.core.event.event_forwarder import SourceInfoEventForwarder
+from hummingbot.core.event.events import MarketEvent
 from hummingbot.strategy_v2.controllers.controller_base import (
     ControllerBase,
     ControllerConfigBase,
@@ -193,8 +195,17 @@ class XEMMLeadLagConfig(ControllerConfigBase):
     # maker and taker exchanges. basis_bps > 0 (maker above taker) favours SELL.
     # Strength is in absolute Decimal applied per bp of basis. Set 0 to disable.
     basis_skew_strength: Decimal = Field(default=Decimal("0.00002"))
-    min_taker_base_for_sell_hedge: Decimal = Field(default=Decimal("0.0005"))
-    min_taker_quote_for_buy_hedge: Decimal = Field(default=Decimal("200"))
+    # Taker-side balance gate as a fraction of the maker order's hedge cost.
+    #   Required taker balance = order_amount * taker_mid * (1 + taker_hedge_buffer_pct)
+    # Examples (order ≈ 78 BRL):
+    #   0.01  → 1% buffer (covers fee + slippage on a single hedge)  ≈ 78.78 BRL needed
+    #   1.01  → buffer of one extra order + 1% (covers two consecutive fills before
+    #           any opposite-side BUY hedge replenishes the balance)
+    #   2.01  → buffer of two extra orders + 1% (three consecutive fills)
+    # This scales automatically with order_amount and price; replaces the previous
+    # absolute thresholds (min_taker_base_for_sell_hedge / min_taker_quote_for_buy_hedge)
+    # which had to be retuned every time order_amount or price moved.
+    taker_hedge_buffer_pct: Decimal = Field(default=Decimal("0.01"))
 
     # === Warmup ===
     warmup_seconds: float = Field(default=20.0)
@@ -408,6 +419,81 @@ class TradeLedger:
             return v.value if isinstance(v.value, (str, int, float)) else str(v.value)
         return v
 
+    def record_raw_fill(self, event, source_connector: str) -> None:
+        """Persist an individual ``OrderFilledEvent`` as a fine-grained record.
+
+        This complements ``record_fill`` (which aggregates at executor close).
+        Raw fills are written immediately as the connector emits them, so the
+        ledger captures fills even when:
+
+          * the order is partial-filled then cancelled (executor never closes
+            with ``filled_amount_quote > 0`` because the partial flowed
+            through ``_all_trade_updates_for_order`` outside the executor's
+            sync path);
+          * the fill arrives via a ``MARKET`` rebalance order placed by
+            ``inventory_audit`` (no executor at all);
+          * the executor's poll-based detection misses the ``is_done``
+            transition due to a race with the controller tick.
+
+        Records are tagged with ``kind: "fill"`` so they're easy to
+        distinguish from ``kind: "trade"`` (the executor-level summary).
+        ``state.json`` is rewritten on every raw fill — the snapshot's
+        ``last_trade`` always reflects the most recent activity.
+        """
+        try:
+            amount = Decimal(str(getattr(event, "amount", 0)))
+            if amount == 0:
+                return  # nothing to record
+
+            price = Decimal(str(getattr(event, "price", 0)))
+            quote_amount = amount * price
+
+            today = self._utc_today()
+            if today != self._today:
+                self._today = today
+                self._pnl_today = Decimal("0")
+                self._trades_today = 0
+
+            self._seq += 1
+            # We do not have realised PnL on a per-fill basis (that is only
+            # known once the maker+taker pair completes). Counters reflect
+            # fill volume, not net PnL — see ``record_fill`` for PnL totals.
+
+            trade_type = getattr(event, "trade_type", None)
+            if hasattr(trade_type, "name"):
+                trade_type = trade_type.name
+            order_type = getattr(event, "order_type", None)
+            if hasattr(order_type, "name"):
+                order_type = order_type.name
+
+            record = {
+                "ts": self._iso_now(),
+                "seq": self._seq,
+                "kind": "fill",
+                "source_connector": source_connector,
+                "trading_pair": getattr(event, "trading_pair", None),
+                "side": trade_type,
+                "order_type": order_type,
+                "client_order_id": getattr(event, "order_id", None),
+                "exchange_order_id": getattr(event, "exchange_order_id", None),
+                "exchange_trade_id": getattr(event, "exchange_trade_id", None),
+                "fill_price": self._to_jsonable(price),
+                "fill_amount_base": self._to_jsonable(amount),
+                "fill_amount_quote": self._to_jsonable(quote_amount),
+                "quote_asset": self._quote,
+            }
+            self._append_jsonl(record)
+            self._write_state(record)
+            self._touch()
+        except Exception as e:
+            try:
+                import logging
+                logging.getLogger(__name__).error(
+                    f"[trade_ledger] failed to record raw fill: {type(e).__name__}: {e}"
+                )
+            except Exception:
+                pass
+
     def record_fill(self, ex) -> None:
         """Persist a completed executor as a trade record.
 
@@ -440,9 +526,48 @@ class TradeLedger:
             if hasattr(side, "name"):  # TradeType enum
                 side = side.name
 
+            # Task 4.3: compute slippage_bps from the expected vs realised
+            # taker price. ``taker_expected_price`` is the ``_taker_result_price``
+            # at hedge placement; ``filled_amount_quote / order_amount`` ≈ avg
+            # taker fill price for a MARKET order. We treat slippage as
+            # negative when the taker filled WORSE than expected (paying more
+            # to BUY or receiving less for SELL).
+            slippage_bps = None
+            taker_expected = ci.get("taker_expected_price")
+            order_amount = ci.get("order_amount")
+            try:
+                if (taker_expected is not None and order_amount
+                        and Decimal(str(taker_expected)) > 0
+                        and Decimal(str(order_amount)) > 0):
+                    expected = Decimal(str(taker_expected))
+                    # Best-effort actual: filled_amount_quote / order_amount
+                    # gives the average taker fill price when the executor
+                    # fully hedged. For partial fills this is still a good
+                    # proxy because the taker MARKET runs against the same
+                    # book level for similar sizes.
+                    actual = Decimal(str(filled)) / Decimal(str(order_amount))
+                    # ``side`` here is the maker side. Taker side is the
+                    # opposite — if maker is BUY we expected a taker SELL,
+                    # so worse-than-expected means actual < expected.
+                    if side == "BUY":
+                        # Maker BUY → taker SELL: lower actual price = worse
+                        slippage_bps = float(
+                            (actual - expected) / expected * Decimal("10000")
+                        )
+                    else:
+                        # Maker SELL → taker BUY: higher actual price = worse
+                        slippage_bps = float(
+                            (expected - actual) / expected * Decimal("10000")
+                        )
+                    # Round to 2 decimals — bps with sub-bps precision is noise.
+                    slippage_bps = round(slippage_bps, 2)
+            except Exception:
+                slippage_bps = None  # don't let a math edge-case fail the record
+
             record = {
                 "ts": self._iso_now(),
                 "seq": self._seq,
+                "kind": "trade",
                 "executor_id": getattr(ex, "id", None),
                 "side": side,
                 "trading_pair": ci.get("maker_trading_pair") or getattr(ex, "trading_pair", None),
@@ -454,6 +579,10 @@ class TradeLedger:
                 "close_type": self._to_jsonable(getattr(ex, "close_type", None)),
                 "close_timestamp": getattr(ex, "close_timestamp", None),
                 "quote_asset": self._quote,
+                # Task 3.4 + 4.3: latency and slippage telemetry
+                "fill_to_hedge_latency_ms": ci.get("fill_to_hedge_latency_ms"),
+                "taker_expected_price": self._to_jsonable(taker_expected),
+                "slippage_bps": slippage_bps,
             }
             self._append_jsonl(record)
             self._write_state(record)
@@ -551,6 +680,7 @@ class XEMMLeadLagController(ControllerBase):
 
         self._started_at: Optional[float] = None
         self._last_action_time: float = 0.0
+        self._last_balance_warn_ts: float = 0.0
         self._last_cancel_reason: Optional[str] = None
         self._consecutive_hedge_failures: int = 0
         self._daily_realized_pnl: Decimal = Decimal("0")
@@ -606,6 +736,15 @@ class XEMMLeadLagController(ControllerBase):
         self._rebalance_last_time: Dict[str, float] = {}
         # Minimum seconds between rebalance orders for the same asset.
         self._rebalance_cooldown_sec: float = 120.0
+        # Circuit-breaker: count consecutive audit cycles in which the same
+        # asset remained in drift WITHOUT being resolved by rebalance. If it
+        # reaches the threshold the kill switch trips — a stuck rebalance
+        # loop (e.g. BELOW_MINIMUM_VOLUME on every retry) otherwise burns
+        # rate-limit and consumes the log forever. Observed in prod 2026-05-11
+        # 01:10 — bot looped for 6h on the same BELOW_MINIMUM_VOLUME rejection.
+        # Reset on first audit that finds the asset within tolerance.
+        self._drift_consecutive_audits: Dict[str, int] = {}
+        self._drift_max_consecutive_audits: int = 30
 
         # === Orphan order reconciliation ===
         # Periodic check (every _orphan_check_interval_sec) that compares the
@@ -614,6 +753,10 @@ class XEMMLeadLagController(ControllerBase):
         # an orphan and gets cancelled immediately. Acts as a safety net for
         # races between cancel/place cycles or unconfirmed cancels.
         self._last_orphan_check_time: float = 0.0
+        # Throttle: log orphan_check only when state changes or every 60s for
+        # liveness. Saves ~50 lines/min when the system is idle.
+        self._last_orphan_log_signature: Optional[tuple] = None
+        self._last_orphan_log_ts: float = 0.0
         # Tightened from 30s → 10s to shrink the worst-case exposure window
         # when the executor's throttled cancel retries fail to clear an order.
         # Combined with the executor retry every 3s, this gives 3 retry
@@ -647,6 +790,40 @@ class XEMMLeadLagController(ControllerBase):
     # ------------------------------------------------------------------ #
     # Startup / shutdown helpers                                        #
     # ------------------------------------------------------------------ #
+    def _attach_ledger_fill_listeners(self) -> None:
+        """Subscribe ``TradeLedger.record_raw_fill`` to OrderFilled events
+        on both maker and taker connectors.
+
+        We hold a reference to the forwarders on ``self`` so they survive the
+        method scope (Hummingbot listeners are weak-referenced via the
+        connector's internal event-emitter book-keeping). One forwarder per
+        connector keeps the source labelling clean.
+        """
+        self._ledger_fill_forwarders = {}
+        for conn_name in (self.config.maker_connector, self.config.taker_connector):
+            if not conn_name:
+                continue
+            try:
+                conn = self.market_data_provider.get_connector(conn_name)
+            except Exception:
+                continue
+            # Bind the connector name into the forwarded callback so the
+            # ledger record knows which exchange the fill came from.
+            # SourceInfoEventForwarder calls back with
+            # (event_tag, event_caller, event); we only need ``event``.
+            forwarder = SourceInfoEventForwarder(
+                lambda _tag, _caller, event, _src=conn_name: (
+                    self._trade_ledger.record_raw_fill(event, source_connector=_src)
+                    if self._trade_ledger is not None else None
+                )
+            )
+            conn.add_listener(MarketEvent.OrderFilled, forwarder)
+            self._ledger_fill_forwarders[conn_name] = forwarder
+        self.logger().info(
+            f"[trade_ledger] attached OrderFilled listeners on "
+            f"{list(self._ledger_fill_forwarders.keys())}"
+        )
+
     async def _cancel_all_open_orders_on_startup(self) -> None:
         """
         Cancel ALL open orders on maker and taker exchanges via direct REST API.
@@ -985,18 +1162,35 @@ class XEMMLeadLagController(ControllerBase):
                 ids.add(str(xid))
         return ids
 
-    @staticmethod
-    def _parse_bitpreco_timestamp(value: Any) -> Optional[float]:
+    # BitPreco's REST API returns ``time_stamp`` strings in America/Sao_Paulo
+    # (UTC-3) without an explicit offset — confirmed empirically against
+    # OrderCreatedEvent log timestamps. ``datetime.strptime`` produces a naive
+    # datetime; ``naive.timestamp()`` then interprets it as the host's *local*
+    # time. On a UTC host (typical Linux server) that meant we treated a fresh
+    # order as having been placed 3 hours ago, breezing past the 3s ``min_age``
+    # filter and cancelling it as a phantom orphan within the first ~60ms of
+    # life. Production logs show this hit ~3 orders/h. We fix by attaching the
+    # explicit BitPreco offset before computing the epoch.
+    BITPRECO_TZ = timezone(timedelta(hours=-3))
+
+    @classmethod
+    def _parse_bitpreco_timestamp(cls, value: Any) -> Optional[float]:
         """
-        BitPreco's open_orders entries carry a `time_stamp` field formatted as
-        "YYYY-MM-DD HH:MM:SS" (UTC). Returns the epoch seconds, or None if the
-        field is missing/unparseable. We use this to apply a minimum-age filter
-        to orphan candidates so we don't race with in-flight placements.
+        BitPreco's open_orders entries carry a ``time_stamp`` field formatted
+        as ``"YYYY-MM-DD HH:MM:SS"`` in **America/Sao_Paulo (UTC-3)**, with no
+        explicit offset. We attach the offset before calling ``.timestamp()``
+        so the resulting epoch is correct regardless of the host timezone.
+
+        Returns the epoch seconds, or None if the field is missing /
+        unparseable. Used by the orphan-check min-age filter so we don't race
+        with in-flight placements.
         """
         if not value:
             return None
         try:
-            return datetime.strptime(str(value), "%Y-%m-%d %H:%M:%S").timestamp()
+            naive = datetime.strptime(str(value), "%Y-%m-%d %H:%M:%S")
+            aware = naive.replace(tzinfo=cls.BITPRECO_TZ)
+            return aware.timestamp()
         except (TypeError, ValueError):
             return None
 
@@ -1076,19 +1270,57 @@ class XEMMLeadLagController(ControllerBase):
                 continue
             orphans.append(eid)
 
-        # Heartbeat — gives a clear picture of the racing-aware reconciliation.
-        self.logger().info(
-            f"[orphan_check] tracker_before={len(tracked_before)} "
-            f"tracker_after={len(tracked_after)} "
-            f"exchange_open={len(exchange_entries)} "
-            f"orphans={len(orphans)} skipped_young={skipped_too_young} "
-            f"(interval={self._orphan_check_interval_sec}s, min_age={self._orphan_min_age_sec}s)"
+        # Task 4.2: detect the *inverse* direction — orders the tracker still
+        # holds but the exchange no longer has open. This means the order was
+        # filled or cancelled at the exchange but the WS update never made it
+        # to the tracker (the reason fills/cancels arrive "did not arrive on
+        # time"). Trigger a one-shot REST status poll to reconcile so the
+        # executor's lifecycle isn't stuck waiting for an event that never
+        # comes. We compute this on ``tracked_after ∩ tracked_before`` to
+        # avoid flapping during the API round-trip.
+        exchange_id_set = {eid for eid, _ts in exchange_entries}
+        tracker_only = (tracked_after & tracked_before) - exchange_id_set
+
+        # Throttled heartbeat: only log when state changes vs last log, or
+        # every 60s so the line still appears in long idle stretches.
+        sig = (
+            len(tracked_before), len(tracked_after), len(exchange_entries),
+            len(orphans), skipped_too_young, len(tracker_only),
         )
+        if sig != self._last_orphan_log_signature or (now - self._last_orphan_log_ts) >= 60.0:
+            self._last_orphan_log_signature = sig
+            self._last_orphan_log_ts = now
+            self.logger().info(
+                f"[orphan_check] tracker_before={len(tracked_before)} "
+                f"tracker_after={len(tracked_after)} "
+                f"exchange_open={len(exchange_entries)} "
+                f"orphans={len(orphans)} skipped_young={skipped_too_young} "
+                f"tracker_only={len(tracker_only)} "
+                f"(interval={self._orphan_check_interval_sec}s, min_age={self._orphan_min_age_sec}s)"
+            )
 
         for orphan_id in orphans:
             ok = await self._bitpreco_cancel_one_orphan(connector, orphan_id)
             if ok:
                 self._orphans_cancelled_total += 1
+
+        # If we found tracker-only entries, trigger a single REST status poll.
+        # The connector reconciles each in-flight order against REST and
+        # emits OrderFilledEvent / OrderCancelledEvent for any state change
+        # discovered. We don't loop per-id — one ``_update_order_status``
+        # call covers all in-flight orders and is rate-limit-cheap.
+        if tracker_only:
+            try:
+                self.logger().info(
+                    f"[reconcile] {len(tracker_only)} tracker-only orders "
+                    f"({sorted(tracker_only)[:3]}{'...' if len(tracker_only) > 3 else ''}) — "
+                    f"triggering connector REST status poll to reconcile."
+                )
+                await connector._update_order_status()
+            except Exception as e:
+                self.logger().warning(
+                    f"[reconcile] REST status poll failed: {type(e).__name__}: {e}"
+                )
 
     # ------------------------------------------------------------------ #
     # Graceful shutdown (SIGTERM / SIGINT)                              #
@@ -1279,6 +1511,8 @@ class XEMMLeadLagController(ControllerBase):
             }
 
             if within:
+                # Drift resolved → reset circuit-breaker counter.
+                self._drift_consecutive_audits[asset] = 0
                 continue
 
             # Drift detected — defer if a legitimate trade can explain it
@@ -1289,6 +1523,24 @@ class XEMMLeadLagController(ControllerBase):
                     f"actual={actual}, tolerance={tolerance_abs})"
                 )
                 continue
+
+            # Circuit-breaker: count consecutive audits with unresolved drift
+            # for this asset. If rebalance keeps failing (BELOW_MINIMUM_VOLUME
+            # in prod 2026-05-11), drift persists across many audits — at the
+            # threshold we trip the kill switch instead of looping forever.
+            stuck_count = self._drift_consecutive_audits.get(asset, 0) + 1
+            self._drift_consecutive_audits[asset] = stuck_count
+            if stuck_count >= self._drift_max_consecutive_audits:
+                if self._kill_reason is None:
+                    self._kill_reason = f"DRIFT_STUCK_{asset}_{stuck_count}_audits"
+                self.logger().critical(
+                    f"[audit/{source}] {asset} drift unresolved for "
+                    f"{stuck_count} consecutive audits "
+                    f"(~{stuck_count * cfg.audit_interval_sec:.0f}s) — "
+                    f"tripping kill switch (KILL_REASON={self._kill_reason}). "
+                    f"Likely cause: rebalance MARKET order keeps failing — "
+                    f"check connector WARN/ERROR logs for the asset's pair."
+                )
 
             any_drift = True
             self.logger().critical(
@@ -1465,6 +1717,41 @@ class XEMMLeadLagController(ControllerBase):
                     f"[rebalance] Could not validate trading rules for {conn_name}/{pair}: {e}"
                 )
 
+            # Quantize amount to the exchange's LOT_SIZE BEFORE placement.
+            # Without this the connector silently rounds down (e.g. Binance
+            # BTC-BRL has min_base_amount_increment=0.00001 BTC, so a queued
+            # rebalance of 0.00018995 BTC gets executed as 0.00018000 — losing
+            # 0.00000995 BTC which then re-triggers the audit next cycle and
+            # creates a drift-rebalance loop. Observed in prod 2026-05-10 23:14
+            # log line 12690-12691. We quantize here so the loss is visible
+            # and intentional; if the truncation drops below min_order_size,
+            # we skip rebalance and accept the residual drift (the next
+            # natural fill will absorb it).
+            try:
+                amount_q = connector.quantize_order_amount(pair, amount)
+                if amount_q != amount:
+                    self.logger().info(
+                        f"[rebalance] {asset} amount quantized: "
+                        f"{amount:.8f} → {amount_q:.8f} on {conn_name} "
+                        f"(LOT_SIZE truncation; residual "
+                        f"{amount - amount_q:+.8f} stays as drift)"
+                    )
+                if amount_q <= 0:
+                    self.logger().warning(
+                        f"[rebalance] {asset} quantized amount is 0 — below "
+                        f"LOT_SIZE for {conn_name}. Skipping rebalance; "
+                        f"residual drift {amount:.8f} accepted (will absorb "
+                        f"into next natural fill)."
+                    )
+                    continue
+                amount = amount_q
+            except Exception as e:
+                self.logger().warning(
+                    f"[rebalance] quantize_order_amount failed for "
+                    f"{conn_name}/{pair}: {type(e).__name__}: {e} — "
+                    f"proceeding with unquantized {amount:.8f}."
+                )
+
             # Place MARKET order
             try:
                 if is_sell:
@@ -1606,6 +1893,22 @@ class XEMMLeadLagController(ControllerBase):
             # Don't skip the rest of the tick — allow processed_data to be built
             # so the strategy doesn't appear stalled during the brief startup window.
 
+        # === Attach OrderFilledEvent listeners (once connectors ready) ===
+        # See ``TradeLedger.record_raw_fill`` for the rationale: executor-level
+        # fill detection misses partial-fill-then-cancel and rebalance MARKETs.
+        # We subscribe directly to ``MarketEvent.OrderFilled`` on each connector
+        # so every fill (regardless of the order's origin) lands in the ledger
+        # in real time. Idempotent — guarded by ``_ledger_listeners_attached``.
+        if not getattr(self, "_ledger_listeners_attached", False):
+            try:
+                if self._trade_ledger is not None:
+                    self._attach_ledger_fill_listeners()
+                    self._ledger_listeners_attached = True
+            except Exception as e:
+                self.logger().warning(
+                    f"[trade_ledger] failed to attach fill listeners: {e}"
+                )
+
         # === Detect newly-completed executors (fills) ===
         # Tracks executor `is_done` transitions to:
         #   1. Bump _balance_version (so fingerprint correctly invalidates)
@@ -1614,19 +1917,39 @@ class XEMMLeadLagController(ControllerBase):
         for ex in self.executors_info:
             if ex.is_done and ex.id not in self._known_done_executor_ids:
                 self._known_done_executor_ids.add(ex.id)
-                # Only treat as a fill if the executor actually traded.
-                # filled_amount_quote may not exist on all ExecutorInfo variants;
-                # fall back to net_pnl_quote != 0 as a coarse "did something" signal.
-                filled = getattr(ex, "filled_amount_quote", None)
-                if filled is None:
-                    filled = getattr(ex, "net_pnl_quote", Decimal("0")) or Decimal("0")
-                if filled and filled != 0:
+                # Detect "did this executor actually trade?" using multiple
+                # signals because `filled_amount_quote` is hardcoded to 0 on
+                # the ExecutorBase (and XEMMExecutor doesn't override it).
+                # Observed in prod 2026-05-11 09:34:48 — a clean XEMM
+                # round-trip (BitPreco maker BUY 0.0001999 + Binance taker
+                # SELL 0.0002) reported filled_amount_quote=0, net_pnl_quote=0
+                # (price diff was tiny + zero BitPreco fees), so the old
+                # check skipped setting `_last_fill_time` — and the audit
+                # fired auto_rebalance 9s later thinking the bot was idle.
+                # Robust fallback: ALSO trust `cum_fees_quote != 0` (Binance
+                # taker always pays a fee) and `is_trading at any prior
+                # point` via the executor's filled flags.
+                filled_quote = getattr(ex, "filled_amount_quote", None) or Decimal("0")
+                net_pnl = getattr(ex, "net_pnl_quote", None) or Decimal("0")
+                cum_fees = getattr(ex, "cum_fees_quote", None) or Decimal("0")
+                # Trade-fingerprint: any of these being non-zero proves a
+                # real fill happened. XEMM with taker hedge ALWAYS pays
+                # cum_fees on the taker leg, so this is the most reliable
+                # signal for our setup.
+                did_trade = bool(filled_quote) or bool(net_pnl) or bool(cum_fees)
+                if did_trade:
                     self._last_fill_time = time.time()
                     self._balance_version += 1
                     # Persist to the trade ledger (trades.jsonl + state.json +
                     # last_fill.touch). Never let ledger I/O block the loop.
                     if self._trade_ledger is not None:
                         self._trade_ledger.record_fill(ex)
+                    self.logger().info(
+                        f"[fill_detected] executor {ex.id} done "
+                        f"filled_quote={filled_quote} net_pnl={net_pnl} "
+                        f"cum_fees={cum_fees} → _last_fill_time updated "
+                        f"(10s audit-suppression window started)"
+                    )
 
         # === Initial inventory audit (Solution C: boot-paused mode) ===
         # Once startup cleanup has confirmed 0 orphan orders, run the audit
@@ -2022,28 +2345,43 @@ class XEMMLeadLagController(ControllerBase):
         target_buy: Decimal = pd["target_prof_buy"]
         target_sell: Decimal = pd["target_prof_sell"]
 
-        # Per-exchange balance gates
-        # BUY maker on Bybit → SELL taker hedge on Binance → needs taker BASE
-        # SELL maker on Bybit → BUY taker hedge on Binance → needs taker QUOTE
+        # Per-exchange balance gates (percent-buffer model — see config doc).
+        # BUY maker → SELL taker hedge → needs taker BASE >= order_amount * (1 + buf)
+        # SELL maker → BUY  taker hedge → needs taker QUOTE >= order_amount * mid * (1 + buf)
         taker_base = pd["taker_base"]
         taker_quote = pd["taker_quote"]
+        taker_mid = pd["taker_local_mid"]
+        order_amt = self.config.order_amount
+        buf_mul = Decimal("1") + self.config.taker_hedge_buffer_pct
+        min_base_required = order_amt * buf_mul
+        min_quote_required = order_amt * taker_mid * buf_mul if taker_mid > 0 else Decimal("0")
 
+        _warn_balance = False
         if len(active_buys) == 0:
-            if taker_base >= self.config.min_taker_base_for_sell_hedge:
+            if taker_base >= min_base_required:
                 actions.append(self._make_create_action(TradeType.BUY, target_buy, now))
             else:
-                self.logger().info(
-                    f"Skipping BUY maker creation: taker_base ({taker_base}) "
-                    f"< min ({self.config.min_taker_base_for_sell_hedge})."
-                )
+                _warn_balance = True
 
         if len(active_sells) == 0:
-            if taker_quote >= self.config.min_taker_quote_for_buy_hedge:
+            if min_quote_required > 0 and taker_quote >= min_quote_required:
                 actions.append(self._make_create_action(TradeType.SELL, target_sell, now))
             else:
-                self.logger().info(
-                    f"Skipping SELL maker creation: taker_quote ({taker_quote}) "
-                    f"< min ({self.config.min_taker_quote_for_buy_hedge})."
+                _warn_balance = True
+
+        if _warn_balance and (now - self._last_balance_warn_ts) >= 60.0:
+            self._last_balance_warn_ts = now
+            if taker_base < min_base_required:
+                self.logger().warning(
+                    f"[balance_gate] BUY side paused: taker_base ({taker_base}) "
+                    f"< required ({min_base_required:.8f}) "
+                    f"= order_amount × (1 + {self.config.taker_hedge_buffer_pct})"
+                )
+            if min_quote_required > 0 and taker_quote < min_quote_required:
+                self.logger().warning(
+                    f"[balance_gate] SELL side paused: taker_quote ({taker_quote}) "
+                    f"< required ({min_quote_required:.4f}) "
+                    f"= order_amount × taker_mid × (1 + {self.config.taker_hedge_buffer_pct})"
                 )
 
         if actions:

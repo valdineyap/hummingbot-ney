@@ -1,265 +1,245 @@
-# XEMM BRL Market Making — Development Status
+# XEMM Lead-Lag — Development Status
 
-**Branch**: `claude/hummingbot-brl-market-making-iuE1Z`
-**Strategy**: XEMM (Cross-Exchange Market Making) for BTC-BRL with synthetic lead-lag signal
-**As of**: 2026-04-30
-
----
-
-## What was implemented
-
-### Chunk 1 — `LeadLagSignalProvider` (DONE ✓)
-
-**File**: `hummingbot/strategy_v2/utils/lead_lag_signal.py`
-**Tests**: `test/hummingbot/strategy_v2/utils/test_lead_lag_signal.py` — **48 tests, all passing**
-**Commit**: `ef0cd828`
-
-Pure Python module (zero Hummingbot dependencies). Key classes:
-- `CircularPriceBuffer` — FIFO price buffer with time-based eviction
-- `EMAFilter` — exponential moving average for FX smoothing
-- `FeedHealth` — staleness detection with optional `last_diff_uid` for real WS hang detection
-- `SignalQuality` enum — OK / DEGRADED_FX / DEGRADED_LEADER / DEGRADED_LOCAL / BAD
-- `LeadLagSignalProvider` — orchestrates the above; key distinction:
-  - `fair_brl_fast`: uses raw FX mid (no EMA) → used for micro lead-lag windows (5/10/15s)
-  - `fair_brl_slow`: uses EMA FX mid → used for basis/regime (stable, not reactive)
-  - `lead_signal_bps(window_sec)` uses `fair_brl_fast` to avoid artificial lag
-
-**Run signal tests** (no compile needed):
-```bash
-cd /home/user/hummingbot-ney
-python -m pytest test/hummingbot/strategy_v2/utils/test_lead_lag_signal.py -v
-```
+**Branch**: `claude/xemm-leadlag`
+**Strategy**: XEMM (Cross-Exchange Market Making) BTC-BRL com sinal lead-lag sintético
+**Atualizado em**: 2026-05-04
 
 ---
 
-### Chunk 2 — `XEMMBRLExecutor` (DONE ✓)
+## Estado atual do bot
 
-**File**: `hummingbot/strategy_v2/executors/xemm_executor/xemm_brl_executor.py`
-**Tests**: `test/hummingbot/strategy_v2/executors/xemm_executor/test_xemm_brl_executor.py` — **5 tests** (requires `./compile`)
-**Commit**: `a51ba8f2`
-
-Subclass of `XEMMExecutor` that overrides only 2 methods:
-- `create_maker_order()` → uses `OrderType.LIMIT_MAKER` instead of `OrderType.LIMIT`
-- `validate_sufficient_balance()` → uses `OrderType.LIMIT_MAKER` for the maker candidate
-
-**Why this matters**: With ~100–300ms home latency, a LIMIT order can cross the book at the exchange and execute as taker, doubling the fee. `LIMIT_MAKER` is rejected by the exchange if it would cross (fail-safe). Both Bybit and Binance Spot connectors support `LIMIT_MAKER`.
-
-**Run executor tests** (requires Cython compile first):
-```bash
-cd /home/user/hummingbot-ney
-./compile
-python -m pytest test/hummingbot/strategy_v2/executors/xemm_executor/test_xemm_brl_executor.py -v
-```
+| Parâmetro | Valor |
+|-----------|-------|
+| **Rodando** | ✅ Sim — PID 11951 (iniciado 2026-05-04 08:15) |
+| **Modo** | Live (`shadow_mode: false`) |
+| **Maker** | Bybit BTC-BRL (LIMIT_MAKER) |
+| **Taker/hedge** | Binance BTC-BRL (MARKET) |
+| **Sinal** | Binance BTC-USDT × USDT-BRL |
+| **min_profitability** | 7 bps NET |
+| **target/max_profitability** | 15 bps NET |
+| **Arbitragem pura** | Desligada (`enable_pure_arb: false`) |
+| **Log** | `logs/logs_conf_xemm_lead_lag_shadow.log` |
+| **CSV** | `logs/xemm_lead_lag/xemm_lead_lag_btcbrl_v1_*.csv` |
 
 ---
 
-### Chunk 3 — `XEMMLeadLagController` (DONE ✓)
+## O que está implementado
 
-**File**: `controllers/generic/xemm_lead_lag.py` (738 lines)
-**Tests**: `test/hummingbot/strategy_v2/controllers/test_xemm_lead_lag.py` (574 lines, requires `./compile`)
-**Example config**: `controllers/generic/xemm_lead_lag_example.yml`
-**Commit**: `4cf5fc51`
+### 1. LeadLagSignalProvider ✅
+**Arquivo**: `hummingbot/strategy_v2/utils/lead_lag_signal.py`
 
-Key components:
-- `Regime` enum: WARMUP / OK / DEGRADED / PAUSED / KILLED
-- `XEMMLeadLagConfig(ControllerConfigBase)`: Pydantic config with all parameters
-- `XEMMLeadLagCSVLogger`: 38-column line-buffered CSV writer
-- `XEMMLeadLagController(ControllerBase)`:
-  - `update_processed_data()`: reads 8 L1 prices, computes signals, per-exchange inventory, targets, regime
-  - `_compute_regime()`: state machine for all risk gates
-  - `determine_executor_actions()`: Phase1-cancel / Phase2-cooldown / Phase3-create
-  - `_compute_targets()`: adjusts BUY/SELL profitability by lead signal + inventory skew
-  - Kill switch file support (`touch /tmp/xemm_lead_lag_pause` to pause)
-  - Daily circuit breakers (max loss, max fills, consecutive hedge failures)
-
-**Run controller tests** (requires Cython compile first):
-```bash
-cd /home/user/hummingbot-ney
-./compile
-python -m pytest test/hummingbot/strategy_v2/controllers/test_xemm_lead_lag.py -v
-```
+Módulo puro Python (zero dependências Hummingbot):
+- `CircularPriceBuffer` — buffer FIFO com eviction por tempo
+- `EMAFilter` — média móvel exponencial para suavizar FX
+- `FeedHealth` — detecção de staleness com `last_diff_uid`
+- `SignalQuality` — OK / DEGRADED_FX / DEGRADED_LEADER / DEGRADED_LOCAL / BAD
+- `LeadLagSignalProvider` — orquestra tudo; `fair_brl_fast` (sem EMA, para lead windows) e `fair_brl_slow` (com EMA, para basis/regime)
 
 ---
 
-## CRITICAL PENDING ISSUE — `XEMMBRLExecutor` wiring
+### 2. XEMMLeadLagExecutor ✅
+**Arquivo**: `hummingbot/strategy_v2/executors/xemm_executor/xemm_lead_lag_executor.py`
 
-**Problem**: The controller's `_make_create_action()` method creates `XEMMExecutorConfig(...)`, which the `ExecutorOrchestrator` maps to `XEMMExecutor` (uses `OrderType.LIMIT`), **not** `XEMMBRLExecutor` (uses `OrderType.LIMIT_MAKER`).
+Subclasse de `XEMMExecutor` com 3 overrides:
 
-**Location**: `controllers/generic/xemm_lead_lag.py`, method `_make_create_action()` (around line 480–510).
+**`validate_sufficient_balance()`** — usa `LIMIT_MAKER` no candidato maker (fee correta).
 
-**Must be fixed before live trading.**
+**`create_maker_order()`** — book-aware pricing:
+- Tenta melhorar fila: `best_bid + tick` (BUY) ou `best_ask - tick` (SELL)
+- Se spread = 1 tick: join em vez de improve
+- Floor de profitabilidade: `min_profitability + placement_profitability_buffer` (histerese)
+- Lead-aware adjustment: ±`placement_lead_aware_delta_bps` quando lead forte fora da dead zone
+- Arredondamento direcional: `ROUND_DOWN` (BUY), `ROUND_UP` (SELL)
+- Guard pós-arredondamento: nunca cruza o livro
+- Fallback para `_maker_target_price` se livro inválido
 
-### Solution options
+**`control_shutdown_process()`** — guard contra `maker_order is None` ou `taker_order is None` (bug na base XEMMExecutor linha 226 que causava `'NoneType'.is_done`).
 
-**Option A (recommended)**: Create `XEMMBRLExecutorConfig` that inherits `XEMMExecutorConfig` and is registered in the executor registry to map to `XEMMBRLExecutor`.
+---
 
-Steps:
-1. In `hummingbot/strategy_v2/executors/xemm_executor/data_types.py`:
-   ```python
-   class XEMMBRLExecutorConfig(XEMMExecutorConfig):
-       type: str = "xemm_brl_executor"  # must match executor's type field
-   ```
-2. In `hummingbot/strategy_v2/executors/xemm_executor/xemm_brl_executor.py`, set the class attribute:
-   ```python
-   class XEMMBRLExecutor(XEMMExecutor):
-       executor_type: str = "xemm_brl_executor"
-   ```
-3. Register in `hummingbot/strategy_v2/executor_handler.py` (or wherever executors are registered — check `ExecutorOrchestrator` for the dispatch map).
-4. In `xemm_lead_lag.py`, import `XEMMBRLExecutorConfig` and use it in `_make_create_action()`.
+### 3. XEMMLeadLagExecutorConfig ✅
+**Arquivo**: `hummingbot/strategy_v2/executors/xemm_executor/data_types.py`
 
-**Option B (simpler but hackier)**: Override executor instantiation directly in the controller, bypassing the registry.
+Campos extras além do `XEMMExecutorConfig` base:
+- `placement_profitability_buffer` — histerese no placement
+- `lead_signal_bps` — injetado pelo controller a cada tick
+- `placement_lead_aware_delta_bps` — ajuste quando lead é informativo
+- `placement_lead_signal_threshold_bps` — dead zone
 
-### How to find the executor registry
+---
 
-```bash
-grep -rn "XEMMExecutor" hummingbot/strategy_v2/executor_handler.py
-grep -rn "executor_type\|ExecutorFactory\|create_executor" hummingbot/strategy_v2/ --include="*.py" | head -30
+### 4. LeadLagArbitrageExecutor ✅
+**Arquivo**: `hummingbot/strategy_v2/executors/arbitrage_executor/lead_lag_arbitrage_executor.py`
+
+Subclasse de `ArbitrageExecutor` para arbitragem pura taker:taker:
+- Override `process_order_failed_event()` — detecta falha parcial (1 perna ok, outra falhou)
+- `_unwind_position()` — MARKET inverso na exchange com menor slippage
+- `_estimate_unwind_slippage()` — calcula slippage em bps via VWAP
+- Gate de slippage: `arb_max_unwind_slippage_bps` antes de desunwinding
+- Estratégias: `abort_and_alert` (default) ou `force_unwind`
+- CloseTypes: `UNWOUND` (sucesso) e `UNWIND_ABORTED` (gate acionado)
+
+---
+
+### 5. LeadLagArbitrageExecutorConfig ✅
+**Arquivo**: `hummingbot/strategy_v2/executors/arbitrage_executor/data_types.py`
+
+```python
+class LeadLagArbitrageExecutorConfig(ArbitrageExecutorConfig):
+    type: Literal["lead_lag_arbitrage_executor"]
+    arb_max_unwind_slippage_bps: Decimal = Decimal("50")
+    arb_unwind_strategy: Literal["abort_and_alert", "force_unwind"] = "abort_and_alert"
 ```
 
 ---
 
-## How to continue
+### 6. Registro no ExecutorOrchestrator ✅
+**Arquivo**: `hummingbot/strategy_v2/executors/executor_orchestrator.py`
 
-### Step 1: Fix `XEMMBRLExecutor` wiring (CRITICAL)
-
-Follow Option A above. The test to verify it works:
-```bash
-./compile
-python -m pytest test/hummingbot/strategy_v2/executors/xemm_executor/test_xemm_brl_executor.py -v
-python -m pytest test/hummingbot/strategy_v2/controllers/test_xemm_lead_lag.py -v
-```
-
-After fixing, add a test to `test_xemm_lead_lag.py` (group E) that verifies `CreateExecutorAction.executor_config` is an instance of `XEMMBRLExecutorConfig`.
-
-### Step 2: Run all tests
-
-```bash
-cd /home/user/hummingbot-ney
-./compile
-python -m pytest test/hummingbot/strategy_v2/utils/test_lead_lag_signal.py -v
-python -m pytest test/hummingbot/strategy_v2/executors/xemm_executor/test_xemm_brl_executor.py -v
-python -m pytest test/hummingbot/strategy_v2/controllers/test_xemm_lead_lag.py -v
-```
-
-**Signal tests** (48) should already be green.
-**Executor tests** (5) and **controller tests** require `./compile` for Cython extensions.
-
-### Step 3: Validate config loading
-
-Copy the example config:
-```bash
-cp controllers/generic/xemm_lead_lag_example.yml conf/controllers/xemm_lead_lag_btc_brl.yml
-```
-
-Validate Pydantic parsing:
-```bash
-python3 -c "
-import yaml
-from controllers.generic.xemm_lead_lag import XEMMLeadLagConfig
-
-with open('conf/controllers/xemm_lead_lag_btc_brl.yml') as f:
-    data = yaml.safe_load(f)
-config = XEMMLeadLagConfig(**data)
-print('id:', config.id)
-print('markets:', config.update_markets({}))
-print('shadow:', config.shadow_mode)
-"
-```
-
-Expected output:
-```
-id: xemm_lead_lag_btcbrl_v1
-markets: {'bybit': {'BTC-BRL'}, 'binance': {'BTC-BRL', 'BTC-USDT', 'USDT-BRL'}}
-shadow: True
-```
-
-### Step 4: Import test inside Hummingbot
-
-```bash
-./compile
-./start
-```
-
-In hummingbot prompt: `start --controller xemm_lead_lag_btc_brl.yml`
-
-If import error occurs, trace it and fix before proceeding.
-
-### Step 5: Shadow mode (48h)
-
-Edit `conf/controllers/xemm_lead_lag_btc_brl.yml` — ensure `shadow_mode: true` (it already is by default).
-
-Configure API keys for Bybit and Binance via the Hummingbot `connect` command.
-
-Start the bot and monitor the CSV log:
-```bash
-tail -f logs/xemm_lead_lag/xemm_lead_lag_*.csv | column -t -s,
-```
-
-**What to look for** (see plan §10.3):
-- `signal_quality == OK` in ≥99% of rows
-- `basis_bps` typically −20 to +20 bps
-- No lines showing order creation (shadow mode)
-- CSV file growing ~1 line/second
-
-### Step 6: Live (after 48h shadow analysis)
-
-1. Analyze shadow CSV (see plan §10.4 for statistical analysis notebook)
-2. Edit YAML: `shadow_mode: false`, keep `order_amount` at minimum
-3. Restart bot
-4. Monitor first 2h manually
+`"lead_lag_arbitrage_executor": LeadLagArbitrageExecutor` no mapa de dispatch.
 
 ---
 
-## Architecture summary (for quick orientation)
+### 7. CloseType expandido ✅
+**Arquivo**: `hummingbot/strategy_v2/models/executors.py`
 
-```
-Signal: Binance BTC-USDT × USDT-BRL (synthetic fair_BRL, never traded)
-    ↓ lead_signal_bps (5/10/15s windows)
-    ↓
-XEMMLeadLagController (tick: 1s)
-    ├── Regime: WARMUP → OK / DEGRADED / PAUSED / KILLED
-    ├── _compute_targets() → target_buy, target_sell (adjusted by lead + inventory)
-    └── determine_executor_actions()
-            ├── StopExecutorAction (risk gates)
-            └── CreateExecutorAction(XEMMBRLExecutorConfig)  ← PENDING FIX
-                        ↓
-                XEMMBRLExecutor
-                    ├── Maker: Bybit BTC-BRL (LIMIT_MAKER)
-                    └── On fill → Taker hedge: Binance BTC-BRL (MARKET)
-```
-
-**Key invariants**:
-- `target_profitability` values are NET of fees (XEMMExecutor adds `_tx_cost_pct` internally)
-- `LIMIT_MAKER` → rejected by exchange if would cross book (fail-safe for home latency)
-- `find_rate("BRL-BRL")` returns `Decimal("1")` natively (no override needed)
-- Shadow mode = full pipeline runs, zero orders placed
+`UNWOUND = 11` e `UNWIND_ABORTED = 12` adicionados ao enum.
 
 ---
 
-## Files added/changed in this branch
+### 8. XEMMLeadLagController ✅
+**Arquivo**: `controllers/generic/xemm_lead_lag.py`
 
-| File | Status | Description |
-|------|--------|-------------|
-| `hummingbot/strategy_v2/utils/lead_lag_signal.py` | NEW | Signal module (zero deps) |
-| `hummingbot/strategy_v2/utils/__init__.py` | NEW | Package init |
-| `test/hummingbot/strategy_v2/utils/__init__.py` | NEW | Test package init |
-| `test/hummingbot/strategy_v2/utils/test_lead_lag_signal.py` | NEW | 48 signal tests |
-| `hummingbot/strategy_v2/executors/xemm_executor/xemm_brl_executor.py` | NEW | LIMIT_MAKER subclass |
-| `test/hummingbot/strategy_v2/executors/xemm_executor/test_xemm_brl_executor.py` | NEW | 5 executor tests |
-| `controllers/generic/xemm_lead_lag.py` | NEW | Full controller (738 lines) |
-| `controllers/generic/xemm_lead_lag_example.yml` | NEW | Config template |
-| `test/hummingbot/strategy_v2/controllers/test_xemm_lead_lag.py` | NEW | Controller tests |
+Features implementadas:
 
-No core Hummingbot files were modified.
+| Feature | Detalhe |
+|---------|---------|
+| `Regime` enum | WARMUP / OK / DEGRADED / PAUSED / KILLED |
+| Tiered polling 200ms | `update_interval=0.2`; fingerprint skip quando livro inalterado |
+| Fingerprint | 8 L1 prices + `balance_version` (incrementado em fills) |
+| Tier 3 throttle | CSV write máximo 1×/segundo |
+| Kill switch | `touch /tmp/xemm_lead_lag_pause` → KILLED + cancel imediato |
+| Lead-lag targets | `_compute_targets()` — BUY/SELL ajustados por sinal + inventory skew |
+| Basis-aware skew | `basis_skew_strength` — bias direcional por basis persistente |
+| Placement buffer | `placement_profitability_buffer` — histerese para evitar requote imediato |
+| Lead-aware placement | `lead_signal_bps` injetado no config do executor a cada tick |
+| Taker balance gates | `min_taker_base_for_sell_hedge`, `min_taker_quote_for_buy_hedge` |
+| Anti-churn | `min_requote_interval_sec` — cooldown entre criações de ordens |
+| Circuit breakers MM | `max_daily_loss_quote`, `max_consecutive_hedge_failures` |
+| Switches independentes | `enable_market_making` / `enable_pure_arb` |
+| Arb detection (VWAP) | `_compute_arb_gross_bps()` — usa VWAP para `arb_order_amount`, não L1 |
+| Arb circuit breakers | `arb_failure_pause_sec`, `arb_max_failures_per_day`, `arb_daily_loss_limit_quote` |
+| Arb rate limiting | `arb_max_per_hour`, `arb_min_interval_sec` |
+| Arb capital check | `_has_capital_for_arb()` — verifica saldo livre na hora do spawn |
+| Arb atomicidade | `_has_active_arb_executor()` — nunca 2 arbs simultâneos |
+| Arb lead-aware | `_arb_threshold()` — agressivo quando lead favorece, conservador quando contradiz |
+| Reset diário | Contadores de arb zerados meia-noite UTC |
 
 ---
 
-## Detailed plan
+### 9. Startup/Shutdown ✅
+**Arquivo**: `controllers/generic/xemm_lead_lag.py` (seção "Startup / shutdown helpers")
 
-See `xemm_brl_implementation_plan.md` in the repo root for the full 1361-line design document, including:
-- All class/method signatures with pseudocode
-- Complete test specifications (48 signal + 29 controller tests)
-- Risk analysis (10 risks with mitigations)
-- Shadow mode operation procedure
-- Statistical analysis notebook for log validation
-- Post-shadow criteria for go-live decision
+- `_cancel_all_open_orders_on_startup()` — roda 1×, quando ambos connectors `.ready`
+- `_bybit_cancel_open_orders()` — `GET /v5/order/realtime` → `POST /v5/order/cancel` por ordem
+- `_binance_cancel_open_orders()` — `DELETE /openOrders` (batch); trata HTTP 400 `-2011` como "sem ordens"
+- Sem dependência do estado SQLite do Hummingbot — consulta a exchange diretamente
+
+---
+
+### 10. Script de operação ✅
+**Arquivo**: `start_xemm_lead_lag.sh`
+
+- Shutdown gracioso: kill switch → wait 12s → SIGTERM → SIGKILL
+- Rotação de log: arquivo anterior renomeado com timestamp UTC
+- Confirmação automática: aguarda até 60s pela primeira ordem maker, imprime PID e detalhe
+
+---
+
+### 11. SIGTERM/SIGINT handler ✅
+**Arquivo**: `controllers/generic/xemm_lead_lag.py`
+
+- `_setup_sigterm_handler()` — registrado no primeiro tick via `loop.add_signal_handler()`; idempotente
+- `_graceful_shutdown(sig_name)` — cancela todas as ordens abertas (REST direto) com timeout de 8s, depois `sys.exit(0)`
+- Protege contra ordens órfãs quando o SO/usuário derruba o processo (reboot de servidor, CTRL-C, systemd stop)
+- Tolera `NotImplementedError` (Windows) sem crashar
+
+---
+
+### 12. Correção `_has_inflight_activity()` ✅
+**Arquivo**: `controllers/generic/xemm_lead_lag.py`
+
+Bug anterior: verificava `not ex.is_done` para executores ativos e `not o.is_done` para in_flight_orders — ambos sempre `True` durante operação normal, bloqueando 100% das ações de drift da auditoria.
+
+Correção: a única verificação legítima de "in-flight" é fill recente (`_last_fill_time < 10s`). Executores ativos com ordens maker abertas são esperados e não indicam trade em andamento.
+
+---
+
+### 13. Inventory auto_rebalance com VWAP ✅
+**Arquivo**: `controllers/generic/xemm_lead_lag.py`
+
+Quando `on_drift_action: "auto_rebalance"` e drift é detectado:
+- `_execute_pending_rebalances()` — avalia ambas exchanges como candidatas
+- `_rebalance_evaluate_exchange()` — usa `_vwap_for_amount()` (caminha o livro real via `get_vwap_for_volume`) como proxy de profundidade
+  - SELL: escolhe exchange com VWAP **maior** (melhor preço de venda)
+  - BUY: escolhe exchange com VWAP **menor** (melhor preço de compra)
+  - Capital check: base ≥ amount (SELL) ou quote ≥ amount × vwap × 1.01 (BUY)
+  - Book muito raso (VWAP None/0) → descarta candidato automaticamente
+- Cooldown de 120s entre rebalances do mesmo asset (evita duplicatas antes do fill propagar)
+- No boot com drift + `auto_rebalance`: NÃO seta `_kill_reason`, bot sai de `boot_paused` e começa a operar enquanto rebalance é colocado
+- Config: `on_drift_action: "auto_rebalance"` em `xemm_lead_lag_btc_brl.yml`
+
+---
+
+## O que está pendente (rollout)
+
+### Passo seguinte: validar detecção de arb no CSV
+
+O bot **já calcula** `arb_long_gross_bps` e `arb_short_gross_bps` a cada tick e grava no CSV — mesmo com `enable_pure_arb: false`. Basta analisar os dados para validar se as oportunidades detectadas são reais.
+
+```bash
+# Ver colunas de arb no CSV atual
+head -1 logs/xemm_lead_lag/xemm_lead_lag_btcbrl_v1_*.csv | tr ',' '\n' | grep -n arb
+
+# Ver distribuição de spread detectado (últimas 1000 linhas)
+tail -1000 logs/xemm_lead_lag/xemm_lead_lag_btcbrl_v1_*.csv | \
+  awk -F, 'NR>1 {print $COL_ARB_LONG}' | sort -n | uniq -c
+```
+
+### Rollout faseado restante
+
+| Step | Descrição | Status |
+|------|-----------|--------|
+| 6 | Analisar CSV arb (24h de dados, `enable_pure_arb=false`) | **próximo** |
+| 7 | Live arb com `order_amount` mínimo (`0.00005`, `max/hora=3`) | pendente |
+| 8 | Calibrar `arb_max_per_hour` e `arb_order_amount` com base no hit rate | pendente |
+
+---
+
+## Arquitetura resumida
+
+```
+Sinal: Binance BTC-USDT × USDT-BRL  →  fair_BRL  →  lead_signal_bps (5/10/15s)
+                                                            ↓
+                                    XEMMLeadLagController (tick: 200ms)
+                                        ├── Regime: WARMUP→OK/DEGRADED/PAUSED/KILLED
+                                        ├── _compute_targets() → target_buy, target_sell
+                                        ├── MM path → CreateExecutorAction(XEMMLeadLagExecutorConfig)
+                                        │               ↓
+                                        │       XEMMLeadLagExecutor
+                                        │           ├── Maker: Bybit BTC-BRL (LIMIT_MAKER)
+                                        │           └── On fill → Hedge: Binance BTC-BRL (MARKET)
+                                        │
+                                        └── Arb path → CreateExecutorAction(LeadLagArbitrageExecutorConfig)
+                                                        ↓ (enable_pure_arb=true)
+                                                LeadLagArbitrageExecutor
+                                                    ├── Buy: exchange com preço menor (MARKET)
+                                                    ├── Sell: exchange com preço maior (MARKET)
+                                                    └── On partial fail → _unwind_position()
+```
+
+**Invariantes críticos**:
+- `target/min/max_profitability` são NET de fees (executor adiciona `_tx_cost_pct` internamente)
+- `LIMIT_MAKER` é rejeitado pela exchange se cruzaria o livro (fail-safe para latência doméstica)
+- `arb_min_profitability` é **GROSS** — o executor `ArbitrageExecutor` desconta fees; não há dupla dedução
+- Startup cleanup consulta a exchange diretamente (não confia no SQLite do Hummingbot)
