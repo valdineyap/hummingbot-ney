@@ -727,6 +727,27 @@ class XEMMLeadLagController(ControllerBase):
         self._daily_realized_pnl: Decimal = Decimal("0")
         self._kill_reason: Optional[str] = None
 
+        # === Ghost-fill controller-level handling ===
+        # The XEMMLeadLagExecutor used to track potentially-filled cancelled
+        # maker orders in a local set. Problem: when BitPreco's CANT_CANCEL
+        # _FILLED_ORDER race leaves a delayed OrderFilledEvent (5–30 s after
+        # cancel), the original executor has usually terminated already, so
+        # its handler never fires and the maker fill ends up un-hedged —
+        # `inventory_audit` only catches it minutes later via slower MARKET
+        # rebalance on the WRONG side (no cross-exchange edge).
+        # Observed 2026-05-11 14:11:31: 3 maker fills in 25 min, 0 taker
+        # hedges placed via the XEMM cycle.
+        # Fix: register pending ghosts here (controller lives across executor
+        # cycles); the controller's fill-event listener hedges late fills
+        # directly via the taker connector.
+        self._pending_ghost_orders: Dict[str, Dict[str, Any]] = {}
+        # Order IDs that an executor already hedged (defensive deduplication
+        # — controller's listener checks this before firing its own hedge).
+        self._already_hedged_ghost_ids: Set[str] = set()
+        # BitPreco confirms cancel within ~30 s; 60 s buffer avoids
+        # purging entries while a real late-fill event is still in flight.
+        self._ghost_max_age_sec: float = 60.0
+
         # === Layered PnL safety state (see _compute_regime gates) ===
         # Session-level: persists for the process lifetime.
         self._session_pnl_total: Decimal = Decimal("0")
@@ -871,12 +892,26 @@ class XEMMLeadLagController(ControllerBase):
             # ledger record knows which exchange the fill came from.
             # SourceInfoEventForwarder calls back with
             # (event_tag, event_caller, event); we only need ``event``.
-            forwarder = SourceInfoEventForwarder(
-                lambda _tag, _caller, event, _src=conn_name: (
-                    self._trade_ledger.record_raw_fill(event, source_connector=_src)
-                    if self._trade_ledger is not None else None
-                )
-            )
+            # Two responsibilities on every fill:
+            #   1. Persist to the trade ledger.
+            #   2. Hedge the order if it was registered as a ghost
+            #      (BitPreco delayed-fill race) — the original executor
+            #      may already be dead, so the controller must own this.
+            def _on_fill(_tag, _caller, event, _src=conn_name):
+                if self._trade_ledger is not None:
+                    try:
+                        self._trade_ledger.record_raw_fill(event, source_connector=_src)
+                    except Exception as e:
+                        self.logger().warning(
+                            f"[trade_ledger] record_raw_fill failed: {type(e).__name__}: {e}"
+                        )
+                try:
+                    self._handle_ghost_fill_event(event, _src)
+                except Exception as e:
+                    self.logger().warning(
+                        f"[ghost_controller] handler raised: {type(e).__name__}: {e}"
+                    )
+            forwarder = SourceInfoEventForwarder(_on_fill)
             conn.add_listener(MarketEvent.OrderFilled, forwarder)
             self._ledger_fill_forwarders[conn_name] = forwarder
         self.logger().info(
@@ -1497,6 +1532,126 @@ class XEMMLeadLagController(ControllerBase):
     # ------------------------------------------------------------------ #
     # Inventory audit (state-based reconciliation)                       #
     # ------------------------------------------------------------------ #
+    # ------------------------------------------------------------------ #
+    # Ghost-fill handling (controller-level)                             #
+    # ------------------------------------------------------------------ #
+    def register_ghost_order(
+        self,
+        order_id: str,
+        maker_side: TradeType,
+        maker_connector: str,
+    ) -> None:
+        """Called by XEMMLeadLagExecutor when a maker order is cancelled
+        with ``executed_amount_base == 0``.  The BitPreco CANT_CANCEL_FILLED
+        _ORDER race can leave a delayed fill event that arrives long after
+        the executor has terminated; this dict lets the controller's own
+        fill listener place the taker hedge instead."""
+        self._pending_ghost_orders[order_id] = {
+            "maker_side": maker_side,
+            "maker_connector": maker_connector,
+            "registered_at": time.time(),
+        }
+        self.logger().info(
+            f"[ghost_controller] registered {order_id} "
+            f"side={maker_side.name if hasattr(maker_side, 'name') else maker_side} "
+            f"conn={maker_connector} | pending={len(self._pending_ghost_orders)}"
+        )
+
+    def mark_ghost_hedged(self, order_id: str) -> None:
+        """Called by the executor when it placed the taker hedge for an
+        order also registered as a ghost.  Prevents the controller's
+        listener from firing a duplicate hedge on the same event."""
+        self._pending_ghost_orders.pop(order_id, None)
+        self._already_hedged_ghost_ids.add(order_id)
+
+    def _purge_ghost_orders(self, now: float) -> None:
+        """Drop ghost entries older than ``_ghost_max_age_sec``.  Cap the
+        hedged-id set size so it cannot grow unboundedly across a long
+        session (we trade ~hundreds of orders/hour; trim conservatively)."""
+        expired = [
+            oid for oid, info in self._pending_ghost_orders.items()
+            if (now - info["registered_at"]) > self._ghost_max_age_sec
+        ]
+        for oid in expired:
+            del self._pending_ghost_orders[oid]
+            self.logger().info(
+                f"[ghost_controller] purged stale entry {oid} "
+                f"(no fill event arrived within {self._ghost_max_age_sec}s)"
+            )
+        if len(self._already_hedged_ghost_ids) > 200:
+            self._already_hedged_ghost_ids.clear()
+
+    def _handle_ghost_fill_event(self, event, source_connector: str) -> None:
+        """Listener wired in ``_attach_ledger_fill_listeners``.  For every
+        OrderFilled event on the maker connector, see if the order_id was
+        registered as a ghost — if so, place a MARKET hedge on the taker
+        for ``event.amount`` BTC.
+
+        The executor's own ``process_order_completed_event`` may also fire
+        on the same underlying fill (different event type) if the executor
+        is still alive; the de-dup set ``_already_hedged_ghost_ids``
+        prevents double-hedging.  Whichever path fires first wins."""
+        order_id = getattr(event, "order_id", None)
+        if not order_id:
+            return
+        if order_id in self._already_hedged_ghost_ids:
+            return
+        info = self._pending_ghost_orders.get(order_id)
+        if info is None:
+            return
+        if source_connector != info["maker_connector"]:
+            self.logger().warning(
+                f"[ghost_controller] {order_id}: fill from {source_connector} "
+                f"but registered for {info['maker_connector']} — skipping."
+            )
+            return
+        try:
+            amount = Decimal(str(getattr(event, "amount", 0)))
+        except Exception:
+            amount = Decimal("0")
+        if amount <= 0:
+            return
+        # Atomically claim ownership BEFORE side effects: this guarantees
+        # that if two handlers somehow process the same event back-to-back,
+        # only one places the hedge.
+        self._pending_ghost_orders.pop(order_id, None)
+        self._already_hedged_ghost_ids.add(order_id)
+
+        maker_side = info["maker_side"]
+        hedge_side = TradeType.BUY if maker_side == TradeType.SELL else TradeType.SELL
+        try:
+            taker_conn = self.market_data_provider.get_connector(
+                self.config.taker_connector
+            )
+        except Exception as e:
+            self.logger().error(
+                f"[ghost_controller] {order_id}: cannot resolve taker connector "
+                f"{self.config.taker_connector}: {type(e).__name__}: {e}. "
+                f"inventory_audit will reconcile (worse PnL)."
+            )
+            return
+
+        pair = self.config.taker_trading_pair
+        try:
+            if hedge_side == TradeType.BUY:
+                hedge_id = taker_conn.buy(pair, amount, OrderType.MARKET, Decimal("0"))
+            else:
+                hedge_id = taker_conn.sell(pair, amount, OrderType.MARKET, Decimal("0"))
+            self.logger().warning(
+                f"[ghost_controller] {order_id}: late fill on {source_connector} "
+                f"({maker_side.name} {amount}) → MARKET {hedge_side.name} {hedge_id} "
+                f"placed on {self.config.taker_connector}/{pair}"
+            )
+            # Suppress inventory_audit's auto_rebalance for 10 s (same window
+            # used by the within-cycle ghost path in the executor).
+            self._last_fill_time = time.time()
+        except Exception as e:
+            self.logger().error(
+                f"[ghost_controller] {order_id}: failed to place taker hedge "
+                f"({hedge_side.name} {amount} on {self.config.taker_connector}): "
+                f"{type(e).__name__}: {e}. inventory_audit will reconcile."
+            )
+
     def _has_inflight_activity(self) -> bool:
         """
         True if a trade is in a transient state that could legitimately explain
@@ -1606,8 +1761,35 @@ class XEMMLeadLagController(ControllerBase):
                 # gate in _compute_regime). Computed at audit time using the
                 # same mid_price the tolerance uses, so units are consistent.
                 "delta_quote": abs(delta) * mid_price,
+                "maker_bal": maker_bal,
+                "taker_bal": taker_bal,
                 "within": within,
             }
+
+            # P1 observability: side-imbalance warning. The audit only
+            # cares about total drift, but when one side is severely
+            # depleted the balance_gate pauses that side and the bot
+            # only trades one direction until a natural fill restores
+            # parity (3 min outage observed in prod 2026-05-11 14:08).
+            # Surface it explicitly so an operator knows what to expect
+            # without grep'ing balance_gate WARNINGs.
+            if within and target > 0 and source == "boot":
+                low_side_ratio = (
+                    min(maker_bal, taker_bal) / target
+                    if target > 0 else Decimal("1")
+                )
+                if low_side_ratio < Decimal("0.25"):
+                    low_side = (
+                        self.config.maker_connector if maker_bal <= taker_bal
+                        else self.config.taker_connector
+                    )
+                    self.logger().warning(
+                        f"[audit/{source}] {asset} TOTAL OK but side-imbalance: "
+                        f"maker={maker_bal:.8f} taker={taker_bal:.8f} target={target} "
+                        f"({low_side} has <25% of target). Bot may pause one side "
+                        f"of hedging until a natural fill restores parity. "
+                        f"Consider depositing on {low_side} if persistent."
+                    )
 
             if within:
                 # Drift resolved → reset circuit-breaker counter.
@@ -1643,7 +1825,8 @@ class XEMMLeadLagController(ControllerBase):
 
             any_drift = True
             self.logger().critical(
-                f"[audit/{source}] {asset} DRIFT actual={actual:f} target={target:f} "
+                f"[audit/{source}] {asset} DRIFT actual={actual:f} "
+                f"(maker={maker_bal:f} taker={taker_bal:f}) target={target:f} "
                 f"delta={delta:+f} ({delta/target*100:+.3f}%) tolerance={tolerance_abs:f} "
                 f"— action={cfg.on_drift_action}"
             )
@@ -2128,6 +2311,11 @@ class XEMMLeadLagController(ControllerBase):
                 and self.config.inventory_audit.enabled
                 and (now - self._last_audit_time) >= self.config.inventory_audit.audit_interval_sec):
             self._run_inventory_audit(now, source="periodic")
+
+        # === Purge stale ghost-order entries (cheap dict trim) ===
+        # Runs every tick; cost is O(N) where N is small (only orders cancelled
+        # with executed=0 in the last 60s, typically <20 at peak).
+        self._purge_ghost_orders(now)
 
         # === Periodic orphan-order reconciliation (every 30s) ===
         # Safety net for any race between cancel/place cycles or unconfirmed

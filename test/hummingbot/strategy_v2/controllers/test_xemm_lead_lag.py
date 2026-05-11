@@ -18,6 +18,7 @@ Test groups:
 import asyncio
 import os
 import tempfile
+import time
 from decimal import Decimal
 from typing import Optional
 from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCase
@@ -1687,3 +1688,146 @@ class TestSigtermHandler(_BaseControllerTest):
 
         # Original kill reason preserved
         self.assertEqual(self.controller._kill_reason, "INVENTORY_DRIFT_BTC")
+
+
+# ===================================================================== #
+# Group I — Controller-level ghost fill handler (P0 fix 2026-05-11)     #
+# ===================================================================== #
+class _GhostFillBaseTest(_BaseControllerTest):
+    """Shared fixtures: a fake fill event + a mocked taker connector."""
+
+    def _fill_event(self, order_id: str, amount=Decimal("0.0002")):
+        ev = MagicMock()
+        ev.order_id = order_id
+        ev.amount = amount
+        ev.price = Decimal("400000")
+        return ev
+
+    def _mock_taker_connector(self):
+        """Replace market_data_provider.get_connector(taker) with a mock
+        that exposes ``buy`` / ``sell`` returning a fake order_id. Also
+        intercepts get_connector(maker) to return a different mock so
+        nothing else breaks."""
+        taker = MagicMock()
+        taker.buy = MagicMock(return_value="hedge-buy-1")
+        taker.sell = MagicMock(return_value="hedge-sell-1")
+        maker = MagicMock()
+        def _get_conn(name):
+            return taker if name == "binance" else maker
+        self.market_data_provider.get_connector = MagicMock(side_effect=_get_conn)
+        return taker
+
+
+class TestGhostFillRegistration(_GhostFillBaseTest):
+    def test_register_adds_entry(self):
+        self.controller.register_ghost_order(
+            order_id="OID-1",
+            maker_side=TradeType.SELL,
+            maker_connector="bybit",
+        )
+        self.assertIn("OID-1", self.controller._pending_ghost_orders)
+        info = self.controller._pending_ghost_orders["OID-1"]
+        self.assertEqual(info["maker_side"], TradeType.SELL)
+        self.assertEqual(info["maker_connector"], "bybit")
+        self.assertGreater(info["registered_at"], 0)
+
+    def test_mark_hedged_moves_to_dedupe_set(self):
+        self.controller.register_ghost_order("OID-2", TradeType.BUY, "bybit")
+        self.controller.mark_ghost_hedged("OID-2")
+        self.assertNotIn("OID-2", self.controller._pending_ghost_orders)
+        self.assertIn("OID-2", self.controller._already_hedged_ghost_ids)
+
+    def test_purge_removes_stale_entries(self):
+        # Manually backdate an entry.
+        self.controller.register_ghost_order("OID-OLD", TradeType.SELL, "bybit")
+        self.controller._pending_ghost_orders["OID-OLD"]["registered_at"] = (
+            time.time() - self.controller._ghost_max_age_sec - 1.0
+        )
+        # And one fresh entry.
+        self.controller.register_ghost_order("OID-NEW", TradeType.BUY, "bybit")
+        self.controller._purge_ghost_orders(time.time())
+        self.assertNotIn("OID-OLD", self.controller._pending_ghost_orders)
+        self.assertIn("OID-NEW", self.controller._pending_ghost_orders)
+
+
+class TestGhostFillEventHandling(_GhostFillBaseTest):
+    def test_late_fill_places_taker_hedge_for_maker_sell(self):
+        taker = self._mock_taker_connector()
+        # Register: maker SELL on bybit → expected hedge is BUY on binance.
+        self.controller.register_ghost_order(
+            order_id="OID-S1",
+            maker_side=TradeType.SELL,
+            maker_connector="bybit",
+        )
+        event = self._fill_event("OID-S1", amount=Decimal("0.00019999"))
+        self.controller._handle_ghost_fill_event(event, source_connector="bybit")
+        # MARKET BUY placed on taker for the fill amount.
+        taker.buy.assert_called_once()
+        args, _ = taker.buy.call_args
+        self.assertEqual(args[0], "BTC-BRL")  # taker_trading_pair
+        self.assertEqual(args[1], Decimal("0.00019999"))
+        # Entry moved to dedupe set.
+        self.assertNotIn("OID-S1", self.controller._pending_ghost_orders)
+        self.assertIn("OID-S1", self.controller._already_hedged_ghost_ids)
+
+    def test_late_fill_places_taker_hedge_for_maker_buy(self):
+        taker = self._mock_taker_connector()
+        self.controller.register_ghost_order(
+            "OID-B1", TradeType.BUY, "bybit"
+        )
+        event = self._fill_event("OID-B1", amount=Decimal("0.0001"))
+        self.controller._handle_ghost_fill_event(event, source_connector="bybit")
+        taker.sell.assert_called_once()
+        args, _ = taker.sell.call_args
+        self.assertEqual(args[1], Decimal("0.0001"))
+        self.assertNotIn("OID-B1", self.controller._pending_ghost_orders)
+
+    def test_already_hedged_skips_duplicate(self):
+        taker = self._mock_taker_connector()
+        self.controller.register_ghost_order("OID-X", TradeType.SELL, "bybit")
+        self.controller.mark_ghost_hedged("OID-X")
+        event = self._fill_event("OID-X")
+        self.controller._handle_ghost_fill_event(event, source_connector="bybit")
+        taker.buy.assert_not_called()
+        taker.sell.assert_not_called()
+
+    def test_unregistered_order_id_is_noop(self):
+        taker = self._mock_taker_connector()
+        event = self._fill_event("OID-UNKNOWN")
+        self.controller._handle_ghost_fill_event(event, source_connector="bybit")
+        taker.buy.assert_not_called()
+        taker.sell.assert_not_called()
+
+    def test_zero_amount_event_skipped(self):
+        taker = self._mock_taker_connector()
+        self.controller.register_ghost_order("OID-Z", TradeType.SELL, "bybit")
+        event = self._fill_event("OID-Z", amount=Decimal("0"))
+        self.controller._handle_ghost_fill_event(event, source_connector="bybit")
+        taker.buy.assert_not_called()
+        # Entry stays in pending since the listener didn't actually claim it
+        # (the late real fill, if it ever comes, may still want to hedge).
+        # But zero-amount events are essentially noise, so this is fine
+        # either way — verify only that no hedge fired.
+
+    def test_mismatched_source_connector_skipped(self):
+        taker = self._mock_taker_connector()
+        self.controller.register_ghost_order("OID-M", TradeType.SELL, "bybit")
+        event = self._fill_event("OID-M")
+        # Event arrives from binance though the maker was bybit — defensive
+        # skip (should never happen in prod, but guards against plumbing
+        # surprises).
+        self.controller._handle_ghost_fill_event(event, source_connector="binance")
+        taker.buy.assert_not_called()
+        self.assertIn("OID-M", self.controller._pending_ghost_orders)
+
+    def test_handler_claims_atomically_before_placing(self):
+        """If buy() raises, the entry is already claimed; a second event
+        for the same order would not re-attempt."""
+        taker = self._mock_taker_connector()
+        taker.buy.side_effect = RuntimeError("connector down")
+        self.controller.register_ghost_order("OID-F", TradeType.SELL, "bybit")
+        event = self._fill_event("OID-F")
+        self.controller._handle_ghost_fill_event(event, source_connector="bybit")
+        # Claim happened despite failure.
+        self.assertNotIn("OID-F", self.controller._pending_ghost_orders)
+        self.assertIn("OID-F", self.controller._already_hedged_ghost_ids)

@@ -85,7 +85,16 @@ class XEMMLeadLagExecutor(XEMMExecutor):
             self.taker_connector, [taker_order_candidate])[0]
         if maker_adjusted_candidate.amount == Decimal("0") or taker_adjusted_candidate.amount == Decimal("0"):
             self.close_type = CloseType.INSUFFICIENT_BALANCE
-            self.logger().error("Not enough budget to open position.")
+            # WARNING (was ERROR): INSUFFICIENT_BALANCE is a graceful skip
+            # condition — the controller's balance_gate / inventory_audit
+            # are the authoritative paths for genuine balance issues. The
+            # ERROR severity caused this normal cancel-replace race state
+            # to spuriously inflate the heartbeat's ANOMALY counter.
+            self.logger().warning(
+                "Not enough budget to open position (INSUFFICIENT_BALANCE — "
+                "graceful skip; controller balance_gate / inventory_audit "
+                "are the source of truth for real balance issues)."
+            )
             self.stop()
 
     async def control_shutdown_process(self):
@@ -157,6 +166,18 @@ class XEMMLeadLagExecutor(XEMMExecutor):
                     # Match base's flow after place_taker_order: transition
                     # so the next tick goes through control_shutdown_process.
                     self._status = RunnableStatus.SHUTTING_DOWN
+                    # Defensive controller dedup. Normally the order_id is
+                    # not in the controller's pending dict at this point
+                    # (that path only registers on cancel-with-executed=0,
+                    # whereas here executed > 0), but if the cancel event
+                    # ran first this same tick it might have registered —
+                    # tell the controller we own this hedge.
+                    ctrl = self._get_controller()
+                    if ctrl is not None:
+                        try:
+                            ctrl.mark_ghost_hedged(order_id)
+                        except Exception:
+                            pass
                 except Exception as e:
                     self.logger().error(
                         f"[reconcile_hedge] place_taker_order failed for "
@@ -208,6 +229,25 @@ class XEMMLeadLagExecutor(XEMMExecutor):
                     f"[ghost_guard] Maker order {event.order_id} registered as "
                     f"potential ghost fill (cancelled with executed=0)."
                 )
+                # Also register at the controller. This executor instance
+                # almost certainly terminates before any delayed fill event
+                # arrives (5–30 s window on BitPreco) — the controller lives
+                # across cycles and its own fill listener will place the
+                # taker hedge if the late event lands.
+                ctrl = self._get_controller()
+                if ctrl is not None:
+                    try:
+                        ctrl.register_ghost_order(
+                            order_id=event.order_id,
+                            maker_side=self.config.maker_side,
+                            maker_connector=self.maker_connector,
+                        )
+                    except Exception as e:
+                        self.logger().warning(
+                            f"[ghost_guard] controller.register_ghost_order "
+                            f"failed: {type(e).__name__}: {e} (fall back to "
+                            f"executor-local handler if still alive)."
+                        )
         super().process_order_canceled_event(event_tag, market, event)
 
     def process_order_completed_event(self, event_tag: int, market, event):
@@ -289,11 +329,35 @@ class XEMMLeadLagExecutor(XEMMExecutor):
                 f"MARKET {self.taker_order_side.name} {amount} {self.taker_trading_pair} "
                 f"on {self.taker_connector}."
             )
+            # Tell the controller we've handled this order_id so its own
+            # fill-listener skips the late event (controller-level dedup).
+            ctrl = self._get_controller()
+            if ctrl is not None:
+                try:
+                    ctrl.mark_ghost_hedged(event.order_id)
+                except Exception:
+                    pass
         except Exception as e:
             self.logger().error(
                 f"[ghost_fill] Failed to place taker hedge for {event.order_id}: "
                 f"{type(e).__name__}: {e}. inventory_audit will reconcile."
             )
+
+    def _get_controller(self):
+        """Return the owning controller instance, or None if unreachable.
+
+        Resolved via ``self._strategy.controllers[controller_id]`` — the same
+        accessor used by ``_get_live_lead_bps``. Returns None on any failure
+        (missing config, no strategy attached, etc.) so callers can fall back
+        to the executor-local code path.
+        """
+        try:
+            cid = getattr(self.config, "controller_id", None)
+            if not cid:
+                return None
+            return getattr(self._strategy, "controllers", {}).get(cid)
+        except Exception:
+            return None
 
     def _touch_controller_last_fill_time(self) -> None:
         """Update the owning controller's ``_last_fill_time`` to now.
@@ -301,19 +365,16 @@ class XEMMLeadLagExecutor(XEMMExecutor):
         This activates the 10-second inflight window in
         ``_has_inflight_activity()`` and prevents the inventory audit from
         queuing an auto_rebalance while our ghost-fill taker hedge is settling.
-        Uses the same ``self.strategy.controllers`` accessor as
-        ``_get_live_lead_bps()``.
         """
+        ctrl = self._get_controller()
+        if ctrl is None:
+            return
         try:
-            cid = getattr(self.config, "controller_id", None)
-            if cid:
-                ctrl = getattr(self._strategy, "controllers", {}).get(cid)
-                if ctrl is not None:
-                    ctrl._last_fill_time = time.time()
-                    self.logger().info(
-                        f"[ghost_fill] controller._last_fill_time updated "
-                        f"(10 s audit-suppression window started)."
-                    )
+            ctrl._last_fill_time = time.time()
+            self.logger().info(
+                f"[ghost_fill] controller._last_fill_time updated "
+                f"(10 s audit-suppression window started)."
+            )
         except Exception:
             pass  # best-effort; inventory_audit is the fallback
 
