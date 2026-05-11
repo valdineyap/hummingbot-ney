@@ -147,7 +147,9 @@ enable_pure_arb: false
 # Pure arbitrage (taker:taker)                                 #
 # ============================================================ #
 arb_order_amount: "0.0002"
-arb_min_profitability: "0.0015"     # 15 bps GROSS — executor deducts fees
+# NET threshold (after round-trip taker fees) — same semantics as the MM
+# controller's min/target/max_profitability and the executor's own NET gate.
+arb_min_profitability: "0.0005"     # 5 bps NET
 arb_lead_aggressive_delta: "0.0003"
 arb_lead_conservative_delta: "0.0005"
 arb_lead_signal_threshold_bps: "5"

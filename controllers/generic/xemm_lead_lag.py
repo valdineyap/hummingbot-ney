@@ -174,9 +174,11 @@ class XEMMLeadLagConfig(ControllerConfigBase):
     enable_pure_arb: bool = Field(default=False)
 
     # === Pure arbitrage (taker:taker) ===
-    # GROSS threshold — ArbitrageExecutor deducts fees internally (no double-count)
+    # NET threshold — controller spawn gate compares ``gross_bps − tx_cost_bps``
+    # against this value, matching the executor's own NET execute gate and the
+    # MM controller's NET min/target/max_profitability semantics.
     arb_order_amount: Decimal = Field(default=Decimal("0.0002"))
-    arb_min_profitability: Decimal = Field(default=Decimal("0.0015"))   # 15 bps gross
+    arb_min_profitability: Decimal = Field(default=Decimal("0.0002"))   # 2 bps net
     arb_lead_aggressive_delta: Decimal = Field(default=Decimal("0.0003"))   # -3 bps when lead favors
     arb_lead_conservative_delta: Decimal = Field(default=Decimal("0.0005")) # +5 bps when lead contradicts
     arb_lead_signal_threshold_bps: Decimal = Field(default=Decimal("5"))    # ±5 bps dead zone
@@ -344,6 +346,7 @@ class XEMMLeadLagCSVLogger:
         "n_active_executors", "shadow_mode",
         # Pure-arb telemetry (VWAP detector + circuit breakers)
         "arb_long_gross_bps", "arb_short_gross_bps",
+        "arb_long_net_bps", "arb_short_net_bps", "arb_tx_cost_bps",
         "arb_near_threshold",
         "arb_failures_today", "arb_realized_loss_today",
         # Inventory audit (state-based reconciliation)
@@ -796,6 +799,10 @@ class XEMMLeadLagController(ControllerBase):
         self._arb_realized_loss_today: Decimal = Decimal("0")
         self._arb_last_reset_day: str = ""
         self._arb_last_alert_time: float = 0.0  # throttle: max 1 log line per 30s
+        # Throttle the per-tick "why didn't an arb spawn?" debug logs
+        # (every gate path in _maybe_create_arb_action) — 5s window keeps
+        # them visible without flooding.
+        self._arb_last_gate_log_ts: float = 0.0
 
         # === Inventory audit state (state-based reconciliation) ===
         # Audit compares (maker_balance + taker_balance) against config target
@@ -2086,7 +2093,8 @@ class XEMMLeadLagController(ControllerBase):
         `arb_order_amount` (not L1 best bid/ask).
 
         Returns Decimal("-9999") if any leg has insufficient depth.
-        Note: GROSS only — fees are deducted by the ArbitrageExecutor itself.
+        GROSS only — used for telemetry / arb_alert_threshold near-miss
+        detection. The spawn gate compares NET (via _compute_arb_net_bps).
         """
         amount = self.config.arb_order_amount
         if side == "long":
@@ -2111,6 +2119,67 @@ class XEMMLeadLagController(ControllerBase):
         if buy_vwap is None or sell_vwap is None or buy_vwap <= 0:
             return Decimal("-9999")
         return (sell_vwap - buy_vwap) / buy_vwap * Decimal("10000")
+
+    def _estimate_arb_tx_cost_bps(self) -> Decimal:
+        """Round-trip taker fee in bps for an arbitrage (both legs MARKET).
+
+        Reads ``connector.get_fee(...).percent`` from both maker and taker
+        connectors. Both legs are taker MARKET orders, so we sum the taker
+        fees. Symmetric for "long" and "short" directions (the side just
+        flips which connector is buyer vs seller — same fee schedule).
+
+        Returns 0 bps on any failure (defensive — better to spawn-and-let-
+        executor-decide than to silently never spawn).
+        """
+        amount = self.config.arb_order_amount
+        # Mid price guesstimate; fee.percent doesn't usually depend on price
+        # for these connectors but the API requires it.
+        try:
+            best_bid = self._safe_price(
+                self.config.maker_connector, self.config.maker_trading_pair,
+                PriceType.BestBid,
+            )
+            best_ask = self._safe_price(
+                self.config.maker_connector, self.config.maker_trading_pair,
+                PriceType.BestAsk,
+            )
+            mid_price = (best_bid + best_ask) / Decimal("2") if (best_bid and best_ask) else Decimal("1")
+        except Exception:
+            mid_price = Decimal("1")
+
+        total_pct = Decimal("0")
+        for conn_name in (self.config.maker_connector, self.config.taker_connector):
+            try:
+                conn = self.market_data_provider.get_connector(conn_name)
+                fee = conn.get_fee(
+                    base_currency="BTC",
+                    quote_currency="BRL",
+                    order_type=OrderType.MARKET,
+                    order_side=TradeType.BUY,
+                    amount=amount,
+                    price=mid_price,
+                    is_maker=False,
+                )
+                total_pct += Decimal(str(fee.percent))
+            except Exception as e:
+                self.logger().warning(
+                    f"[arb_fee] cannot read fee from {conn_name}: "
+                    f"{type(e).__name__}: {e}. Treating as 0 bps."
+                )
+        return total_pct * Decimal("10000")
+
+    def _compute_arb_net_bps(self, side: str) -> Decimal:
+        """NET spread in bps after deducting round-trip taker fees.
+
+        This is the value the spawn gate compares against ``arb_min_profitability``
+        — keeps semantics consistent with the executor's own NET gate (it
+        also subtracts fees before comparing to the same threshold) and
+        with the MM controller which expresses profitability NET of fees.
+        """
+        gross = self._compute_arb_gross_bps(side)
+        if gross == Decimal("-9999"):
+            return gross  # propagate sentinel
+        return gross - self._estimate_arb_tx_cost_bps()
 
     def _market_fingerprint(self) -> tuple:
         """
@@ -2447,12 +2516,27 @@ class XEMMLeadLagController(ControllerBase):
         maker_vs_taker_bps = self._bps_ratio(local_mid, taker_local_mid)
         taker_local_spread_bps = self._spread_bps(taker_local_bid, taker_local_ask)
 
-        # 6.5. Pure arb detection (VWAP-based; gross only — executor deducts fees)
-        # Always compute for telemetry/calibration; the spawn gate (Phase 3a in
-        # determine_executor_actions) reads `enable_pure_arb` to decide whether
-        # to actually execute on these signals.
+        # 6.5. Pure arb detection (VWAP-based).
+        # GROSS values stay for telemetry / arb_alert_threshold near-miss
+        # detection. NET values (gross − round-trip taker fees) are what the
+        # spawn gate in _maybe_create_arb_action compares against
+        # arb_min_profitability — consistent with the executor's own NET
+        # execute gate and with the MM controller's NET min/target/max
+        # profitability semantics.
         arb_long_gross_bps = self._compute_arb_gross_bps("long")
         arb_short_gross_bps = self._compute_arb_gross_bps("short")
+        arb_tx_cost_bps = self._estimate_arb_tx_cost_bps()
+        # Preserve the -9999 sentinel when one leg lacks depth.
+        arb_long_net_bps = (
+            arb_long_gross_bps - arb_tx_cost_bps
+            if arb_long_gross_bps > Decimal("-1000")
+            else arb_long_gross_bps
+        )
+        arb_short_net_bps = (
+            arb_short_gross_bps - arb_tx_cost_bps
+            if arb_short_gross_bps > Decimal("-1000")
+            else arb_short_gross_bps
+        )
 
         # 6.6. Arb near-threshold alert (fires even with enable_pure_arb=False)
         thr = Decimal(str(self.config.arb_alert_threshold_bps))
@@ -2536,6 +2620,9 @@ class XEMMLeadLagController(ControllerBase):
             "shadow_mode": self.config.shadow_mode,
             "arb_long_gross_bps": arb_long_gross_bps,
             "arb_short_gross_bps": arb_short_gross_bps,
+            "arb_long_net_bps": arb_long_net_bps,
+            "arb_short_net_bps": arb_short_net_bps,
+            "arb_tx_cost_bps": arb_tx_cost_bps,
             "arb_near_threshold": arb_near_threshold,
             "arb_failures_today": self._arb_failures_today,
             "arb_realized_loss_today": self._arb_realized_loss_today,
@@ -2886,8 +2973,9 @@ class XEMMLeadLagController(ControllerBase):
 
     def _arb_threshold(self, side: str, best_lead_bps: Optional[Decimal]) -> Decimal:
         """
-        Lead-aware GROSS threshold in bps for the given side.
-        - Lead in dead zone: base threshold
+        Lead-aware NET-bps threshold for the given side. Returned value is
+        compared against ``_compute_arb_net_bps(side)`` in the spawn gate.
+        - Lead in dead zone: base threshold (= arb_min_profitability bps)
         - Lead favours arb: aggressive (lower threshold)
         - Lead opposes arb: conservative (higher threshold)
         """
@@ -2941,29 +3029,67 @@ class XEMMLeadLagController(ControllerBase):
         """
         Returns a CreateExecutorAction for a LeadLagArbitrageExecutor if all
         gates pass; else None.
+
+        Spawn gate uses NET bps (gross spread minus round-trip taker fees),
+        consistent with the executor's own NET execution gate and with the
+        MM controller's `min/target/max_profitability` (also NET). Every
+        rejection emits a throttled debug-level log so the operator can
+        see why an arb didn't spawn in any given window.
         """
+        # Throttle to avoid log spam — these gates fire every tick.
+        def _gate_log(reason: str) -> None:
+            if (now - self._arb_last_gate_log_ts) >= 5.0:
+                self.logger().info(f"[arb_gate_skip] {reason}")
+                self._arb_last_gate_log_ts = now
+
         # Circuit breakers
         if now < self._arb_paused_until:
+            _gate_log(
+                f"failure_pause active ({self._arb_paused_until - now:.0f}s "
+                f"remaining)"
+            )
             return None
         if self._arb_failures_today >= self.config.arb_max_failures_per_day:
+            _gate_log(
+                f"max_failures_per_day reached "
+                f"({self._arb_failures_today}/{self.config.arb_max_failures_per_day})"
+            )
             return None
         if self._arb_realized_loss_today >= self.config.arb_daily_loss_limit_quote:
+            _gate_log(
+                f"daily_loss_limit reached "
+                f"({self._arb_realized_loss_today}/{self.config.arb_daily_loss_limit_quote})"
+            )
             return None
 
         # Atomicity: only one arb at a time
         if self._has_active_arb_executor(active_executors):
+            _gate_log("active arb executor present (only 1 at a time)")
             return None
 
         # Cooldown
         if (now - self._last_arb_time) < self.config.arb_min_interval_sec:
+            _gate_log(
+                f"cooldown active "
+                f"({self.config.arb_min_interval_sec - (now - self._last_arb_time):.1f}s "
+                f"remaining)"
+            )
             return None
 
         # Sliding window rate limit
         self._purge_old_arb_history(now)
         if len(self._arb_history) >= self.config.arb_max_per_hour:
+            _gate_log(
+                f"hourly rate limit "
+                f"({len(self._arb_history)}/{self.config.arb_max_per_hour})"
+            )
             return None
 
         pd = self.processed_data
+        # NET = gross - tx_cost. Computed fresh each tick because tx_cost
+        # depends on connector fees, which can change (VIP tier, promotion).
+        long_net = pd.get("arb_long_net_bps", Decimal("-9999"))
+        short_net = pd.get("arb_short_net_bps", Decimal("-9999"))
         long_gross = pd.get("arb_long_gross_bps", Decimal("-9999"))
         short_gross = pd.get("arb_short_gross_bps", Decimal("-9999"))
         best_lead = pd.get("best_lead_bps")
@@ -2972,36 +3098,56 @@ class XEMMLeadLagController(ControllerBase):
         threshold_short = self._arb_threshold("short", best_lead)
 
         candidates = []
-        if long_gross > threshold_long:
-            candidates.append(("long", long_gross))
-        if short_gross > threshold_short:
-            candidates.append(("short", short_gross))
+        if long_net > threshold_long:
+            candidates.append(("long", long_net, long_gross))
+        if short_net > threshold_short:
+            candidates.append(("short", short_net, short_gross))
 
         if not candidates:
+            # Only log when we have at least usable spread data — silent
+            # if VWAP probes returned -9999 (no depth) since that's
+            # market state, not a tunable gate.
+            if long_net > Decimal("-1000") or short_net > Decimal("-1000"):
+                _gate_log(
+                    f"edge below threshold | "
+                    f"long net={long_net:.2f}bps thr={threshold_long:.2f}bps "
+                    f"(gross={long_gross:.2f}) | "
+                    f"short net={short_net:.2f}bps thr={threshold_short:.2f}bps "
+                    f"(gross={short_gross:.2f})"
+                )
             return None
 
-        # Pick the side with the higher edge
-        side, edge_bps = max(candidates, key=lambda c: c[1])
+        # Pick the side with the higher NET edge.
+        side, edge_net_bps, edge_gross_bps = max(candidates, key=lambda c: c[1])
 
         # Dynamic capital check
         if not self._has_capital_for_arb(side):
             if self.config.arb_capital_strategy == "skip_if_insufficient":
                 self.logger().info(
-                    f"Arb {side} edge={edge_bps:.2f}bps SKIPPED: "
+                    f"[arb_gate_skip] Arb {side} net={edge_net_bps:.2f}bps "
+                    f"(gross={edge_gross_bps:.2f}) SKIPPED: "
                     f"insufficient free capital."
                 )
                 return None
             # cancel_xemm_to_free: not implemented in this iteration — log and skip
             self.logger().warning(
-                f"Arb {side} edge={edge_bps:.2f}bps: "
+                f"[arb_gate_skip] Arb {side} net={edge_net_bps:.2f}bps "
+                f"(gross={edge_gross_bps:.2f}): "
                 f"cancel_xemm_to_free strategy not yet implemented; skipping."
             )
             return None
 
-        # Spawn
+        # All gates passed — spawn.
         self._last_arb_time = now
         self._arb_history.append(now)
-        return self._make_arb_action(side, edge_bps, now)
+        self.logger().warning(
+            f"[arb_spawn] SPAWNING {side} arb: "
+            f"net={edge_net_bps:.2f}bps gross={edge_gross_bps:.2f}bps "
+            f"threshold={threshold_long if side == 'long' else threshold_short:.2f}bps "
+            f"(lead={best_lead}) | history_1h={len(self._arb_history)} "
+            f"order_amount={self.config.arb_order_amount}"
+        )
+        return self._make_arb_action(side, edge_net_bps, now)
 
     def _make_arb_action(
         self, side: str, edge_bps: Decimal, now: float,

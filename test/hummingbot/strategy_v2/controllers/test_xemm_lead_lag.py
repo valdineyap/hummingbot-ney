@@ -1064,6 +1064,122 @@ class TestArbThreshold(_ArbBaseTest):
         self.assertEqual(threshold, base)
 
 
+class TestArbNetSpawnGate(_ArbBaseTest):
+    """Pins the NET-bps spawn-gate behaviour added 2026-05-11.
+
+    The spawn gate compares ``gross_bps − tx_cost_bps`` (NET) against
+    ``arb_min_profitability``, matching the executor's own NET execute gate
+    and the MM controller's NET ``min/target/max_profitability`` semantics.
+    These tests force a specific tx_cost via mock connectors so the
+    arithmetic is deterministic regardless of the framework's default fee
+    schedule.
+    """
+
+    def _mock_fee(self, total_round_trip_bps: Decimal):
+        """Make ``get_fee`` on both connectors return ``percent = half`` —
+        so that round-trip sum equals the target bps."""
+        from unittest.mock import MagicMock as _MM
+        half_pct = total_round_trip_bps / Decimal("20000")  # bps→percent, halve
+        fee_obj = _MM()
+        fee_obj.percent = half_pct
+        fake_conn = _MM()
+        fake_conn.get_fee = _MM(return_value=fee_obj)
+        self.market_data_provider.get_connector = _MM(return_value=fake_conn)
+
+    async def test_net_equals_gross_minus_tx_cost(self):
+        # gross=20 bps, tx_cost=4 bps → net=16 bps
+        self._set_vwap(
+            taker_buy=Decimal("300000"),
+            maker_sell=Decimal("300600"),  # 20 bps gross
+        )
+        self._mock_fee(Decimal("4"))
+        await self._warm()
+        pd = self.controller.processed_data
+        self.assertAlmostEqual(
+            float(pd["arb_tx_cost_bps"]), 4.0, places=2,
+        )
+        self.assertAlmostEqual(
+            float(pd["arb_long_net_bps"]),
+            float(pd["arb_long_gross_bps"]) - 4.0, places=2,
+        )
+
+    async def test_spawn_uses_net_not_gross_at_boundary(self):
+        # gross=20 bps, tx_cost=4 bps → net=16 bps. With threshold 15 bps,
+        # net>threshold → spawn.
+        self.config.arb_min_profitability = Decimal("0.0015")  # 15 bps
+        self._set_vwap(
+            taker_buy=Decimal("300000"),
+            maker_sell=Decimal("300600"),
+        )
+        self._mock_fee(Decimal("4"))
+        await self._warm()
+        self.controller.executors_info = []
+        self.controller._last_action_time = 0.0
+        self.controller._last_arb_time = 0.0
+        actions = self.controller.determine_executor_actions()
+        arb_creates = [
+            a for a in actions if isinstance(a, CreateExecutorAction)
+            and a.executor_config.type == "lead_lag_arbitrage_executor"
+        ]
+        self.assertEqual(len(arb_creates), 1)
+
+    async def test_spawn_blocked_when_net_under_threshold_even_if_gross_over(self):
+        # gross=18 bps, tx_cost=10 bps → net=8 bps. Threshold 15 bps.
+        # Under OLD gross-only gate, this would have spawned (18>15);
+        # under NEW NET gate it must NOT (8<15).
+        self.config.arb_min_profitability = Decimal("0.0015")  # 15 bps
+        self._set_vwap(
+            taker_buy=Decimal("300000"),
+            maker_sell=Decimal("300540"),  # 18 bps gross
+        )
+        self._mock_fee(Decimal("10"))
+        await self._warm()
+        self.controller.executors_info = []
+        self.controller._last_action_time = 0.0
+        self.controller._last_arb_time = 0.0
+        actions = self.controller.determine_executor_actions()
+        arb_creates = [
+            a for a in actions if isinstance(a, CreateExecutorAction)
+            and a.executor_config.type == "lead_lag_arbitrage_executor"
+        ]
+        self.assertEqual(len(arb_creates), 0)
+
+    async def test_spawn_succeeds_with_low_threshold_and_zero_fees(self):
+        # Spawn at the new default-ish 2 bps NET with zero fees.
+        self.config.arb_min_profitability = Decimal("0.0002")  # 2 bps
+        self._set_vwap(
+            taker_buy=Decimal("300000"),
+            maker_sell=Decimal("300120"),  # 4 bps gross
+        )
+        self._mock_fee(Decimal("0"))
+        await self._warm()
+        self.controller.executors_info = []
+        self.controller._last_action_time = 0.0
+        self.controller._last_arb_time = 0.0
+        actions = self.controller.determine_executor_actions()
+        arb_creates = [
+            a for a in actions if isinstance(a, CreateExecutorAction)
+            and a.executor_config.type == "lead_lag_arbitrage_executor"
+        ]
+        self.assertEqual(len(arb_creates), 1)
+
+    async def test_tx_cost_fallback_to_zero_on_connector_error(self):
+        """If ``connector.get_fee`` raises, the estimator returns 0 bps so
+        the spawn gate degrades gracefully — better to spawn-and-let-
+        executor-decide than silently never spawn."""
+        from unittest.mock import MagicMock as _MM
+        bad_conn = _MM()
+        bad_conn.get_fee = _MM(side_effect=RuntimeError("api down"))
+        self.market_data_provider.get_connector = _MM(return_value=bad_conn)
+        self._set_vwap(
+            taker_buy=Decimal("300000"),
+            maker_sell=Decimal("300600"),
+        )
+        await self._warm()
+        pd = self.controller.processed_data
+        self.assertEqual(pd["arb_tx_cost_bps"], Decimal("0"))
+
+
 class TestArbCounterReset(_ArbBaseTest):
     async def test_failures_reset_at_new_utc_day(self):
         # Set fail count
