@@ -346,6 +346,175 @@ class TestRiskGates(_BaseControllerTest):
 
 
 # ===================================================================== #
+# Group C2 — PnL-based safety gates (layered loss protection)           #
+# ===================================================================== #
+class TestPnlSafetyGates(_BaseControllerTest):
+    """Verifies each PnL-based circuit breaker fires and latches KILLED.
+
+    All tests bypass warmup with _push_warm_history-equivalent inline loops
+    then set the relevant counter directly. The regime computation is what
+    we want to test, not the fill-detection path.
+    """
+
+    async def _warm(self):
+        for i in range(25):
+            self.market_data_provider.time.return_value = 1700000000.0 + i
+            await self.controller.update_processed_data()
+
+    async def test_daily_loss_limit_trips_killed(self):
+        await self._warm()
+        # Push past the limit (default 100 BRL).
+        self.controller._daily_realized_pnl = Decimal("-100.01")
+        self.market_data_provider.time.return_value = 1700000050.0
+        await self.controller.update_processed_data()
+        self.assertEqual(self.controller.processed_data["regime"], Regime.KILLED)
+        self.assertEqual(
+            self.controller.processed_data["cancel_reason"], "DAILY_LOSS_LIMIT"
+        )
+
+    async def test_daily_loss_just_under_does_not_trip(self):
+        await self._warm()
+        self.controller._daily_realized_pnl = Decimal("-99.99")
+        self.market_data_provider.time.return_value = 1700000050.0
+        await self.controller.update_processed_data()
+        self.assertNotEqual(
+            self.controller.processed_data["regime"], Regime.KILLED
+        )
+
+    async def test_session_drawdown_trips_killed(self):
+        await self._warm()
+        # Peak was 80 BRL, currently -20 → drawdown = 100 BRL.
+        # Default max_session_drawdown_quote = 50 BRL → trips.
+        self.controller._session_pnl_peak = Decimal("80")
+        self.controller._session_pnl_total = Decimal("-20")
+        self.market_data_provider.time.return_value = 1700000050.0
+        await self.controller.update_processed_data()
+        self.assertEqual(self.controller.processed_data["regime"], Regime.KILLED)
+        self.assertTrue(
+            self.controller.processed_data["cancel_reason"].startswith(
+                "SESSION_DRAWDOWN_"
+            )
+        )
+
+    async def test_session_drawdown_below_threshold_does_not_trip(self):
+        await self._warm()
+        # Peak 30, current 0 → drawdown 30 BRL < 50 → no trip.
+        self.controller._session_pnl_peak = Decimal("30")
+        self.controller._session_pnl_total = Decimal("0")
+        self.market_data_provider.time.return_value = 1700000050.0
+        await self.controller.update_processed_data()
+        self.assertNotEqual(
+            self.controller.processed_data["regime"], Regime.KILLED
+        )
+
+    async def test_losing_streak_trips_killed(self):
+        await self._warm()
+        self.controller._consecutive_losing_fills = 5  # default max=5 → trips
+        self.market_data_provider.time.return_value = 1700000050.0
+        await self.controller.update_processed_data()
+        self.assertEqual(self.controller.processed_data["regime"], Regime.KILLED)
+        self.assertTrue(
+            self.controller.processed_data["cancel_reason"].startswith(
+                "LOSING_STREAK_"
+            )
+        )
+
+    async def test_losing_streak_under_threshold_does_not_trip(self):
+        await self._warm()
+        self.controller._consecutive_losing_fills = 4  # 4 < 5 → no trip
+        self.market_data_provider.time.return_value = 1700000050.0
+        await self.controller.update_processed_data()
+        self.assertNotEqual(
+            self.controller.processed_data["regime"], Regime.KILLED
+        )
+
+    async def test_hourly_burn_trips_killed(self):
+        await self._warm()
+        # Advance mock clock so update_processed_data definitely re-runs the
+        # regime check (signal buffer ignores same-timestamp ticks).
+        self.market_data_provider.time.return_value = 1700000050.0
+        now = self.market_data_provider.time.return_value
+        # Default max_hourly_burn_quote = 50 BRL.
+        # Inject 10 entries × -10 BRL within the last 30 min → sum = -100.
+        from collections import deque
+        self.controller._hourly_pnl_history = deque(
+            (now - 60 - i * 30, Decimal("-10")) for i in range(10)
+        )
+        await self.controller.update_processed_data()
+        self.assertEqual(self.controller.processed_data["regime"], Regime.KILLED)
+        self.assertTrue(
+            self.controller.processed_data["cancel_reason"].startswith(
+                "HOURLY_BURN_"
+            )
+        )
+
+    async def test_hourly_burn_old_entries_trimmed(self):
+        await self._warm()
+        self.market_data_provider.time.return_value = 1700000050.0
+        now = self.market_data_provider.time.return_value
+        # All entries older than 3600s → should be trimmed and not trigger.
+        from collections import deque
+        self.controller._hourly_pnl_history = deque(
+            (now - 4000 - i * 30, Decimal("-10")) for i in range(10)
+        )
+        await self.controller.update_processed_data()
+        self.assertNotEqual(
+            self.controller.processed_data["regime"], Regime.KILLED
+        )
+        # Hourly burn helper should have purged everything.
+        self.assertEqual(self.controller._hourly_burn(now), Decimal("0"))
+
+    async def test_unrealized_loss_trips_killed(self):
+        await self._warm()
+        # max_unrealized_loss_quote default = 100 BRL.
+        self.controller._last_audit_results = {
+            "_drift_active": True,
+            "BTC": {
+                "actual": Decimal("0.0015"),
+                "target": Decimal("0.001"),
+                "delta": Decimal("0.0005"),
+                "delta_quote": Decimal("150"),  # > 100 → trips
+                "within": False,
+            },
+        }
+        self.market_data_provider.time.return_value = 1700000050.0
+        await self.controller.update_processed_data()
+        self.assertEqual(self.controller.processed_data["regime"], Regime.KILLED)
+        self.assertTrue(
+            self.controller.processed_data["cancel_reason"].startswith(
+                "UNREALIZED_LOSS_"
+            )
+        )
+
+    async def test_hedge_failures_via_drift_audits_trips_killed(self):
+        await self._warm()
+        # Three consecutive stuck audits on BTC → matches default max=3.
+        self.controller._drift_consecutive_audits = {"BTC": 3}
+        self.market_data_provider.time.return_value = 1700000050.0
+        await self.controller.update_processed_data()
+        self.assertEqual(self.controller.processed_data["regime"], Regime.KILLED)
+        self.assertTrue(
+            self.controller.processed_data["cancel_reason"].startswith(
+                "HEDGE_FAILURES_"
+            )
+        )
+
+    async def test_killed_reason_is_sticky_across_recovery(self):
+        # Trip session drawdown, then restore PnL — should remain KILLED.
+        await self._warm()
+        self.controller._session_pnl_peak = Decimal("100")
+        self.controller._session_pnl_total = Decimal("-50")  # dd=150
+        self.market_data_provider.time.return_value = 1700000050.0
+        await self.controller.update_processed_data()
+        self.assertEqual(self.controller.processed_data["regime"], Regime.KILLED)
+        # Now "recover" — kill should remain.
+        self.controller._session_pnl_total = Decimal("100")
+        self.market_data_provider.time.return_value = 1700000060.0
+        await self.controller.update_processed_data()
+        self.assertEqual(self.controller.processed_data["regime"], Regime.KILLED)
+
+
+# ===================================================================== #
 # Group D — Anti-churn cooldown                                         #
 # ===================================================================== #
 class TestAntiChurn(_BaseControllerTest):
@@ -924,7 +1093,10 @@ class _AuditBaseTest(_BaseControllerTest):
         self.config.inventory_audit = InventoryAuditConfig(
             enabled=True,
             audit_interval_sec=300.0,
-            tolerance_pct=Decimal("0.005"),
+            # mid_price in tests is (300000+300100)/2 = 300050. max_drift_quote=3 BRL
+            # → tolerance_abs = 3/300050 ≈ 9.998e-6 BTC, equivalent to the
+            # previous tolerance_pct=0.005 * target=0.002 = 1e-5 BTC.
+            max_drift_quote=Decimal("3"),
             on_drift_action="pause",
             base_targets={"BTC": Decimal("0.002")},
         )
@@ -955,7 +1127,10 @@ class _AutoRebalanceBaseTest(_AuditBaseTest):
         self.config.inventory_audit = InventoryAuditConfig(
             enabled=True,
             audit_interval_sec=300.0,
-            tolerance_pct=Decimal("0.005"),
+            # mid_price in tests is (300000+300100)/2 = 300050. max_drift_quote=3 BRL
+            # → tolerance_abs = 3/300050 ≈ 9.998e-6 BTC, equivalent to the
+            # previous tolerance_pct=0.005 * target=0.002 = 1e-5 BTC.
+            max_drift_quote=Decimal("3"),
             on_drift_action="auto_rebalance",
             base_targets={"BTC": Decimal("0.002")},
         )
@@ -1230,7 +1405,7 @@ class TestInventoryAuditConfigDefaults(_BaseControllerTest):
         cfg = InventoryAuditConfig()
         self.assertTrue(cfg.enabled)
         self.assertEqual(cfg.base_targets, {})
-        self.assertEqual(cfg.tolerance_pct, Decimal("0.005"))
+        self.assertEqual(cfg.max_drift_quote, Decimal("60"))
         self.assertEqual(cfg.on_drift_action, "pause")
 
     def test_audit_extra_field_rejected(self):

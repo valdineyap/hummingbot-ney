@@ -106,10 +106,36 @@ taker_hedge_buffer_pct: "0.01"
 warmup_seconds: 25.0
 
 # ============================================================ #
-# Circuit breakers                                             #
+# Circuit breakers — layered PnL protection (defense in depth) #
 # ============================================================ #
-max_consecutive_hedge_failures: 3   # was 1; more permissive for transient errors
-max_daily_loss_quote: "100"     # BRL
+# Each gate measures a different failure mode. All values are in BRL (quote).
+# In-process trip → regime=KILLED → cancel all orders → refuse new orders.
+# An EXTERNAL watchdog (tools/watchdog_pnl.sh, cron every 1 min) runs with
+# LOOSER thresholds as a redundancy layer if these gates ever fail.
+#
+# 1. Hedge failures (proxy via inventory_audit drift counter):
+#    N consecutive stuck audits on any base asset → KILL.
+max_consecutive_hedge_failures: 3
+# 2. Realized loss since UTC midnight.
+max_daily_loss_quote: "100"
+# 3. Peak-to-trough drawdown since process start. Catches "won early, gave
+#    it back" patterns. Resets only on bot restart.
+max_session_drawdown_quote: "50"
+# 4. Consecutive closed executors with net_pnl_quote < 0. Detects adverse
+#    selection clusters before daily limit fires.
+max_consecutive_losing_fills: 5
+# 5. Rolling 1h burn rate: sum of net_pnl over the last 3600s ≤ -limit.
+#    Catches slow bleeds that would not trip daily_loss until hours later.
+max_hourly_burn_quote: "50"
+# 6. Sum across base assets of |drift| * mid_price. Defense-in-depth against
+#    auto_rebalance failing to keep up with growing drift.
+max_unrealized_loss_quote: "100"
+
+# Self-termination on KILLED: when no executors are active and inventory is
+# in tolerance, SIGTERM the process so the supervisor restarts cleanly.
+# Opt-in to avoid surprising shutdowns in shadow_mode.
+auto_terminate_on_kill: false
+auto_terminate_grace_sec: 30
 
 # ============================================================ #
 # Operational modes (independent switches)                     #

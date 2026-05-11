@@ -21,10 +21,11 @@ import os
 import signal
 import sys
 import time
+from collections import deque
 from datetime import datetime, timedelta, timezone
 from decimal import Decimal
 from enum import Enum
-from typing import Any, Dict, List, Literal, Optional, Set, Tuple
+from typing import Any, Deque, Dict, List, Literal, Optional, Set, Tuple
 
 from pydantic import BaseModel, ConfigDict, Field, field_validator, model_validator
 
@@ -58,13 +59,23 @@ class InventoryAuditConfig(BaseModel):
     """
     State-based inventory reconciliation: for each base asset, the bot's total
     holdings (maker_balance + taker_balance) are compared against a fixed target
-    every `audit_interval_sec`. If the divergence exceeds `tolerance_pct` AND
-    there is no in-flight trade activity that could explain it, `on_drift_action`
-    fires.
+    every `audit_interval_sec`. If the divergence (converted to quote currency
+    via the maker's current mid_price) exceeds `max_drift_quote` AND there is no
+    in-flight trade activity that could explain it, `on_drift_action` fires.
+
+    Why an absolute quote threshold (not percentage):
+      * Percentage tolerance scales with `target`, leading to absurd absolute
+        values for large books (0.5% × 1 BTC = ~2000 BRL of "noise" — way past
+        any rebalance fee). An absolute BRL threshold reflects the real economics:
+        below `max_drift_quote` it is not worth rebalancing (fees + slippage
+        dominate), regardless of book size.
+      * Below this threshold the audit is SILENT — no CRITICAL, no anomaly
+        counter increment.
 
     Notes:
       * Only base assets (BTC, ETH...) get a target — quote (BRL) grows with PnL.
-      * tolerance_pct is global (applies to every asset).
+      * `max_drift_quote` is global (applies to every asset, expressed in the
+        maker's quote currency — BRL for BTC-BRL).
       * Hedge in-flight detection (executors active, in_flight_orders, recent fill)
         is preferred over a fixed grace period — defers drift action only when
         a legitimate trade can explain the imbalance.
@@ -73,7 +84,11 @@ class InventoryAuditConfig(BaseModel):
 
     enabled: bool = True
     audit_interval_sec: float = 300.0
-    tolerance_pct: Decimal = Decimal("0.005")
+    # Drift máximo aceitável em quote currency (e.g. BRL para BTC-BRL).
+    # Default: 60 BRL (~$12 USD) — acima do min_notional típico das exchanges
+    # e do break-even de fees+slippage do MARKET rebalance. Convertido para BTC
+    # em runtime usando o mid_price corrente do maker.
+    max_drift_quote: Decimal = Decimal("60")
     on_drift_action: Literal["alert", "pause", "auto_rebalance"] = "pause"
     base_targets: Dict[str, Decimal] = Field(default_factory=dict)
 
@@ -210,9 +225,32 @@ class XEMMLeadLagConfig(ControllerConfigBase):
     # === Warmup ===
     warmup_seconds: float = Field(default=20.0)
 
-    # === Circuit breakers ===
+    # === Circuit breakers (PnL-based) ===
+    # All limits below are expressed in QUOTE currency (BRL for BTC-BRL pair).
+    # They are positive numbers; the gate compares against -limit for losses.
     max_consecutive_hedge_failures: int = Field(default=3)
     max_daily_loss_quote: Decimal = Field(default=Decimal("100"))
+    # Session drawdown: kill when (session_peak - current_session_pnl) >= this.
+    # Captures "won early, gave it back" patterns that net daily PnL hides.
+    # Resets only on process restart — peak is per-process, not per-day.
+    max_session_drawdown_quote: Decimal = Field(default=Decimal("50"))
+    # Consecutive closed executors with net_pnl_quote < 0. Catches adverse-selection
+    # clusters or signal inversion before total loss reaches daily limit.
+    max_consecutive_losing_fills: int = Field(default=5)
+    # Rolling 1h burn rate: kill when sum(net_pnl) over last 3600s <= -limit.
+    # Detects slow bleeds that would not trip daily_loss until hours later.
+    max_hourly_burn_quote: Decimal = Field(default=Decimal("50"))
+    # Unrealized-PnL proxy via inventory drift in quote terms (sum across base
+    # assets of |actual-target| * mid_price). Catches large open exposure even
+    # when realized PnL still looks fine. Should be > inventory_audit.max_drift_quote.
+    max_unrealized_loss_quote: Decimal = Field(default=Decimal("100"))
+    # When KILLED and there are no active executors and inventory is in tolerance,
+    # the controller sends SIGTERM to its own process so the supervisor (or operator)
+    # can restart cleanly. Opt-in to avoid surprising shutdowns in shadow_mode.
+    auto_terminate_on_kill: bool = Field(default=False)
+    # Seconds to wait after KILL latches before auto_terminate fires (gives
+    # graceful cancel + audit one cycle each).
+    auto_terminate_grace_sec: float = Field(default=30.0)
 
     # === Inventory audit (state-based reconciliation) ===
     inventory_audit: InventoryAuditConfig = Field(default_factory=InventoryAuditConfig)
@@ -313,6 +351,9 @@ class XEMMLeadLagCSVLogger:
         "audit_drift_active", "audit_inflight_active",
         # Boot state
         "boot_paused",
+        # PnL-safety telemetry (drives circuit breakers and external watchdog)
+        "daily_realized_pnl", "session_pnl_total", "session_pnl_peak",
+        "session_drawdown", "consecutive_losing_fills", "hourly_burn",
     ]
 
     def __init__(self, log_dir: str, controller_id: str):
@@ -685,6 +726,25 @@ class XEMMLeadLagController(ControllerBase):
         self._consecutive_hedge_failures: int = 0
         self._daily_realized_pnl: Decimal = Decimal("0")
         self._kill_reason: Optional[str] = None
+
+        # === Layered PnL safety state (see _compute_regime gates) ===
+        # Session-level: persists for the process lifetime.
+        self._session_pnl_total: Decimal = Decimal("0")
+        self._session_pnl_peak: Decimal = Decimal("0")
+        # Counts how many closed executors in a row had net_pnl_quote < 0.
+        # Resets on the first non-loss fill.
+        self._consecutive_losing_fills: int = 0
+        # Sliding 1h history of (timestamp, net_pnl_quote) tuples used by the
+        # hourly burn-rate gate. Trimmed lazily on each access in _hourly_burn.
+        self._hourly_pnl_history: Deque[Tuple[float, Decimal]] = deque()
+        # Day key (UTC) for the daily_realized_pnl reset — separate from
+        # _arb_last_reset_day so the two reset paths are independent.
+        self._daily_pnl_last_reset_day: str = ""
+        # Set when KILLED has latched; the auto-terminate path uses this to
+        # know when the grace period started.
+        self._kill_latched_at: Optional[float] = None
+        # Latched when auto-terminate has fired (single-shot guard).
+        self._auto_terminated: bool = False
 
         # === Tiered polling state ===
         self._last_fingerprint: Optional[tuple] = None
@@ -1488,14 +1548,49 @@ class XEMMLeadLagController(ControllerBase):
         if not cfg.enabled or not cfg.base_targets:
             return
 
+        # Skip the audit completely when the kill switch is already tripped —
+        # the bot is stopping; further CRITICAL drift logs are pure noise (and
+        # poison any human/agent reviewing the log). Observed in prod
+        # 2026-05-11: ~250 CRITICAL lines emitted in the 25 minutes between
+        # DRIFT_STUCK trip and operator intervention.
+        if self._kill_reason is not None:
+            self._last_audit_time = now  # advance so the next check spaces out
+            return
+
         self._last_audit_time = now
         inflight = self._has_inflight_activity()
         results: Dict[str, Dict[str, Decimal]] = {"_inflight_active": inflight}
         any_drift = False
 
+        # Convert `max_drift_quote` (BRL) → base-asset tolerance via the maker's
+        # current mid_price. Updated every audit cycle so the threshold tracks
+        # market movement. Fail-safe: if mid_price unavailable, skip this audit
+        # cycle (don't fire false CRITICAL on missing data).
+        try:
+            best_bid = self._safe_price(
+                self.config.maker_connector, self.config.maker_trading_pair, PriceType.BestBid
+            )
+            best_ask = self._safe_price(
+                self.config.maker_connector, self.config.maker_trading_pair, PriceType.BestAsk
+            )
+            if best_bid is None or best_ask is None or best_bid <= 0 or best_ask <= 0:
+                raise ValueError(f"invalid prices bid={best_bid} ask={best_ask}")
+            mid_price = (best_bid + best_ask) / Decimal("2")
+        except Exception as e:
+            self.logger().warning(
+                f"[audit/{source}] cannot compute mid_price for "
+                f"{self.config.maker_trading_pair} ({type(e).__name__}: {e}) — "
+                f"skipping audit cycle."
+            )
+            return
+
         for asset, target in cfg.base_targets.items():
             target = Decimal(str(target))
-            tolerance_abs = target * cfg.tolerance_pct
+            # tolerance_abs in base asset = max_drift_quote / mid_price.
+            # Assumes the asset is the BASE of the maker pair — if you add a
+            # target for an asset that's NOT the maker base, this conversion
+            # will be wrong. For BTC-BRL with BTC target this is correct.
+            tolerance_abs = cfg.max_drift_quote / mid_price
 
             maker_bal = self._safe_total_balance(self.config.maker_connector, asset)
             taker_bal = self._safe_total_balance(self.config.taker_connector, asset)
@@ -1507,6 +1602,10 @@ class XEMMLeadLagController(ControllerBase):
                 "actual": actual,
                 "target": target,
                 "delta": delta,
+                # Quote-denominated absolute drift (read by the unrealized-loss
+                # gate in _compute_regime). Computed at audit time using the
+                # same mid_price the tolerance uses, so units are consistent.
+                "delta_quote": abs(delta) * mid_price,
                 "within": within,
             }
 
@@ -1944,11 +2043,50 @@ class XEMMLeadLagController(ControllerBase):
                     # last_fill.touch). Never let ledger I/O block the loop.
                     if self._trade_ledger is not None:
                         self._trade_ledger.record_fill(ex)
+                    # === Safety counters (drive PnL-based circuit breakers) ===
+                    # Increment realized PnL counters AFTER trade-ledger I/O so
+                    # ledger failures cannot mask a loss from the gates.
+                    self._daily_realized_pnl += net_pnl
+                    self._session_pnl_total += net_pnl
+                    if self._session_pnl_total > self._session_pnl_peak:
+                        self._session_pnl_peak = self._session_pnl_total
+                    if net_pnl < Decimal("0"):
+                        self._consecutive_losing_fills += 1
+                    else:
+                        self._consecutive_losing_fills = 0
+                    self._hourly_pnl_history.append((time.time(), net_pnl))
+                    # Per-executor-type accounting for arb circuit breakers.
+                    # Arb executors close once; XEMM executors also close once.
+                    # We only count arb losses/failures here; XEMM losses flow
+                    # through daily_realized_pnl / session_pnl_total above.
+                    ex_type = getattr(ex.config, "type", "")
+                    if ex_type == "lead_lag_arbitrage_executor":
+                        if net_pnl < Decimal("0"):
+                            # Store loss as a POSITIVE magnitude (matches the
+                            # gate at line ~2561: `>= arb_daily_loss_limit_quote`).
+                            self._arb_realized_loss_today += abs(net_pnl)
+                            self._arb_failures_today += 1
+                            # Per-failure cooldown: pause arb spawning for
+                            # arb_failure_pause_sec. Read at _maybe_create_arb_action.
+                            self._arb_paused_until = max(
+                                self._arb_paused_until,
+                                time.time() + self.config.arb_failure_pause_sec,
+                            )
+                            self.logger().warning(
+                                f"[arb_failure] executor {ex.id} closed with "
+                                f"net_pnl={net_pnl} → failures_today="
+                                f"{self._arb_failures_today}, "
+                                f"loss_today={self._arb_realized_loss_today}, "
+                                f"paused for {self.config.arb_failure_pause_sec:.0f}s"
+                            )
                     self.logger().info(
                         f"[fill_detected] executor {ex.id} done "
                         f"filled_quote={filled_quote} net_pnl={net_pnl} "
                         f"cum_fees={cum_fees} → _last_fill_time updated "
-                        f"(10s audit-suppression window started)"
+                        f"(10s audit-suppression window started); "
+                        f"safety: daily_pnl={self._daily_realized_pnl} "
+                        f"session_pnl={self._session_pnl_total} "
+                        f"losing_streak={self._consecutive_losing_fills}"
                     )
 
         # === Initial inventory audit (Solution C: boot-paused mode) ===
@@ -2084,6 +2222,35 @@ class XEMMLeadLagController(ControllerBase):
         )
         should_cancel = regime in (Regime.PAUSED, Regime.KILLED)
 
+        # 5b. Auto-terminate (opt-in). When KILLED has latched, no executors
+        # are active, and inventory is in tolerance (or audit disabled), send
+        # SIGTERM to ourselves so the supervisor restarts cleanly. The grace
+        # window gives Phase-1 cancel logic time to actually fly out cancels
+        # AND lets the next audit cycle confirm zero drift.
+        if regime == Regime.KILLED and self._kill_latched_at is None:
+            self._kill_latched_at = now
+        if (regime == Regime.KILLED
+                and self.config.auto_terminate_on_kill
+                and not self._auto_terminated
+                and self._kill_latched_at is not None
+                and (now - self._kill_latched_at) >= self.config.auto_terminate_grace_sec):
+            active_count = sum(1 for e in self.executors_info if not e.is_done)
+            drift_active = bool(self._last_audit_results.get("_drift_active"))
+            if active_count == 0 and not drift_active:
+                self._auto_terminated = True
+                self.logger().critical(
+                    f"[auto_terminate] KILLED for "
+                    f"{now - self._kill_latched_at:.0f}s with no active executors "
+                    f"and drift={drift_active}; sending SIGTERM to pid={os.getpid()} "
+                    f"(reason={self._kill_reason})"
+                )
+                try:
+                    os.kill(os.getpid(), signal.SIGTERM)
+                except Exception as e:
+                    self.logger().error(
+                        f"[auto_terminate] os.kill failed: {type(e).__name__}: {e}"
+                    )
+
         # 6. Bps relations (for diagnostic CSV columns)
         fair_slow = self._signal.fair_brl_slow
         basis_bps = self._signal.basis_bps
@@ -2125,6 +2292,17 @@ class XEMMLeadLagController(ControllerBase):
             self._arb_failures_today = 0
             self._arb_realized_loss_today = Decimal("0")
             self._arb_last_reset_day = today
+
+        # 6.7b. Reset daily realized-PnL counter at UTC date rollover (independent
+        # day key from arb so the two paths stay decoupled — if one ever moves
+        # to a different rollover schedule the other is unaffected).
+        if today != self._daily_pnl_last_reset_day:
+            if self._daily_pnl_last_reset_day:
+                self.logger().info(
+                    f"Daily realized PnL reset (was {self._daily_realized_pnl})"
+                )
+            self._daily_realized_pnl = Decimal("0")
+            self._daily_pnl_last_reset_day = today
 
         # 7. Active executor count
         active = self.filter_executors(
@@ -2180,6 +2358,13 @@ class XEMMLeadLagController(ControllerBase):
             "audit_drift_active": 1 if self._last_audit_results.get("_drift_active") else 0,
             "audit_inflight_active": 1 if self._last_audit_results.get("_inflight_active") else 0,
             "boot_paused": 1 if self._boot_paused else 0,
+            # PnL-safety telemetry (drives CSV columns and external watchdog).
+            "daily_realized_pnl": self._daily_realized_pnl,
+            "session_pnl_total": self._session_pnl_total,
+            "session_pnl_peak": self._session_pnl_peak,
+            "session_drawdown": self._session_pnl_peak - self._session_pnl_total,
+            "consecutive_losing_fills": self._consecutive_losing_fills,
+            "hourly_burn": self._hourly_burn(now),
         }
 
         # Tier 3 throttling: CSV write at most once per second, even when running
@@ -2202,6 +2387,23 @@ class XEMMLeadLagController(ControllerBase):
         except Exception:
             return False
 
+    def _hourly_burn(self, now: float) -> Decimal:
+        """Return the net PnL sum across the last 3600 seconds.
+
+        Trims expired entries in-place (deque popleft from the front). Cheap
+        in the steady state because closed executors are rare (~tens per hour
+        at worst), so the deque stays small.
+        """
+        cutoff = now - 3600.0
+        while self._hourly_pnl_history and self._hourly_pnl_history[0][0] < cutoff:
+            self._hourly_pnl_history.popleft()
+        if not self._hourly_pnl_history:
+            return Decimal("0")
+        total = Decimal("0")
+        for _, pnl in self._hourly_pnl_history:
+            total += pnl
+        return total
+
     def _compute_regime(
         self,
         now: float,
@@ -2220,13 +2422,61 @@ class XEMMLeadLagController(ControllerBase):
             self._kill_reason = "KILL_SWITCH"
             return Regime.KILLED, "KILL_SWITCH"
 
-        # 3. Circuit breakers
-        if self._consecutive_hedge_failures >= self.config.max_consecutive_hedge_failures:
-            self._kill_reason = "HEDGE_FAILURES"
-            return Regime.KILLED, "HEDGE_FAILURES"
+        # 3. Circuit breakers (PnL-based — each measures a different failure mode)
+
+        # 3a. HEDGE_FAILURES — proxy via inventory_audit's drift counter.
+        # When the maker fills and the taker hedge fails, drift appears and
+        # persists across audits. N consecutive stuck audits on ANY base asset
+        # is treated as N consecutive hedge failures. Single source of truth:
+        # we read the same _drift_consecutive_audits the DRIFT_STUCK gate uses.
+        if self._drift_consecutive_audits:
+            worst = max(self._drift_consecutive_audits.values())
+            if worst >= self.config.max_consecutive_hedge_failures:
+                self._kill_reason = f"HEDGE_FAILURES_{worst}_audits"
+                return Regime.KILLED, self._kill_reason
+
+        # 3b. DAILY_LOSS_LIMIT — realized PnL since UTC midnight.
         if self._daily_realized_pnl <= -self.config.max_daily_loss_quote:
             self._kill_reason = "DAILY_LOSS_LIMIT"
             return Regime.KILLED, "DAILY_LOSS_LIMIT"
+
+        # 3c. SESSION_DRAWDOWN — peak-to-trough since process start.
+        # Catches "made 80 BRL by lunch, gave back 60 by dinner" — net daily
+        # is +20 (under DAILY_LOSS_LIMIT) but drawdown is 60 BRL.
+        drawdown = self._session_pnl_peak - self._session_pnl_total
+        if drawdown >= self.config.max_session_drawdown_quote:
+            self._kill_reason = f"SESSION_DRAWDOWN_{drawdown:.2f}"
+            return Regime.KILLED, self._kill_reason
+
+        # 3d. LOSING_STREAK — N consecutive closed executors with net_pnl < 0.
+        # Fast-trip for adverse-selection clusters before daily_loss accumulates.
+        if self._consecutive_losing_fills >= self.config.max_consecutive_losing_fills:
+            self._kill_reason = f"LOSING_STREAK_{self._consecutive_losing_fills}"
+            return Regime.KILLED, self._kill_reason
+
+        # 3e. HOURLY_BURN — sum of net_pnl over the last 3600s.
+        # Detects slow bleeds before daily_loss bites (e.g. consistent ~5 BRL
+        # losses across an hour adds to 50 BRL — half the daily limit, but a
+        # clear signal something is broken).
+        burn = self._hourly_burn(now)
+        if burn <= -self.config.max_hourly_burn_quote:
+            self._kill_reason = f"HOURLY_BURN_{burn:.2f}"
+            return Regime.KILLED, self._kill_reason
+
+        # 3f. UNREALIZED_LOSS — sum of |drift| * mid_price across base assets.
+        # Defense-in-depth against the case where inventory_audit's auto_rebalance
+        # cannot keep up with growing drift (e.g. taker side keeps rejecting
+        # MARKET orders). max_drift_quote triggers rebalance at e.g. 60 BRL;
+        # this gate trips KILL once the cumulative exposure crosses the higher
+        # threshold (default 100 BRL) without waiting for the 30-audit DRIFT_STUCK.
+        total_drift_quote = Decimal("0")
+        for asset, info in self._last_audit_results.items():
+            if asset.startswith("_") or not isinstance(info, dict):
+                continue
+            total_drift_quote += info.get("delta_quote", Decimal("0"))
+        if total_drift_quote >= self.config.max_unrealized_loss_quote:
+            self._kill_reason = f"UNREALIZED_LOSS_{total_drift_quote:.2f}"
+            return Regime.KILLED, self._kill_reason
 
         # 4. Hard PAUSE gates
         if self._signal.is_any_stale:
