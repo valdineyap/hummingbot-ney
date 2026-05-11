@@ -257,51 +257,66 @@ class BitprecoExchange(ExchangePyBase):
         amount_str = f"{amount:f}"
         market = await self.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
 
-        # MARKET BUY needs a non-zero price so that BitPreco can compute
-        # `volume = amount * price` and pass the `min_volume` check. The
-        # framework passes price=0 for MARKET orders, which causes the
-        # exchange to reject with BELOW_MINIMUM_VOLUME (observed in prod
-        # 2026-05-11 01:10:34 — auto_rebalance loop stuck for 6h because
-        # every MARKET BUY rebalance was rejected). We synthesize a
-        # price = best_ask * 1.01 — 1% slippage buffer — which the
-        # matching engine ignores for execution but uses for the volume
-        # check. Falls back to mid-price * 1.01 if best_ask unavailable.
-        # SELL MARKET doesn't need this: BitPreco accepts price=0 there
-        # because the volume is calculated from the bid side at fill time.
+        # BitPreco's MARKET BUY API differs from MARKET SELL: the `amount`
+        # field is interpreted as the VOLUME to spend in quote currency (BRL),
+        # NOT the base amount to buy (BTC). Empirically confirmed by every
+        # MARKET BUY attempt in the log history (2026-05-05 through 2026-05-11)
+        # being rejected with `BELOW_MINIMUM_VOLUME` and
+        # `requested_volume: 0` — BitPreco couldn't read a non-zero volume
+        # from our payload because we were sending 0.0002 (BTC) where they
+        # expected a value in BRL (which they then read as essentially 0).
+        #
+        # Fix: convert the requested base amount to quote currency before
+        # sending. Use best_ask * 1.01 as the ceiling price (1% buffer for
+        # book walking) so the final fill amount in BTC is >= what was
+        # requested. BitPreco refunds unused BRL after the market order
+        # completes, so over-spending the buffer is safe.
+        #
+        # SELL MARKET does NOT need this conversion: BitPreco accepts
+        # `amount` in base (BTC) for sells, and that path has many
+        # successful executions in the log history.
+        #
+        # The previous "synthesized price" attempt (2026-05-11 01:10) was
+        # based on the wrong assumption that BitPreco computes
+        # `volume = amount * price` — it doesn't, hence the rejections
+        # continued unchanged after that fix landed.
         if (order_type is OrderType.MARKET
-                and trade_type is TradeType.BUY
-                and price <= 0):
+                and trade_type is TradeType.BUY):
             try:
-                synthesized = self.get_price(trading_pair, True)
-                if synthesized is None or synthesized <= 0 or synthesized.is_nan():
-                    raise ValueError(f"get_price returned {synthesized!r}")
-                price = synthesized * Decimal("1.01")
-                self.logger().info(
-                    f"[market_buy_price] synthesized price={price:f} "
-                    f"(best_ask*1.01) for MARKET BUY {amount_str} {market} "
-                    f"— required by BitPreco min_volume check."
+                ceiling_price = self.get_price(trading_pair, True)  # best_ask
+                if ceiling_price is None or ceiling_price <= 0 or ceiling_price.is_nan():
+                    raise ValueError(f"get_price returned {ceiling_price!r}")
+                ceiling_price = ceiling_price * Decimal("1.01")
+                amount_brl = (amount * ceiling_price).quantize(
+                    Decimal("0.01"), rounding="ROUND_UP"
                 )
+                self.logger().info(
+                    f"[market_buy_volume] converted {amount:f} BTC "
+                    f"→ {amount_brl} BRL volume "
+                    f"(ceiling_price={ceiling_price:f}) for MARKET BUY on BitPreco."
+                )
+                amount_str = f"{amount_brl:f}"
+                price = Decimal("0")  # not used by BitPreco for MARKET BUY
             except Exception as e:
                 self.logger().error(
-                    f"[market_buy_price] failed to synthesize price for "
-                    f"MARKET BUY {amount_str} {market}: {type(e).__name__}: {e}. "
+                    f"[market_buy_volume] failed to compute BRL volume for "
+                    f"MARKET BUY {amount} {market}: {type(e).__name__}: {e}. "
                     f"BitPreco will likely reject as BELOW_MINIMUM_VOLUME."
                 )
 
         # BitPreco rejects fractional prices for BTC-BRL. We must send integer
         # BRL prices, with SIDE-AWARE rounding to keep LIMIT_MAKER intent:
-        #   BUY  → floor (stays below the ask, won't cross)
-        #   SELL → ceil  (stays above the bid, won't cross)
+        #   LIMIT BUY  → floor (stays below the ask, won't cross)
+        #   LIMIT SELL → ceil  (stays above the bid, won't cross)
         # Without this, BitPreco would silently round (typically up), which
         # could flip a LIMIT_MAKER BUY into a taker fill and drain inventory.
-        # For MARKET BUY (with synthesized price above) we ROUND_UP instead
-        # so the synthesized price stays >= best_ask*1.01 after rounding.
+        # MARKET BUY now sets price=0 (BRL volume is in `amount` field per
+        # the conversion above) so the rounding is a no-op for it.
         # Only applied to BTC-BRL where the integer-price rule is confirmed;
         # other pairs keep the price as-is for now.
         if market.upper() in ("BTC-BRL", "BTCBRL"):
             if trade_type is TradeType.BUY:
-                rounding = "ROUND_UP" if order_type is OrderType.MARKET else "ROUND_DOWN"
-                price_to_send = price.quantize(Decimal("1"), rounding=rounding)
+                price_to_send = price.quantize(Decimal("1"), rounding="ROUND_DOWN")
             else:
                 price_to_send = price.quantize(Decimal("1"), rounding="ROUND_UP")
         else:
