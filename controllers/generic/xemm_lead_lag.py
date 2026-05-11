@@ -905,6 +905,14 @@ class XEMMLeadLagController(ControllerBase):
             #      (BitPreco delayed-fill race) — the original executor
             #      may already be dead, so the controller must own this.
             def _on_fill(_tag, _caller, event, _src=conn_name):
+                # Touch _last_fill_time FIRST. The 10-s inflight window now
+                # covers any fill — XEMM closes, ghost late fills, arb legs
+                # mid-execution, even auto_rebalance MARKET fills — not just
+                # executor-close transitions. Prevents the race observed in
+                # 2026-05-11 16:50:46 where the inventory_audit ran 1 s after
+                # an arb's leg-1 fill, saw the transient drift, and queued a
+                # MARKET SELL that collided with the arb's own leg-2 SELL.
+                self._last_fill_time = time.time()
                 if self._trade_ledger is not None:
                     try:
                         self._trade_ledger.record_raw_fill(event, source_connector=_src)
@@ -1678,16 +1686,31 @@ class XEMMLeadLagController(ControllerBase):
           * A fill event occurred within the last 10 seconds: the WS account
             stream may not have propagated the balance update yet, and the
             hedge order may still be in flight.
+          * An arbitrage executor is currently running (Fix A 2026-05-11):
+            arb has TWO MARKET legs; between leg-1 fill and leg-2 fill the
+            inventory is INTENTIONALLY skewed. Without this check the audit
+            mistook the transient as drift and queued a third MARKET order
+            on the same exchange leg-2 was about to use — double-sold the
+            position (observed 16:50:46). Active arb is a stronger signal
+            than the 10s timer because BitPreco's REST poll path for fill
+            detection can take longer than 10s.
 
-        Why 10 seconds is sufficient:
+        Why 10 seconds is sufficient for the timer path:
           * XEMM fill → hedge MARKET order typically completes in < 2s.
           * Audit interval is 5 minutes — any drift that persists for 5 minutes
             is real, not transient. The 10s grace window is more than enough.
         """
-        # The only genuinely transient state: a fill happened recently enough
-        # that the resulting balance change may not yet be settled.
+        # Recent fill: WS account-stream balance update may still be in flight.
         if self._last_fill_time > 0 and (time.time() - self._last_fill_time) < 10.0:
             return True
+
+        # Active arb executor: leg-1 already filled, leg-2 pending. Drift is
+        # by design here — do not interfere.
+        for ex in (self.executors_info or []):
+            if not getattr(ex, "is_done", True):
+                ex_type = getattr(getattr(ex, "config", None), "type", "")
+                if ex_type == "lead_lag_arbitrage_executor":
+                    return True
 
         return False
 

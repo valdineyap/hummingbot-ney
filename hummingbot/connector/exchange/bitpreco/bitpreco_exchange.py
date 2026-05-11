@@ -75,6 +75,12 @@ class BitprecoExchange(ExchangePyBase):
         self._trading_rules_polling_task = None
         self._last_poll_timestamp = 0
         self._order_tracker: ClientOrderTracker = ClientOrderTracker(connector=self)
+        # === Latency instrumentation (2026-05-11) ===
+        # Maps client_order_id → time.time() at REST `place_order` submission,
+        # used to compute submit-to-fill latency when a TradeUpdate arrives in
+        # ``_all_trade_updates_for_order``. Cleared per-order on first fill.
+        # Self-pruning: capped at 200 entries (FIFO drop) to keep memory bounded.
+        self._place_order_submit_times: Dict[str, float] = {}
 
     @property
     def name(self) -> str:
@@ -338,6 +344,11 @@ class BitprecoExchange(ExchangePyBase):
         # Wrap the request itself: on network/parse exceptions the order may
         # have been accepted by BitPreco anyway. Try to recover before
         # propagating, otherwise we leave an unhedged orphan on the book.
+        # === Latency instrumentation ===
+        # Time just the REST round-trip; combined with the fill-side log in
+        # _all_trade_updates_for_order, this separates BitPreco server-side
+        # latency from our own fill-detection latency.
+        api_start = time.time()
         try:
             response = await self._api_request(
                 method=RESTMethod.POST,
@@ -345,15 +356,24 @@ class BitprecoExchange(ExchangePyBase):
                 data=self._add_auth_token_to_req_body(data),
             )
         except Exception as net_err:
+            api_elapsed_ms = (time.time() - api_start) * 1000
             self.logger().warning(
-                f"BitPreco place_order request raised "
-                f"({type(net_err).__name__}: {net_err}) — attempting recovery via open_orders."
+                f"[bp_timing] place_order REST raised after {api_elapsed_ms:.0f}ms "
+                f"cmd={data['cmd']} limited={is_limited} "
+                f"({type(net_err).__name__}: {net_err}) — attempting recovery."
             )
             recovered = await self._try_recover_placement(
                 market, trade_type, amount_str, price_str, transact_time)
             if recovered is not None:
                 return (recovered, transact_time)
             raise
+        api_elapsed_ms = (time.time() - api_start) * 1000
+        self.logger().info(
+            f"[bp_timing] place_order REST cmd={data['cmd']} "
+            f"limited={is_limited} amount={amount_str} → "
+            f"took {api_elapsed_ms:.0f}ms "
+            f"response_cod={response.get('message_cod') if isinstance(response, dict) else 'non-dict'}"
+        )
 
         # Defensive parsing — BitPreco returns different shapes for success/failure
         # and we were silently raising KeyError, leaving orphan orders on the
@@ -396,6 +416,18 @@ class BitprecoExchange(ExchangePyBase):
             raise IOError(f"BitPreco place_order: no order id in response: {response}")
 
         o_id = str(oid_value)
+        # Record submit time for fill-latency instrumentation. Read by
+        # _all_trade_updates_for_order when this order's fill is detected.
+        # Keep the dict bounded — drop the oldest entry when it grows past
+        # 200 (FIFO via insertion order on Python 3.7+ dicts).
+        # Defensive lazy-init: some unit tests bypass __init__ via
+        # ``BitprecoExchange.__new__``, so the attribute may not exist yet.
+        if not hasattr(self, "_place_order_submit_times"):
+            self._place_order_submit_times = {}
+        self._place_order_submit_times[order_id] = transact_time
+        if len(self._place_order_submit_times) > 200:
+            oldest_key = next(iter(self._place_order_submit_times))
+            self._place_order_submit_times.pop(oldest_key, None)
         return (o_id, transact_time)
 
     async def _place_cancel(self, order_id: str, tracked_order: InFlightOrder):
@@ -763,6 +795,20 @@ class BitprecoExchange(ExchangePyBase):
                         fill_timestamp=fill_timestamp,
                     )
                     trade_updates.append(trade_update)
+                    # Submit-to-fill latency log. Distinguishes our fill-
+                    # detection lag from BitPreco's server-side matching
+                    # latency (the place_order REST log measures the latter).
+                    submit_ts = self._place_order_submit_times.pop(
+                        order.client_order_id, None
+                    )
+                    if submit_ts is not None:
+                        e2e_ms = (time.time() - submit_ts) * 1000
+                        self.logger().info(
+                            f"[bp_timing] fill_detected order={order.client_order_id} "
+                            f"side={order.trade_type.name} amount={trade_update.fill_base_amount} "
+                            f"price={trade_update.fill_price} → "
+                            f"submit_to_fill={e2e_ms:.0f}ms (REST poll path)"
+                        )
         return trade_updates
 
     def _create_order_book_data_source(self) -> BitprecoAPIOrderBookDataSource:
@@ -978,7 +1024,26 @@ class BitprecoExchange(ExchangePyBase):
     async def _user_stream_event_listener(self):
         async for event_message in self._iter_user_event_queue():
             if event_message.get("event") == "flash":
+                # Instrumentation: how long after our most recent place_order
+                # did this WS flash arrive? Identifies whether the lag is on
+                # BitPreco's WS push or on our own poll path below.
+                flash_t = time.time()
+                if self._place_order_submit_times:
+                    most_recent = max(self._place_order_submit_times.values())
+                    ws_lag_ms = (flash_t - most_recent) * 1000
+                    self.logger().info(
+                        f"[bp_timing] WS flash arrived {ws_lag_ms:.0f}ms after "
+                        f"most recent place_order "
+                        f"(pending_orders={len(self._place_order_submit_times)})"
+                    )
                 await self._update_all_balances()
+                # NOTE: This 5-second sleep is the dominant source of fill-
+                # detection latency observed 2026-05-11 (arb leg-2 only
+                # discovered as filled ~5 s after BitPreco actually matched).
+                # Kept conservatively until the timing logs above confirm
+                # whether REST `_update_order_status` is reliable without
+                # the buffer. Adjusting here is the single-line fix; do
+                # NOT remove without verifying via [bp_timing] log diff.
                 await self._sleep(5.0)
                 await self._update_order_status()
 

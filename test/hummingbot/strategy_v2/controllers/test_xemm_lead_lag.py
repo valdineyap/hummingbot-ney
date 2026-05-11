@@ -1631,6 +1631,45 @@ class TestInflightActivityDetection(_AuditBaseTest):
         self.controller._last_fill_time = time.time() - 2.0  # 2s ago
         self.assertTrue(self.controller._has_inflight_activity())
 
+    def test_active_arb_executor_is_inflight_even_without_recent_fill(self):
+        """Fix A (2026-05-11): an active arb executor is considered inflight
+        for the full duration of its lifecycle, regardless of the 10-s timer.
+
+        Arb has TWO MARKET legs; between leg-1 fill and leg-2 fill the
+        inventory is INTENTIONALLY skewed. If the audit interprets that
+        transient as drift, it queues a parallel MARKET order that
+        collides with the arb's own leg-2 (observed prod 16:50:46:
+        double-sold the position).
+        """
+        arb_executor = MagicMock()
+        arb_executor.is_done = False
+        arb_executor.config.type = "lead_lag_arbitrage_executor"
+        self.controller.executors_info = [arb_executor]
+        # No recent fill — timer path would say "not inflight"
+        self.controller._last_fill_time = 0.0
+        self.assertTrue(self.controller._has_inflight_activity())
+
+    def test_done_arb_executor_is_not_inflight(self):
+        """Once an arb has finished (both legs settled, is_done=True), it
+        no longer suppresses the audit."""
+        arb_executor = MagicMock()
+        arb_executor.is_done = True
+        arb_executor.config.type = "lead_lag_arbitrage_executor"
+        self.controller.executors_info = [arb_executor]
+        self.controller._last_fill_time = 0.0
+        self.assertFalse(self.controller._has_inflight_activity())
+
+    def test_non_arb_active_executor_does_not_trigger_arb_path(self):
+        """Regression: an active XEMM (non-arb) executor must NOT trigger the
+        arb-active inflight path. XEMM normal steady-state is open maker
+        orders, which is fine for the audit to run on."""
+        xemm_executor = MagicMock()
+        xemm_executor.is_done = False
+        xemm_executor.config.type = "xemm_executor"
+        self.controller.executors_info = [xemm_executor]
+        self.controller._last_fill_time = 0.0
+        self.assertFalse(self.controller._has_inflight_activity())
+
 
 class TestBootPausedMode(_AuditBaseTest):
     def setUp(self):
