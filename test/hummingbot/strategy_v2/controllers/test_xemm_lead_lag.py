@@ -1180,6 +1180,152 @@ class TestArbNetSpawnGate(_ArbBaseTest):
         self.assertEqual(pd["arb_tx_cost_bps"], Decimal("0"))
 
 
+class TestArbSpawnRaceGuard(_ArbBaseTest):
+    """Pins the spawn-race fix added 2026-05-11 17:35.
+
+    Before the fix, ``_has_active_arb_executor`` only saw the latest
+    ``executors_info`` snapshot. The framework updates that ASYNCHRONOUSLY
+    after CreateExecutorAction dispatch, so multiple arbs could spawn at
+    the cooldown boundary before any registered. Observed in prod: 10
+    arbs spawned in 47 s, none executed, all sat in RUNNING forever.
+
+    Fix: ``_arb_spawn_pending_until`` is set to ``now + 30 s`` when we
+    return a CreateExecutorAction; cleared the moment we observe the
+    executor in ``executors_info``.
+    """
+    async def test_pending_blocks_second_spawn_within_grace(self):
+        # First spawn → flag set
+        self._set_vwap(
+            taker_buy=Decimal("300000"),
+            maker_sell=Decimal("300600"),  # 20 bps gross
+        )
+        await self._warm()
+        self.controller.executors_info = []
+        self.controller._last_action_time = 0.0
+        self.controller._last_arb_time = 0.0
+        first_actions = self.controller.determine_executor_actions()
+        first_creates = [a for a in first_actions if isinstance(a, CreateExecutorAction)]
+        self.assertEqual(len(first_creates), 1)
+        self.assertGreater(self.controller._arb_spawn_pending_until, 0)
+        # executors_info STILL empty (framework hasn't registered yet)
+        # Tick forward past arb_min_interval_sec but within 30 s grace
+        now = self.market_data_provider.time.return_value
+        self.market_data_provider.time.return_value = now + 10.0
+        self.controller._last_action_time = 0.0  # bypass anti-churn
+        self.controller._last_arb_time = 0.0  # bypass arb cooldown
+        second_actions = self.controller.determine_executor_actions()
+        second_creates = [
+            a for a in second_actions if isinstance(a, CreateExecutorAction)
+            and a.executor_config.type == "lead_lag_arbitrage_executor"
+        ]
+        # Spawn-race guard should block this second spawn
+        self.assertEqual(len(second_creates), 0)
+
+    async def test_pending_cleared_when_executor_observed(self):
+        self._set_vwap(
+            taker_buy=Decimal("300000"),
+            maker_sell=Decimal("300600"),
+        )
+        await self._warm()
+        self.controller._last_arb_time = 0.0
+        self.controller._last_action_time = 0.0
+        # Simulate the pending flag being set
+        now = self.market_data_provider.time.return_value
+        self.controller._arb_spawn_pending_until = now + 25.0
+        # Inject an active arb executor (framework caught up)
+        arb_ex = MagicMock()
+        arb_ex.is_done = False
+        arb_ex.config.type = "lead_lag_arbitrage_executor"
+        arb_ex.config.id = "ARB-OBSERVED"
+        # _has_active_arb_executor is what clears the flag
+        was_active = self.controller._has_active_arb_executor([arb_ex])
+        self.assertTrue(was_active)
+        self.assertEqual(self.controller._arb_spawn_pending_until, 0.0)
+
+    async def test_pending_auto_expires_after_30s(self):
+        # If executor never registers, flag must auto-expire after 30 s.
+        # vwap must be set BEFORE _warm so processed_data carries the arb edge.
+        self._set_vwap(
+            taker_buy=Decimal("300000"),
+            maker_sell=Decimal("300600"),
+        )
+        await self._warm()
+        now = self.market_data_provider.time.return_value
+        # Simulate pending that has already expired (now > pending_until).
+        self.controller._arb_spawn_pending_until = now - 1.0
+        self.controller.executors_info = []
+        self.controller._last_arb_time = 0.0
+        self.controller._last_action_time = 0.0
+        actions = self.controller.determine_executor_actions()
+        creates = [
+            a for a in actions if isinstance(a, CreateExecutorAction)
+            and a.executor_config.type == "lead_lag_arbitrage_executor"
+        ]
+        # Expired pending should NOT block
+        self.assertEqual(len(creates), 1)
+
+
+class TestArbExecutorAgeOut(_ArbBaseTest):
+    """An arb executor that polls profitability forever without firing
+    is killed after ``arb_executor_max_age_sec`` to prevent accumulation
+    and race-to-execute when threshold finally crosses."""
+
+    async def test_old_arb_executor_is_killed(self):
+        await self._warm()
+        now = self.market_data_provider.time.return_value
+        # Inject a stale arb executor (spawned 120 s ago, never executed)
+        stale = MagicMock()
+        stale.is_done = False
+        stale.config.type = "lead_lag_arbitrage_executor"
+        stale.config.id = "ARB-STALE"
+        stale.timestamp = now - 120.0  # well past max_age (default 60 s)
+        self.controller.executors_info = [stale]
+        # Bypass anti-churn so we reach the sweep
+        self.controller._last_action_time = 0.0
+        actions = self.controller.determine_executor_actions()
+        stops = [
+            a for a in actions if isinstance(a, StopExecutorAction)
+            and a.executor_id == "ARB-STALE"
+        ]
+        self.assertEqual(len(stops), 1)
+
+    async def test_fresh_arb_executor_not_killed(self):
+        await self._warm()
+        now = self.market_data_provider.time.return_value
+        fresh = MagicMock()
+        fresh.is_done = False
+        fresh.config.type = "lead_lag_arbitrage_executor"
+        fresh.config.id = "ARB-FRESH"
+        fresh.timestamp = now - 10.0  # only 10 s old
+        self.controller.executors_info = [fresh]
+        self.controller._last_action_time = 0.0
+        actions = self.controller.determine_executor_actions()
+        stops = [
+            a for a in actions if isinstance(a, StopExecutorAction)
+            and a.executor_id == "ARB-FRESH"
+        ]
+        self.assertEqual(len(stops), 0)
+
+    async def test_xemm_executor_not_subject_to_arb_age_out(self):
+        """Only arb executors age out — XEMM executors have their own
+        lifecycle."""
+        await self._warm()
+        now = self.market_data_provider.time.return_value
+        old_xemm = MagicMock()
+        old_xemm.is_done = False
+        old_xemm.config.type = "xemm_executor"
+        old_xemm.config.id = "XEMM-OLD"
+        old_xemm.timestamp = now - 600.0  # 10 minutes
+        self.controller.executors_info = [old_xemm]
+        self.controller._last_action_time = 0.0
+        actions = self.controller.determine_executor_actions()
+        stops = [
+            a for a in actions if isinstance(a, StopExecutorAction)
+            and a.executor_id == "XEMM-OLD"
+        ]
+        self.assertEqual(len(stops), 0)
+
+
 class TestArbCounterReset(_ArbBaseTest):
     async def test_failures_reset_at_new_utc_day(self):
         # Set fail count

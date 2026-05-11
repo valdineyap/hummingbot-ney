@@ -186,6 +186,15 @@ class XEMMLeadLagConfig(ControllerConfigBase):
     # Rate limits
     arb_max_per_hour: int = Field(default=10)
     arb_min_interval_sec: float = Field(default=5.0)
+    # Max time an arb executor may stay in RUNNING without firing
+    # execute_arbitrage. The executor polls profitability each tick; if a
+    # spawn condition disappears immediately after spawn, the executor
+    # would otherwise sit forever waiting for an opportunity. Observed in
+    # prod 2026-05-11 17:35: 10 arbs spawned, none executed, all stuck.
+    # 60s is long enough that a real fast-moving opportunity has time to
+    # cross threshold + execute, but short enough that stuck executors
+    # don't accumulate.
+    arb_executor_max_age_sec: float = Field(default=60.0)
 
     # Capital strategy (dynamic — checks free balance at spawn time)
     arb_capital_strategy: str = Field(default="skip_if_insufficient")  # or "cancel_xemm_to_free"
@@ -794,6 +803,19 @@ class XEMMLeadLagController(ControllerBase):
         # === Arb circuit breaker state ===
         self._last_arb_time: float = 0.0
         self._arb_history: List[float] = []   # timestamps within sliding 1h window
+        # Spawn-race fix (2026-05-11): _has_active_arb_executor checks
+        # self.executors_info which is updated ASYNCHRONOUSLY by the
+        # framework after CreateExecutorAction is dispatched. Between
+        # dispatching the action and the executor appearing in
+        # executors_info, multiple ticks can pass — 10 arbs spawned in 47 s
+        # at the 5-s cooldown boundary because none had registered yet.
+        # ``_arb_spawn_pending_until`` is set to ``now + 30 s`` when we
+        # return a CreateExecutorAction, and cleared the moment we observe
+        # the resulting executor in ``executors_info`` (i.e. inside
+        # ``_has_active_arb_executor`` returning True). The 30-s ceiling
+        # guards against the rare case where an executor fails to register
+        # at all — we'd lose at most one spawn window, not block forever.
+        self._arb_spawn_pending_until: float = 0.0
         self._arb_paused_until: float = 0.0
         self._arb_failures_today: int = 0
         self._arb_realized_loss_today: Decimal = Decimal("0")
@@ -2870,6 +2892,40 @@ class XEMMLeadLagController(ControllerBase):
         if (now - self._last_action_time) < self.config.min_requote_interval_sec:
             return []
 
+        # === Arb executor age-out ===
+        # An arb executor that polls profitability forever without firing
+        # blocks all subsequent arbs (one-at-a-time invariant) AND can race
+        # to execute concurrently with newly-spawned arbs if the spread
+        # eventually crosses the threshold. Hard-kill any arb that has
+        # been RUNNING longer than arb_executor_max_age_sec.
+        for executor in active_executors:
+            ex_type = getattr(getattr(executor, "config", None), "type", "")
+            if ex_type != "lead_lag_arbitrage_executor":
+                continue
+            spawn_ts = getattr(executor, "timestamp", None) or getattr(
+                getattr(executor, "config", None), "timestamp", None
+            )
+            if spawn_ts is None:
+                continue
+            age = now - float(spawn_ts)
+            if age > self.config.arb_executor_max_age_sec:
+                self.logger().warning(
+                    f"[arb_age_out] killing arb executor "
+                    f"{getattr(executor.config, 'id', '?')} age={age:.0f}s "
+                    f"(> {self.config.arb_executor_max_age_sec:.0f}s) — "
+                    f"never executed."
+                )
+                actions.append(StopExecutorAction(
+                    controller_id=self.config.id,
+                    executor_id=executor.config.id,
+                    keep_position=False,
+                ))
+        if actions:
+            # Don't try to spawn new ones in the same tick where we're killing
+            # stale ones; let the cancellations settle first.
+            self._last_action_time = now
+            return actions
+
         # === Phase 3a: pure arb gate (capital-aware, has its own cooldown) ===
         if self.config.enable_pure_arb:
             arb_action = self._maybe_create_arb_action(now, active_executors)
@@ -2982,12 +3038,20 @@ class XEMMLeadLagController(ControllerBase):
     # Pure arbitrage helpers                                             #
     # ------------------------------------------------------------------ #
     def _has_active_arb_executor(self, active_executors) -> bool:
-        """Atomicity: only one arb executor at a time."""
-        return any(
+        """Atomicity: only one arb executor at a time.
+
+        Side-effect: when an arb is observed in ``active_executors``, the
+        spawn-race pending flag is cleared (the framework has caught up and
+        registered the executor we recently dispatched).
+        """
+        active = any(
             getattr(e.config, "type", "") == "lead_lag_arbitrage_executor"
             and not e.is_done
             for e in active_executors
         )
+        if active:
+            self._arb_spawn_pending_until = 0.0
+        return active
 
     def _purge_old_arb_history(self, now: float) -> None:
         """Drop history older than 1h (sliding window for arb_max_per_hour)."""
@@ -3064,6 +3128,20 @@ class XEMMLeadLagController(ControllerBase):
             if (now - self._arb_last_gate_log_ts) >= 5.0:
                 self.logger().info(f"[arb_gate_skip] {reason}")
                 self._arb_last_gate_log_ts = now
+
+        # Spawn-race guard: if we recently returned a CreateExecutorAction
+        # for an arb but the framework hasn't yet registered it in
+        # executors_info, the next call to _has_active_arb_executor would
+        # return False (stale snapshot) and we'd spawn duplicates. The flag
+        # is cleared as soon as _has_active_arb_executor observes the
+        # registered executor; otherwise it auto-clears after 30 s so a
+        # never-registered spawn doesn't block forever.
+        if now < self._arb_spawn_pending_until:
+            _gate_log(
+                f"pending spawn registration "
+                f"({self._arb_spawn_pending_until - now:.1f}s grace remaining)"
+            )
+            return None
 
         # Circuit breakers
         if now < self._arb_paused_until:
@@ -3163,6 +3241,9 @@ class XEMMLeadLagController(ControllerBase):
         # All gates passed — spawn.
         self._last_arb_time = now
         self._arb_history.append(now)
+        # Spawn-race guard: block further spawns for up to 30 s, OR until
+        # _has_active_arb_executor confirms the executor registered.
+        self._arb_spawn_pending_until = now + 30.0
         self.logger().warning(
             f"[arb_spawn] SPAWNING {side} arb: "
             f"net={edge_net_bps:.2f}bps gross={edge_gross_bps:.2f}bps "
