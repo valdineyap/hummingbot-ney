@@ -40,7 +40,6 @@ PAUSE_FILE=/tmp/xemm_lead_lag_pause
 #   WATCHDOG_STATE_STALE_SEC     = 120 s    (state.json not refreshed → bot hung)
 WATCHDOG_DAILY_LOSS=${WATCHDOG_DAILY_LOSS:-150}
 WATCHDOG_SESSION_LOSS=${WATCHDOG_SESSION_LOSS:-120}
-WATCHDOG_STATE_STALE_SEC=${WATCHDOG_STATE_STALE_SEC:-120}
 
 TS=$(date -u +%Y-%m-%dT%H:%M:%SZ)
 
@@ -73,25 +72,17 @@ UPDATED_AT=$(grep -oE '"updated_at":[[:space:]]*"[^"]+"' "$STATE" | grep -oE '"[
 PNL_TODAY=${PNL_TODAY:-0}
 PNL_SESSION=${PNL_SESSION:-0}
 
-# --- Staleness: how long since state.json was last written? ---
+# --- Staleness (logged for visibility, NOT used for tripping) ---
+# state.json is written ONLY when the trade ledger sees a fill — markets
+# can easily be quiet for hours in BRL pairs off-peak, so this metric is
+# useless for liveness. Liveness is the heartbeat script's job (pgrep).
+# Kept here as telemetry only.
 if [ -n "$UPDATED_AT" ]; then
     STATE_EPOCH=$(date -d "$UPDATED_AT" +%s 2>/dev/null || echo 0)
     NOW_EPOCH=$(date +%s)
     STALE_SEC=$((NOW_EPOCH - STATE_EPOCH))
 else
     STALE_SEC=99999
-fi
-
-# --- Check stale state (bot hung / not producing fills since N seconds) ---
-# Only trip on staleness if the bot is supposedly alive — if the process is
-# already gone, the heartbeat handles DOWN and there is no value in pausing.
-if [ -n "$BOT_PID" ] && [ "$STALE_SEC" -gt "$WATCHDOG_STATE_STALE_SEC" ]; then
-    # A stale state with the bot still running is ALSO not always bad: it
-    # just means no fills have happened recently. We log it but only trip
-    # when staleness is extreme (>20m) — otherwise idle markets falsely fire.
-    if [ "$STALE_SEC" -gt 1200 ]; then
-        trip "STATE_STALE_${STALE_SEC}s" "pnl_today=$PNL_TODAY pnl_session=$PNL_SESSION"
-    fi
 fi
 
 # --- Compare PnL against thresholds (use awk for float comparison) ---
