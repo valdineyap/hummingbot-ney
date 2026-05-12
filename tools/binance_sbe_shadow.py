@@ -76,6 +76,36 @@ from typing import Any, Dict, List
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 sys.path.insert(0, str(PROJECT_ROOT))
 
+
+def _load_env_file(path: Path) -> None:
+    """Populate ``os.environ`` from a minimal ``KEY=VALUE`` file.
+
+    Only sets keys that aren't already in the environment, so explicit
+    shell exports always win — that matches the behaviour of
+    ``start_xemm_lead_lag.sh``'s ``${VAR:-default}`` pattern.
+
+    Kept inline (no ``python-dotenv`` dependency) so the tool can run
+    on a minimal hummingbot conda env without extra packages.
+    """
+    if not path.is_file():
+        return
+    for raw in path.read_text().splitlines():
+        line = raw.strip()
+        if not line or line.startswith("#"):
+            continue
+        if "=" not in line:
+            continue
+        key, _, value = line.partition("=")
+        key = key.strip()
+        # Strip surrounding quotes if present (e.g. KEY="value with spaces").
+        value = value.strip().strip('"').strip("'")
+        if key and key not in os.environ:
+            os.environ[key] = value
+
+
+# Auto-load .env so the user doesn't need to remember to `source` it.
+_load_env_file(PROJECT_ROOT / ".env")
+
 try:
     import psutil
 except ImportError:  # pragma: no cover

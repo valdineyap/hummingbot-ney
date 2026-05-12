@@ -31,6 +31,24 @@ if [ -z "$1" ]; then
 fi
 
 # ============================================================
+# Environment file loading
+# ============================================================
+# If a local `.env` exists, source it so all variables defined there
+# become available to the python process. The file is gitignored — see
+# `.env.example` for the supported variables.
+#
+# We use `set -a` / `set +a` so every VAR=VALUE line in `.env` is
+# auto-exported, no need for explicit `export` per line. This means
+# `.env` is just a list of `KEY=VALUE` lines, no `export` prefix.
+# ============================================================
+if [ -f "$(dirname "$0")/.env" ]; then
+    set -a
+    # shellcheck disable=SC1091
+    source "$(dirname "$0")/.env"
+    set +a
+fi
+
+# ============================================================
 # BitPreco fast-path routing (BitPreco-owned operators only)
 # ============================================================
 # Route BitPreco traffic through the internal network instead of the
@@ -46,9 +64,13 @@ fi
 # NO fallback: if set, the internal route must always be reachable.
 # Read by hummingbot/connector/exchange/bitpreco/bitpreco_constants.py
 # at import time, so it MUST be exported here (before python boots).
+#
+# These exports are kept as a fallback / hardcoded baseline; if you
+# prefer per-host configuration, move them into `.env` and remove
+# from here (last assignment wins in bash).
 # ============================================================
-export BITPRECO_INTERNAL_BOOKS="http://54.232.138.12"
-export BITPRECO_INTERNAL_API="https://backend.bitpreco.com/exchange/exch_api.php"
+export BITPRECO_INTERNAL_BOOKS="${BITPRECO_INTERNAL_BOOKS:-http://54.232.138.12}"
+export BITPRECO_INTERNAL_API="${BITPRECO_INTERNAL_API:-https://backend.bitpreco.com/exchange/exch_api.php}"
 
 # Kill any running instance gracefully
 if pgrep -f "conf_xemm_lead_lag_shadow" > /dev/null; then
