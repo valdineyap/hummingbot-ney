@@ -280,7 +280,8 @@ class WebsocketMessagesTest(IsolatedAsyncioWrapperTestCase):
 
     async def test_malformed_frame_does_not_kill_stream(self):
         """A single broken frame should be logged and skipped — the next
-        frame must still be processed."""
+        frame must still be processed. Covers truncated buffers and
+        similar per-frame anomalies."""
         ds = _make_data_source()
         ws = _make_ws_assistant_with_messages([
             _make_ws_response(b"\x00\x00"),  # too short for header
@@ -290,6 +291,48 @@ class WebsocketMessagesTest(IsolatedAsyncioWrapperTestCase):
         trade_q = ds._message_queue[ds._trade_messages_queue_key]
         self.assertEqual(trade_q.qsize(), 1)
         self.assertEqual(trade_q.get_nowait()["t"], 99)
+
+    async def test_schema_mismatch_propagates_does_not_silently_skip(self):
+        """A schemaId mismatch means every frame on this stream will be
+        unparseable. We MUST surface this loudly (by propagating the
+        exception so the base reconnect loop kicks in) rather than
+        silently logging + dropping every frame, which would look like
+        the stream went idle. Pinned because conflating
+        SbeSchemaMismatchError with the generic SbeDecodeError catch
+        would be an easy regression to ship."""
+        ds = _make_data_source()
+        # Build a frame with the wrong schemaId — same layout as a valid
+        # trade frame but the schema id bytes are bumped.
+        bad_frame = bytearray(_build_trade_frame())
+        # MessageHeader layout: blockLength(2) + templateId(2) + schemaId(2) + version(2)
+        # → schemaId starts at byte 4. Set to a value != SBE_SCHEMA_ID.
+        bad_schema_id = CONSTANTS.SBE_SCHEMA_ID + 7
+        bad_frame[4:6] = struct.pack("<H", bad_schema_id)
+
+        ws = _make_ws_assistant_with_messages([_make_ws_response(bytes(bad_frame))])
+        from hummingbot.connector.exchange.binance_sbe.sbe_decoder import (
+            SbeSchemaMismatchError,
+        )
+        with self.assertRaises(SbeSchemaMismatchError):
+            await ds._process_websocket_messages(ws)
+        # Nothing got enqueued — bot would have seen "no data" not "bad data".
+        for k in ds._get_messages_queue_keys():
+            self.assertEqual(ds._message_queue[k].qsize(), 0)
+
+    async def test_truncated_frame_does_not_propagate(self):
+        """Complementary to the schema-mismatch test: a truncated buffer
+        is per-frame, not systemic — we still swallow it and keep
+        processing."""
+        ds = _make_data_source()
+        ws = _make_ws_assistant_with_messages([
+            _make_ws_response(b"\x00" * 3),  # truncated header
+            _make_ws_response(_build_trade_frame(trade_id=123)),
+        ])
+        # Must NOT raise.
+        await ds._process_websocket_messages(ws)
+        trade_q = ds._message_queue[ds._trade_messages_queue_key]
+        self.assertEqual(trade_q.qsize(), 1)
+        self.assertEqual(trade_q.get_nowait()["t"], 123)
 
     async def test_unexpected_payload_type_does_not_crash(self):
         ds = _make_data_source()

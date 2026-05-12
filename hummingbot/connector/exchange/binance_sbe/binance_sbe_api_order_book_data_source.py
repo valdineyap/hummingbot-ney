@@ -27,7 +27,7 @@ from hummingbot.connector.exchange.binance.binance_api_order_book_data_source im
 )
 from hummingbot.connector.exchange.binance_sbe import binance_sbe_constants as CONSTANTS
 from hummingbot.connector.exchange.binance_sbe import sbe_decoder
-from hummingbot.connector.exchange.binance_sbe.sbe_decoder import SbeDecodeError
+from hummingbot.connector.exchange.binance_sbe.sbe_decoder import SbeDecodeError, SbeSchemaMismatchError
 from hummingbot.core.web_assistant.connections.data_types import WSJSONRequest, WSResponse
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
 from hummingbot.core.web_assistant.ws_assistant import WSAssistant
@@ -241,11 +241,20 @@ class BinanceSbeAPIOrderBookDataSource(BinanceAPIOrderBookDataSource):
     async def _process_binary_frame(self, frame: bytes) -> None:
         try:
             events = sbe_decoder.decode_frame(frame)
+        except SbeSchemaMismatchError:
+            # Schema (id or non-additive version) mismatch is systemic —
+            # every frame on this stream will fail the same way. Propagate
+            # so the base ``listen_for_subscriptions`` exception handler
+            # logs and forces a reconnect; if the issue is persistent
+            # (Binance bumped the schema), this surfaces as a loud,
+            # operator-visible reconnect loop rather than a silently
+            # empty queue. Matches the fail-stop policy documented in
+            # the implementation plan.
+            self.logger().exception("[binance_sbe] schema mismatch while decoding SBE frame")
+            raise
         except SbeDecodeError:
-            # Log + skip the frame. Schema-id mismatch and truncated
-            # frames both raise here; we don't kill the whole stream
-            # because a single malformed frame should be recoverable
-            # (the next frame will succeed).
+            # Truncated buffers and other per-frame anomalies are
+            # recoverable — the next frame will succeed. Log + skip.
             self.logger().exception("[binance_sbe] failed to decode SBE frame")
             return
 
