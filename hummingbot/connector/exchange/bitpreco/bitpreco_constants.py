@@ -6,34 +6,54 @@ from hummingbot.core.data_type.in_flight_order import OrderState
 # ----------------------------------------------------------------------------
 # Fast-path internal routing (BitPreco-owned operators only)
 # ----------------------------------------------------------------------------
-# Two independent host overrides, one per endpoint category:
+# Two independent overrides, with DIFFERENT semantics:
 #
-#   BITPRECO_INTERNAL_BOOKS  → public market data (order book, ticker, trades)
-#   BITPRECO_INTERNAL_API    → private REST trading (place/cancel/balance/etc.)
+#   BITPRECO_INTERNAL_BOOKS  → HOST for public market data. Paths
+#                              ({pair}/orderbook, btc-brl/ticker, ...)
+#                              are appended by the connector.
+#                              Example: http://54.232.138.12
 #
-# Both default to the public host. If set, there is NO fallback to the public
-# host on failure — the internal host MUST be reachable. A network error on
-# the internal host propagates as a normal IOError, intentionally (silent
-# fallback would mask a real outage).
+#   BITPRECO_INTERNAL_API    → FULL URL for private REST trading. Every
+#                              cmd (buy, sell, order_cancel, balance,
+#                              all_orders_cancel, ...) is POSTed to this
+#                              single endpoint with the cmd in the JSON
+#                              body — same as the public /trading.
+#                              Example:
+#                              https://backend.bitpreco.com/exchange/exch_api.php
 #
-# Legacy env vars `BITPRECO_ORDER_BOOK_URL` and `BITPRECO_TRADING_URL` are
-# kept as low-level escape hatches: if set, they win over the `*_INTERNAL_*`
-# variables for their specific endpoints.
+# The asymmetry exists because the private side is a single endpoint
+# discriminated by `cmd` in the body, while the public side is REST with
+# multiple paths.
+#
+# Both default to the public host. If set, there is NO fallback on
+# failure — the internal route MUST be reachable. A network error
+# propagates as a normal IOError, intentionally (silent fallback would
+# mask a real outage).
+#
+# Legacy env vars `BITPRECO_ORDER_BOOK_URL` and `BITPRECO_TRADING_URL`
+# are kept as low-level escape hatches: if set, they win over the
+# `*_INTERNAL_*` variables for their specific endpoints.
 # ----------------------------------------------------------------------------
 
 _DEFAULT_HOST = "https://api.bitpreco.com"
 
 _PUBLIC_HOST = os.environ.get("BITPRECO_INTERNAL_BOOKS", _DEFAULT_HOST).rstrip("/")
-_TRADING_HOST = os.environ.get("BITPRECO_INTERNAL_API", _DEFAULT_HOST).rstrip("/")
 
-# Public market data endpoints
+# Public market data endpoints (host + path)
 ORDER_BOOK_PATH_URL = f"{_PUBLIC_HOST}/{{}}/orderbook"
 
 
 # REST API ENDPOINTS
 TRADING_PATH_URL = "trading"
 DEFAULT_DOMAIN = "bitpreco_trading"
-REST_URL = f"{_TRADING_HOST}/{TRADING_PATH_URL}"
+
+# Private REST trading endpoint: BITPRECO_INTERNAL_API, if set, is the
+# FULL URL — used verbatim. Otherwise default to the public host + /trading.
+_internal_api = os.environ.get("BITPRECO_INTERNAL_API")
+if _internal_api:
+    REST_URL = _internal_api.rstrip("/")
+else:
+    REST_URL = f"{_DEFAULT_HOST}/{TRADING_PATH_URL}"
 
 # Legacy escape hatches — take precedence over *_INTERNAL_* for their endpoint.
 if os.environ.get('BITPRECO_ORDER_BOOK_URL') is not None:

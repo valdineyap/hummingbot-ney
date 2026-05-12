@@ -34,17 +34,21 @@ fi
 # BitPreco fast-path routing (BitPreco-owned operators only)
 # ============================================================
 # Route BitPreco traffic through the internal network instead of the
-# public internet. Two independent toggles:
+# public internet. Two independent toggles with DIFFERENT semantics:
 #
-#   BITPRECO_INTERNAL_BOOKS — public endpoints (book, ticker, trades)
-#   BITPRECO_INTERNAL_API   — private REST trading (auth_token; place/cancel/balance)
+#   BITPRECO_INTERNAL_BOOKS — HOST for public endpoints (book, ticker,
+#                              trades). Paths are appended by the
+#                              connector.
+#   BITPRECO_INTERNAL_API   — FULL URL for private REST trading
+#                              (place/cancel/balance/etc.). All cmds
+#                              POST to this single endpoint.
 #
-# NO fallback: if set, the internal host must always be reachable.
+# NO fallback: if set, the internal route must always be reachable.
 # Read by hummingbot/connector/exchange/bitpreco/bitpreco_constants.py
 # at import time, so it MUST be exported here (before python boots).
 # ============================================================
 # export BITPRECO_INTERNAL_BOOKS="http://54.232.138.12"
-# export BITPRECO_INTERNAL_API="http://<internal-trading-host>"   # phase 2
+# export BITPRECO_INTERNAL_API="https://backend.bitpreco.com/exchange/exch_api.php"
 
 # Kill any running instance gracefully
 if pgrep -f "conf_xemm_lead_lag_shadow" > /dev/null; then
