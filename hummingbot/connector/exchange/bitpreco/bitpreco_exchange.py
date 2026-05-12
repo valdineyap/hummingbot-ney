@@ -81,6 +81,11 @@ class BitprecoExchange(ExchangePyBase):
         # ``_all_trade_updates_for_order``. Cleared per-order on first fill.
         # Self-pruning: capped at 200 entries (FIFO drop) to keep memory bounded.
         self._place_order_submit_times: Dict[str, float] = {}
+        # Last time `_update_balances` SUCCESSFULLY refreshed `_account_balances`.
+        # Read by callers (e.g. controller's inventory audit) to gauge staleness
+        # before trusting the cached balance for drift detection.
+        # Initial 0.0 means "never refreshed yet"; treat as max-stale.
+        self._last_balance_update_ts: float = 0.0
 
     @property
     def name(self) -> str:
@@ -958,7 +963,21 @@ class BitprecoExchange(ExchangePyBase):
             new_state=new_state,
         )
 
-    async def _update_balances(self):
+    async def _update_balances(self, _trigger: str = "unknown"):
+        """Refresh account balances from BitPreco REST.
+
+        ``_trigger`` is a free-form string identifying the caller; used in
+        ``[bp_balance]`` log so we can see WHICH entry point is keeping the
+        cache fresh (or not). Common triggers:
+          - ``ws_flash``     : WS user-stream "flash" event listener
+          - ``periodic``     : framework's ``_status_polling_loop``
+          - ``post_place``   : forced after place_order (added 2026-05-12)
+          - ``audit_force``  : forced by controller audit before reading
+          - ``unknown``      : any other caller (default; investigation aid)
+        """
+        if not hasattr(self, "_last_balance_update_ts"):
+            self._last_balance_update_ts = 0.0
+        api_start = time.time()
         local_asset_names = set(self._account_balances.keys())
         remote_asset_names = set()
         data = {"cmd": "balance"}
@@ -967,6 +986,7 @@ class BitprecoExchange(ExchangePyBase):
             path_url=CONSTANTS.REST_URL,
             data=self._add_auth_token_to_req_body(data),
         )
+        api_elapsed_ms = (time.time() - api_start) * 1000
         self.logger().debug(
             f"bitpreco _update_balances raw response: type={type(balances).__name__} "
             f"keys={list(balances.keys()) if isinstance(balances, dict) else 'n/a'}"
@@ -1013,9 +1033,20 @@ class BitprecoExchange(ExchangePyBase):
             del self._account_available_balances[asset_name]
             del self._account_balances[asset_name]
 
-    async def _update_all_balances(self):
+        # Stamp success and log so we can see the staleness from the audit side.
+        prev_ts = self._last_balance_update_ts
+        self._last_balance_update_ts = time.time()
+        gap_s = (self._last_balance_update_ts - prev_ts) if prev_ts > 0 else None
+        gap_str = f"gap={gap_s:.1f}s" if gap_s is not None else "first_refresh"
+        btc = self._account_balances.get("BTC", "n/a")
+        brl = self._account_balances.get("BRL", "n/a")
+        self.logger().info(
+            f"[bp_balance] trigger={_trigger} REST took {api_elapsed_ms:.0f}ms "
+            f"BTC={btc} BRL={brl} {gap_str}"
+        )
 
-        await self._update_balances()
+    async def _update_all_balances(self, _trigger: str = "periodic"):
+        await self._update_balances(_trigger=_trigger)
         # if not self.real_time_balance_update:
         # This is only required for exchanges that do not provide balance update notifications through websocket
         self._in_flight_orders_snapshot = {k: copy.copy(v) for k, v in self.in_flight_orders.items()}
@@ -1036,7 +1067,7 @@ class BitprecoExchange(ExchangePyBase):
                         f"most recent place_order "
                         f"(pending_orders={len(self._place_order_submit_times)})"
                     )
-                await self._update_all_balances()
+                await self._update_all_balances(_trigger="ws_flash")
                 # === FOLLOW-UP REQUIRED — see DEVELOPMENT_STATUS.md ===
                 # Reduced from 5.0s → 0.5s on 2026-05-11. Original 5s was
                 # undocumented (present since the connector's first commit

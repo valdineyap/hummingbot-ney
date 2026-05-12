@@ -1736,7 +1736,7 @@ class XEMMLeadLagController(ControllerBase):
 
         return False
 
-    def _run_inventory_audit(self, now: float, source: str = "periodic") -> None:
+    async def _run_inventory_audit(self, now: float, source: str = "periodic") -> None:
         """
         For each base asset configured in inventory_audit.base_targets, compute
         |delta| = |actual_total - target_total| and compare against tolerance.
@@ -1769,6 +1769,43 @@ class XEMMLeadLagController(ControllerBase):
         # but we DO update ``_last_audit_results`` so the gate stays live.
         killed = self._kill_reason is not None
         self._last_audit_time = now
+
+        # === Force-refresh balances before reading (2026-05-12 fix) ===
+        # Observed 2026-05-11 22:30: audit fired off STALE BitPreco balance
+        # (28 s old — cycle 4's BUY hadn't propagated to the connector's
+        # cached _account_balances). False drift detection → unnecessary
+        # rebalance → HEDGE_FAILURES_3 → KILLED. BitPreco's REST balance
+        # endpoint updates immediately post-fill (per operator confirmation
+        # 2026-05-12); the lag was 100% on our side (WS flash missed or
+        # periodic-poll cadence too coarse). Forcing a refresh here adds
+        # ~200ms × 2 connectors = ~400ms to audit cycle (10 s interval =
+        # 4 % overhead), in exchange for accurate drift detection.
+        for conn_name in (self.config.maker_connector, self.config.taker_connector):
+            try:
+                conn = self.market_data_provider.get_connector(conn_name)
+            except Exception:
+                continue
+            update_fn = getattr(conn, "_update_balances", None)
+            if update_fn is None:
+                continue
+            # BitPreco's override accepts `_trigger=`; framework default
+            # doesn't. Try the named arg first, fall back gracefully.
+            try:
+                await update_fn(_trigger=f"audit_force_{source}")
+            except TypeError:
+                try:
+                    await update_fn()
+                except Exception as e:
+                    self.logger().warning(
+                        f"[audit/{source}] force-refresh balance failed "
+                        f"for {conn_name}: {type(e).__name__}: {e}"
+                    )
+            except Exception as e:
+                self.logger().warning(
+                    f"[audit/{source}] force-refresh balance failed "
+                    f"for {conn_name}: {type(e).__name__}: {e}"
+                )
+
         inflight = self._has_inflight_activity()
         results: Dict[str, Dict[str, Decimal]] = {"_inflight_active": inflight}
         any_drift = False
@@ -2438,7 +2475,7 @@ class XEMMLeadLagController(ControllerBase):
         if (self._startup_cleanup_done
                 and not self._initial_audit_done
                 and self.config.inventory_audit.enabled):
-            self._run_inventory_audit(now, source="boot")
+            await self._run_inventory_audit(now, source="boot")
             self._initial_audit_done = True
             if self._kill_reason is None:
                 # No drift, or auto_rebalance/alert (no kill set) → proceed
@@ -2466,7 +2503,7 @@ class XEMMLeadLagController(ControllerBase):
         if (self._initial_audit_done
                 and self.config.inventory_audit.enabled
                 and (now - self._last_audit_time) >= self.config.inventory_audit.audit_interval_sec):
-            self._run_inventory_audit(now, source="periodic")
+            await self._run_inventory_audit(now, source="periodic")
 
         # === Purge stale ghost-order entries (cheap dict trim) ===
         # Runs every tick; cost is O(N) where N is small (only orders cancelled

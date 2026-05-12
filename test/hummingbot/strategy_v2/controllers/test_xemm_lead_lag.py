@@ -1418,12 +1418,12 @@ class _AutoRebalanceBaseTest(_AuditBaseTest):
 
 
 class TestAutoRebalanceQueuing(_AutoRebalanceBaseTest):
-    def test_excess_queues_rebalance(self):
+    async def test_excess_queues_rebalance(self):
         """Drift >0 (excess BTC) queues a rebalance without setting kill reason."""
         self._mock_total_balance(Decimal("0.0012"), Decimal("0.0010"))  # 0.0022 total, +0.0002 excess
         self.controller._has_inflight_activity = MagicMock(return_value=False)
 
-        self.controller._run_inventory_audit(now=1700000000.0, source="periodic")
+        await self.controller._run_inventory_audit(now=1700000000.0, source="periodic")
 
         # kill_reason must NOT be set (auto_rebalance does not pause the bot)
         self.assertIsNone(self.controller._kill_reason)
@@ -1431,18 +1431,18 @@ class TestAutoRebalanceQueuing(_AutoRebalanceBaseTest):
         self.assertIn("BTC", self.controller._pending_rebalances)
         self.assertGreater(self.controller._pending_rebalances["BTC"], Decimal("0"))
 
-    def test_deficit_queues_rebalance(self):
+    async def test_deficit_queues_rebalance(self):
         """Drift <0 (deficit BTC) queues a rebalance."""
         self._mock_total_balance(Decimal("0.0009"), Decimal("0.0009"))  # 0.0018 total, -0.0002 deficit
         self.controller._has_inflight_activity = MagicMock(return_value=False)
 
-        self.controller._run_inventory_audit(now=1700000000.0, source="periodic")
+        await self.controller._run_inventory_audit(now=1700000000.0, source="periodic")
 
         self.assertIsNone(self.controller._kill_reason)
         self.assertIn("BTC", self.controller._pending_rebalances)
         self.assertLess(self.controller._pending_rebalances["BTC"], Decimal("0"))
 
-    def test_cooldown_blocks_second_queue(self):
+    async def test_cooldown_blocks_second_queue(self):
         """If a rebalance was placed recently, the next audit defers."""
         self._mock_total_balance(Decimal("0.0012"), Decimal("0.0010"))
         self.controller._has_inflight_activity = MagicMock(return_value=False)
@@ -1450,11 +1450,11 @@ class TestAutoRebalanceQueuing(_AutoRebalanceBaseTest):
         # Simulate a rebalance that was placed 30s ago (cooldown=120s)
         self.controller._rebalance_last_time["BTC"] = now - 30.0
 
-        self.controller._run_inventory_audit(now=now, source="periodic")
+        await self.controller._run_inventory_audit(now=now, source="periodic")
 
         self.assertNotIn("BTC", self.controller._pending_rebalances)
 
-    def test_cooldown_expired_allows_queue(self):
+    async def test_cooldown_expired_allows_queue(self):
         """After cooldown expires, rebalance is re-queued."""
         self._mock_total_balance(Decimal("0.0012"), Decimal("0.0010"))
         self.controller._has_inflight_activity = MagicMock(return_value=False)
@@ -1462,7 +1462,7 @@ class TestAutoRebalanceQueuing(_AutoRebalanceBaseTest):
         # Last rebalance was 130s ago (> 120s cooldown)
         self.controller._rebalance_last_time["BTC"] = now - 130.0
 
-        self.controller._run_inventory_audit(now=now, source="periodic")
+        await self.controller._run_inventory_audit(now=now, source="periodic")
 
         self.assertIn("BTC", self.controller._pending_rebalances)
 
@@ -1645,14 +1645,14 @@ class TestAutoRebalanceExecution(_AutoRebalanceBaseTest):
 
 
 class TestAutoRebalanceBootBehavior(_AutoRebalanceBaseTest):
-    def test_boot_exits_with_drift_when_auto_rebalance_configured(self):
+    async def test_boot_exits_with_drift_when_auto_rebalance_configured(self):
         """With auto_rebalance, boot_paused exits even when drift is found."""
         self._mock_total_balance(Decimal("0.0012"), Decimal("0.001"))  # excess
         self.controller._has_inflight_activity = MagicMock(return_value=False)
         self.controller._boot_paused = True
         self.controller._initial_audit_done = False
 
-        self.controller._run_inventory_audit(now=1700000000.0, source="boot")
+        await self.controller._run_inventory_audit(now=1700000000.0, source="boot")
         self.controller._initial_audit_done = True
         # With auto_rebalance, _kill_reason is NOT set → boot_paused can exit
         if self.controller._kill_reason is None:
@@ -1679,45 +1679,45 @@ class TestInventoryAuditConfigDefaults(_BaseControllerTest):
 
 
 class TestInventoryAuditNoDrift(_AuditBaseTest):
-    def test_no_drift_when_balances_match_target(self):
+    async def test_no_drift_when_balances_match_target(self):
         # 0.001 + 0.001 = 0.002 (target) → no drift
         self._mock_total_balance(Decimal("0.001"), Decimal("0.001"))
-        self.controller._run_inventory_audit(now=1700000000.0, source="boot")
+        await self.controller._run_inventory_audit(now=1700000000.0, source="boot")
         result = self.controller._last_audit_results["BTC"]
         self.assertTrue(result["within"])
         self.assertEqual(result["delta"], Decimal("0"))
         # No kill switch
         self.assertIsNone(self.controller._kill_reason)
 
-    def test_no_drift_within_tolerance(self):
+    async def test_no_drift_within_tolerance(self):
         # 0.001 + 0.0009905 = 0.0019905 → -0.0000095 from target (~-0.475%, within 0.5%)
         self._mock_total_balance(Decimal("0.001"), Decimal("0.0009905"))
-        self.controller._run_inventory_audit(now=1700000000.0, source="boot")
+        await self.controller._run_inventory_audit(now=1700000000.0, source="boot")
         result = self.controller._last_audit_results["BTC"]
         self.assertTrue(result["within"])
         self.assertIsNone(self.controller._kill_reason)
 
 
 class TestInventoryAuditDriftPause(_AuditBaseTest):
-    def test_drift_above_tolerance_trips_kill_switch(self):
+    async def test_drift_above_tolerance_trips_kill_switch(self):
         # 0.001 + 0.0008 = 0.0018 → -0.0002 from target (-10%, well above 0.5%)
         self._mock_total_balance(Decimal("0.001"), Decimal("0.0008"))
         # Ensure no in-flight activity
         self.controller.executors_info = []
         self.controller._has_inflight_activity = MagicMock(return_value=False)
 
-        self.controller._run_inventory_audit(now=1700000000.0, source="boot")
+        await self.controller._run_inventory_audit(now=1700000000.0, source="boot")
         result = self.controller._last_audit_results["BTC"]
         self.assertFalse(result["within"])
         self.assertEqual(self.controller._kill_reason, "INVENTORY_DRIFT_BTC")
         self.assertTrue(self.controller._last_audit_results["_drift_active"])
 
-    def test_drift_deferred_when_inflight_active(self):
+    async def test_drift_deferred_when_inflight_active(self):
         # Same drift but in-flight active → defer (no kill)
         self._mock_total_balance(Decimal("0.001"), Decimal("0.0008"))
         self.controller._has_inflight_activity = MagicMock(return_value=True)
 
-        self.controller._run_inventory_audit(now=1700000000.0, source="boot")
+        await self.controller._run_inventory_audit(now=1700000000.0, source="boot")
         # No kill set
         self.assertIsNone(self.controller._kill_reason)
         # _drift_active stays False (action was deferred)
@@ -1727,12 +1727,12 @@ class TestInventoryAuditDriftPause(_AuditBaseTest):
 
 
 class TestInventoryAuditAlertAction(_AuditBaseTest):
-    def test_alert_action_logs_but_does_not_pause(self):
+    async def test_alert_action_logs_but_does_not_pause(self):
         self.config.inventory_audit.on_drift_action = "alert"
         self._mock_total_balance(Decimal("0.001"), Decimal("0.0008"))
         self.controller._has_inflight_activity = MagicMock(return_value=False)
 
-        self.controller._run_inventory_audit(now=1700000000.0, source="periodic")
+        await self.controller._run_inventory_audit(now=1700000000.0, source="periodic")
         # alert action does NOT trip kill switch
         self.assertIsNone(self.controller._kill_reason)
         # but _drift_active flagged for CSV
@@ -1754,7 +1754,7 @@ class TestAuditPassiveModeWhenKilled(_AuditBaseTest):
     increment, kill re-trip, CRITICAL spam).
     """
 
-    def test_killed_audit_still_updates_drift_active_on_refresh(self):
+    async def test_killed_audit_still_updates_drift_active_on_refresh(self):
         """Drift cleared after kill → audit must flip _drift_active to False."""
         # Setup: bot is KILLED with drift previously detected.
         self.controller._kill_reason = "HEDGE_FAILURES_3"
@@ -1765,11 +1765,11 @@ class TestAuditPassiveModeWhenKilled(_AuditBaseTest):
             Decimal("0.001"),   # taker — total 0.002 = target
         )
         self.controller._has_inflight_activity = MagicMock(return_value=False)
-        self.controller._run_inventory_audit(now=1700000000.0, source="periodic")
+        await self.controller._run_inventory_audit(now=1700000000.0, source="periodic")
         # Auto_terminate gate should now see clear state.
         self.assertFalse(self.controller._last_audit_results["_drift_active"])
 
-    def test_killed_audit_still_flags_drift_when_present(self):
+    async def test_killed_audit_still_flags_drift_when_present(self):
         """If drift persists post-kill, gate stays BLOCKED."""
         self.controller._kill_reason = "HEDGE_FAILURES_3"
         self.controller._last_audit_results = {"_drift_active": False}
@@ -1780,10 +1780,10 @@ class TestAuditPassiveModeWhenKilled(_AuditBaseTest):
             Decimal("0.0008"),  # total 0.0018 < target → 0.0002 drift
         )
         self.controller._has_inflight_activity = MagicMock(return_value=False)
-        self.controller._run_inventory_audit(now=1700000000.0, source="periodic")
+        await self.controller._run_inventory_audit(now=1700000000.0, source="periodic")
         self.assertTrue(self.controller._last_audit_results["_drift_active"])
 
-    def test_killed_audit_DOES_queue_rebalance_to_unblock_auto_terminate(self):
+    async def test_killed_audit_DOES_queue_rebalance_to_unblock_auto_terminate(self):
         """Killed mode MUST queue auto_rebalance — that's how the bot
         recovers from drift-deadlock (Fix A, 2026-05-11 19:41).
 
@@ -1805,11 +1805,11 @@ class TestAuditPassiveModeWhenKilled(_AuditBaseTest):
         # Pre-condition: no recent rebalance (cooldown elapsed).
         self.controller._rebalance_last_time = {}
         self.controller._pending_rebalances = {}
-        self.controller._run_inventory_audit(now=1700000000.0, source="periodic")
+        await self.controller._run_inventory_audit(now=1700000000.0, source="periodic")
         # Rebalance MUST be queued for BTC.
         self.assertIn("BTC", self.controller._pending_rebalances)
 
-    def test_killed_audit_respects_rebalance_cooldown(self):
+    async def test_killed_audit_respects_rebalance_cooldown(self):
         """In killed mode the cooldown still applies — we don't want to
         spam rebalance orders if a previous one is still in flight."""
         self.config.inventory_audit.on_drift_action = "auto_rebalance"
@@ -1823,37 +1823,37 @@ class TestAuditPassiveModeWhenKilled(_AuditBaseTest):
             "BTC": now - 30.0  # 30s ago, cooldown is 120s default
         }
         self.controller._pending_rebalances = {}
-        self.controller._run_inventory_audit(now=now, source="periodic")
+        await self.controller._run_inventory_audit(now=now, source="periodic")
         # No new rebalance queued — cooldown still active.
         self.assertEqual(self.controller._pending_rebalances, {})
 
-    def test_killed_audit_does_not_retrip_kill_reason(self):
+    async def test_killed_audit_does_not_retrip_kill_reason(self):
         """Existing kill_reason preserved — we don't overwrite it with
         a DRIFT_STUCK or INVENTORY_DRIFT during shutdown."""
         self.config.inventory_audit.on_drift_action = "pause"
         self.controller._kill_reason = "HEDGE_FAILURES_3"
         self._mock_total_balance(Decimal("0.001"), Decimal("0.0008"))
         self.controller._has_inflight_activity = MagicMock(return_value=False)
-        self.controller._run_inventory_audit(now=1700000000.0, source="periodic")
+        await self.controller._run_inventory_audit(now=1700000000.0, source="periodic")
         self.assertEqual(self.controller._kill_reason, "HEDGE_FAILURES_3")
 
-    def test_killed_audit_does_not_increment_drift_consecutive(self):
+    async def test_killed_audit_does_not_increment_drift_consecutive(self):
         """Drift counter freezes at kill time — we're not actively
         managing the asset anymore."""
         self.controller._kill_reason = "HEDGE_FAILURES_3"
         self.controller._drift_consecutive_audits = {"BTC": 3}
         self._mock_total_balance(Decimal("0.001"), Decimal("0.0008"))
         self.controller._has_inflight_activity = MagicMock(return_value=False)
-        self.controller._run_inventory_audit(now=1700000000.0, source="periodic")
+        await self.controller._run_inventory_audit(now=1700000000.0, source="periodic")
         # Still 3 — not incremented.
         self.assertEqual(self.controller._drift_consecutive_audits["BTC"], 3)
 
-    def test_normal_mode_still_runs_full_audit(self):
+    async def test_normal_mode_still_runs_full_audit(self):
         """Sanity guard: non-killed mode behavior unchanged."""
         self.controller._kill_reason = None
         self._mock_total_balance(Decimal("0.001"), Decimal("0.0008"))
         self.controller._has_inflight_activity = MagicMock(return_value=False)
-        self.controller._run_inventory_audit(now=1700000000.0, source="periodic")
+        await self.controller._run_inventory_audit(now=1700000000.0, source="periodic")
         # Drift action="pause" (default in _AuditBaseTest) → kill_reason set.
         self.assertEqual(self.controller._kill_reason, "INVENTORY_DRIFT_BTC")
         self.assertTrue(self.controller._last_audit_results["_drift_active"])
@@ -1970,13 +1970,13 @@ class TestBootPausedMode(_AuditBaseTest):
         creates = [a for a in actions if hasattr(a, "executor_config")]
         self.assertEqual(len(creates), 0)
 
-    def test_boot_exits_when_cleanup_and_audit_pass(self):
+    async def test_boot_exits_when_cleanup_and_audit_pass(self):
         # No drift case
         self._mock_total_balance(Decimal("0.001"), Decimal("0.001"))
         self.controller._has_inflight_activity = MagicMock(return_value=False)
 
         # Simulate the boot flow: run audit
-        self.controller._run_inventory_audit(now=1700000000.0, source="boot")
+        await self.controller._run_inventory_audit(now=1700000000.0, source="boot")
         # Manually replicate boot transition logic
         self.controller._initial_audit_done = True
         if self.controller._kill_reason is None:
@@ -1985,12 +1985,12 @@ class TestBootPausedMode(_AuditBaseTest):
         self.assertFalse(self.controller._boot_paused)
         self.assertIsNone(self.controller._kill_reason)
 
-    def test_boot_stays_paused_when_audit_detects_drift(self):
+    async def test_boot_stays_paused_when_audit_detects_drift(self):
         # Drift case
         self._mock_total_balance(Decimal("0.001"), Decimal("0.0008"))
         self.controller._has_inflight_activity = MagicMock(return_value=False)
 
-        self.controller._run_inventory_audit(now=1700000000.0, source="boot")
+        await self.controller._run_inventory_audit(now=1700000000.0, source="boot")
         self.controller._initial_audit_done = True
         if self.controller._kill_reason is None:
             self.controller._boot_paused = False
@@ -2001,16 +2001,16 @@ class TestBootPausedMode(_AuditBaseTest):
 
 
 class TestAuditDisabled(_BaseControllerTest):
-    def test_audit_disabled_runs_no_op(self):
+    async def test_audit_disabled_runs_no_op(self):
         # Default: enabled=True but base_targets={} → audit returns immediately
-        self.controller._run_inventory_audit(now=1700000000.0, source="periodic")
+        await self.controller._run_inventory_audit(now=1700000000.0, source="periodic")
         self.assertEqual(self.controller._last_audit_results, {})
         self.assertIsNone(self.controller._kill_reason)
 
-    def test_audit_explicitly_disabled_runs_no_op(self):
+    async def test_audit_explicitly_disabled_runs_no_op(self):
         self.config.inventory_audit.enabled = False
         self.config.inventory_audit.base_targets = {"BTC": Decimal("0.002")}
-        self.controller._run_inventory_audit(now=1700000000.0, source="periodic")
+        await self.controller._run_inventory_audit(now=1700000000.0, source="periodic")
         self.assertEqual(self.controller._last_audit_results, {})
 
 
