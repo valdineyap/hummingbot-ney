@@ -846,15 +846,27 @@ class XEMMLeadLagController(ControllerBase):
         self._rebalance_last_time: Dict[str, float] = {}
         # Minimum seconds between rebalance orders for the same asset.
         self._rebalance_cooldown_sec: float = 120.0
-        # Circuit-breaker: count consecutive audit cycles in which the same
-        # asset remained in drift WITHOUT being resolved by rebalance. If it
-        # reaches the threshold the kill switch trips — a stuck rebalance
-        # loop (e.g. BELOW_MINIMUM_VOLUME on every retry) otherwise burns
-        # rate-limit and consumes the log forever. Observed in prod 2026-05-11
-        # 01:10 — bot looped for 6h on the same BELOW_MINIMUM_VOLUME rejection.
-        # Reset on first audit that finds the asset within tolerance.
-        self._drift_consecutive_audits: Dict[str, int] = {}
-        self._drift_max_consecutive_audits: int = 30
+        # === Barrier-pattern audit state (2026-05-12 simplification) ===
+        # Replaces _drift_consecutive_audits/HEDGE_FAILURES_N strike-rule and
+        # the audit-in-killed-mode complexity. State machine:
+        #   IDLE         — normal: each tick, audit refreshes balance, checks
+        #                  drift; if drift suspected, transitions to CANCELLING.
+        #   CANCELLING   — audit requested stop-the-world; determine_executor_
+        #                  actions emits StopExecutorAction for ALL active
+        #                  executors. Next tick, audit checks quiescence
+        #                  (no active executors + no in-flight orders on
+        #                  either connector).
+        #   VALIDATING   — quiescent reached; audit re-reads balance
+        #                  authoritatively. Drift confirmed → queue rebalance.
+        #                  Drift cleared (false alarm / race) → return to IDLE.
+        # Eliminates the entire class of false-positive drifts caused by
+        # stale balance / hedge-in-flight / arb-leg-in-flight races.
+        self._barrier_state: str = "IDLE"
+        self._barrier_started_at: float = 0.0
+        self._barrier_timeout_sec: float = 5.0
+        # Snapshot from the phase-1 audit that triggered the barrier. Kept
+        # for log/forensic correlation with the post-barrier outcome.
+        self._barrier_drift_snapshot: Dict[str, Dict[str, Decimal]] = {}
 
         # === Orphan order reconciliation ===
         # Periodic check (every _orphan_check_interval_sec) that compares the
@@ -1736,50 +1748,198 @@ class XEMMLeadLagController(ControllerBase):
 
         return False
 
-    async def _run_inventory_audit(self, now: float, source: str = "periodic") -> None:
+    def _is_quiescent(self) -> bool:
+        """True when the bot is in a stop-the-world state suitable for an
+        authoritative balance read:
+          - no active executors (executors_info has no `not is_done`)
+          - no in-flight orders on either connector
+
+        Used by the barrier-pattern audit (CANCELLING → VALIDATING transition).
+        Defensive against MagicMock'ed connectors in tests: ``in_flight_orders``
+        is only inspected when it is an actual dict; anything else is treated
+        as "zero" (the test would have explicitly mocked it otherwise).
         """
-        For each base asset configured in inventory_audit.base_targets, compute
-        |delta| = |actual_total - target_total| and compare against tolerance.
+        for ex in (self.executors_info or []):
+            if not getattr(ex, "is_done", True):
+                return False
+        for conn_name in (self.config.maker_connector, self.config.taker_connector):
+            try:
+                conn = self.market_data_provider.get_connector(conn_name)
+                in_flight = getattr(conn, "in_flight_orders", None)
+                if isinstance(in_flight, dict) and len(in_flight) > 0:
+                    return False
+            except Exception:
+                continue
+        return True
 
-        Drift action only fires when no in-flight activity could explain the
-        imbalance — avoids false positives during legitimate XEMM/arb cycles.
+    def _count_inflight_orders(self) -> int:
+        """Diagnostic helper: total in-flight orders across both connectors.
+        Defensive: only counts when ``in_flight_orders`` is a real dict."""
+        total = 0
+        for conn_name in (self.config.maker_connector, self.config.taker_connector):
+            try:
+                conn = self.market_data_provider.get_connector(conn_name)
+                in_flight = getattr(conn, "in_flight_orders", None)
+                if isinstance(in_flight, dict):
+                    total += len(in_flight)
+            except Exception:
+                continue
+        return total
 
-        Updates `self._last_audit_results` for CSV logging. Sets `self._kill_reason`
-        if drift action is "pause" (which is the production setting).
+    async def _run_inventory_audit(self, now: float, source: str = "periodic") -> None:
+        """Barrier-pattern inventory audit (2026-05-12 simplification).
 
-        Source values:
-          * "boot"     — runs once after startup_cleanup (gates boot_paused exit)
-          * "periodic" — runs every audit_interval_sec
+        State machine:
+          IDLE       → suspect drift → CANCELLING
+          CANCELLING → wait for quiescence → VALIDATING (or timeout)
+          VALIDATING → authoritative re-read → confirmed: queue rebalance;
+                                              cleared: return to IDLE
+                       (always returns to IDLE after this phase)
+
+        Walks as many transitions as possible in a single call. When the
+        bot has no active executors (boot, tests, quiet markets), the full
+        sequence IDLE → CANCELLING → VALIDATING → IDLE runs in one call.
+        When there are active executors that need cancelling, the call
+        ends in CANCELLING and resumes next tick.
+
+        Replaces the previous multi-defense complexity:
+        - ``_has_inflight_activity`` 10s-timer defer-on-recent-fill
+        - ``_drift_consecutive_audits`` 3-strike kill rule
+        - "Audit in killed mode" passive observation
+        All of those were paper-cuts compensating for false-positive drift
+        from stale balance / hedge-in-flight / arb-leg-in-flight races.
+        The barrier eliminates the race window itself.
         """
         cfg = self.config.inventory_audit
         if not cfg.enabled or not cfg.base_targets:
             return
 
-        # When the kill switch is already tripped we still need to compute
-        # drift — the auto_terminate gate reads ``_last_audit_results
-        # ["_drift_active"]`` and would deadlock on a frozen-True snapshot
-        # if the audit stopped refreshing it. Observed 2026-05-11 16:51:
-        # HEDGE_FAILURES_3 trip → audit stopped → a later natural fill
-        # resolved the drift but ``_drift_active`` stayed True → auto_
-        # terminate never fired → bot stuck in KILLED indefinitely.
-        # In killed mode we suppress the noisy/destructive side-effects:
-        #   - no CRITICAL spam (only state-change INFO at the end)
-        #   - no rebalance queueing (we're shutting down)
-        #   - no drift_consecutive_audits increment / re-trip of kill
-        # but we DO update ``_last_audit_results`` so the gate stays live.
-        killed = self._kill_reason is not None
         self._last_audit_time = now
 
-        # === Force-refresh balances before reading (2026-05-12 fix) ===
-        # Observed 2026-05-11 22:30: audit fired off STALE BitPreco balance
-        # (28 s old — cycle 4's BUY hadn't propagated to the connector's
-        # cached _account_balances). False drift detection → unnecessary
-        # rebalance → HEDGE_FAILURES_3 → KILLED. BitPreco's REST balance
-        # endpoint updates immediately post-fill (per operator confirmation
-        # 2026-05-12); the lag was 100% on our side (WS flash missed or
-        # periodic-poll cadence too coarse). Forcing a refresh here adds
-        # ~200ms × 2 connectors = ~400ms to audit cycle (10 s interval =
-        # 4 % overhead), in exchange for accurate drift detection.
+        # State-machine walker. Max 3 transitions in a single call:
+        #   IDLE → CANCELLING → VALIDATING → IDLE.
+        # Any iteration that returns (instead of transitioning) ends the call.
+        for _ in range(3):
+            if self._barrier_state == "IDLE":
+                advance = await self._audit_step_idle(now, source, cfg)
+                if not advance:
+                    return  # no drift detected; stay IDLE
+                # else transitioned to CANCELLING; loop continues
+                continue
+
+            if self._barrier_state == "CANCELLING":
+                advance = self._audit_step_cancelling(now)
+                if not advance:
+                    return  # not quiescent yet; wait next tick
+                # else transitioned to VALIDATING; loop continues
+                continue
+
+            if self._barrier_state == "VALIDATING":
+                await self._audit_step_validating(now, source, cfg)
+                return  # always returns to IDLE; done for this call
+
+            # Unknown state (defensive)
+            self.logger().error(
+                f"[audit/{source}] unknown _barrier_state={self._barrier_state}; resetting to IDLE"
+            )
+            self._barrier_state = "IDLE"
+            return
+
+    async def _audit_step_idle(
+        self, now: float, source: str, cfg: "InventoryAuditConfig",
+    ) -> bool:
+        """IDLE → CANCELLING transition. Returns True if barrier was entered
+        (loop continues), False if no drift was found (stay IDLE)."""
+        await self._force_refresh_balances(source)
+        mid_price = self._read_audit_mid_price(source)
+        if mid_price is None:
+            return False
+
+        results, any_drift = self._compute_drift_per_asset(cfg, mid_price)
+        results["_drift_active"] = any_drift
+        results["_inflight_active"] = self._has_inflight_activity()
+        self._last_audit_results = results
+
+        if source == "boot":
+            self._log_side_imbalance_if_any(results, source)
+
+        if not any_drift:
+            return False
+
+        # Enter barrier
+        self._barrier_state = "CANCELLING"
+        self._barrier_started_at = now
+        self._barrier_drift_snapshot = results
+        self.logger().info(
+            f"[audit/{source}] drift suspected — entering barrier. "
+            f"{self._format_drift_summary(results)}; "
+            f"validation timeout {self._barrier_timeout_sec:.0f}s"
+        )
+        return True
+
+    def _audit_step_cancelling(self, now: float) -> bool:
+        """CANCELLING → VALIDATING transition. Returns True if advanced
+        (quiescent reached OR timeout), False if still waiting."""
+        if self._is_quiescent():
+            elapsed = now - self._barrier_started_at
+            self.logger().info(
+                f"[barrier] quiescent after {elapsed:.1f}s — VALIDATING"
+            )
+            self._barrier_state = "VALIDATING"
+            return True
+        if (now - self._barrier_started_at) > self._barrier_timeout_sec:
+            self.logger().warning(
+                f"[barrier] timeout {self._barrier_timeout_sec:.0f}s reached "
+                f"with {self._count_inflight_orders()} order(s) still in flight "
+                f"— proceeding to VALIDATING anyway"
+            )
+            self._barrier_state = "VALIDATING"
+            return True
+        return False
+
+    async def _audit_step_validating(
+        self, now: float, source: str, cfg: "InventoryAuditConfig",
+    ) -> None:
+        """VALIDATING → IDLE transition (always)."""
+        await self._force_refresh_balances(source)
+        mid_price = self._read_audit_mid_price(source)
+        if mid_price is None:
+            # Can't validate without a price — return to IDLE without
+            # queuing rebalance. Next audit cycle will retry from IDLE.
+            self._barrier_state = "IDLE"
+            self._barrier_drift_snapshot = {}
+            return
+
+        results, any_drift = self._compute_drift_per_asset(cfg, mid_price)
+
+        if any_drift:
+            self.logger().critical(
+                f"[barrier] drift CONFIRMED after quiescence — "
+                f"{self._format_drift_summary(results)}"
+            )
+            self._queue_rebalance_for_confirmed(now, source, cfg, results)
+            if cfg.on_drift_action == "pause":
+                self._maybe_set_kill_reason_from_drift(results)
+        else:
+            self.logger().info(
+                f"[barrier] drift CLEARED after quiescence (was a race / "
+                f"stale read). suspicion snapshot: "
+                f"{self._format_drift_summary(self._barrier_drift_snapshot)}"
+            )
+
+        self._barrier_state = "IDLE"
+        self._barrier_drift_snapshot = {}
+        results["_drift_active"] = any_drift
+        results["_inflight_active"] = False  # we just reached quiescence
+        self._last_audit_results = results
+
+    # ----- audit helpers -----
+
+    async def _force_refresh_balances(self, source: str) -> None:
+        """Ask both connectors to refresh their account_balances cache via
+        REST. BitPreco's override accepts a ``_trigger`` kwarg for log
+        tagging; framework default doesn't — try named, fall back graceful.
+        """
         for conn_name in (self.config.maker_connector, self.config.taker_connector):
             try:
                 conn = self.market_data_provider.get_connector(conn_name)
@@ -1788,8 +1948,6 @@ class XEMMLeadLagController(ControllerBase):
             update_fn = getattr(conn, "_update_balances", None)
             if update_fn is None:
                 continue
-            # BitPreco's override accepts `_trigger=`; framework default
-            # doesn't. Try the named arg first, fall back gracefully.
             try:
                 await update_fn(_trigger=f"audit_force_{source}")
             except TypeError:
@@ -1806,14 +1964,9 @@ class XEMMLeadLagController(ControllerBase):
                     f"for {conn_name}: {type(e).__name__}: {e}"
                 )
 
-        inflight = self._has_inflight_activity()
-        results: Dict[str, Dict[str, Decimal]] = {"_inflight_active": inflight}
-        any_drift = False
-
-        # Convert `max_drift_quote` (BRL) → base-asset tolerance via the maker's
-        # current mid_price. Updated every audit cycle so the threshold tracks
-        # market movement. Fail-safe: if mid_price unavailable, skip this audit
-        # cycle (don't fire false CRITICAL on missing data).
+    def _read_audit_mid_price(self, source: str) -> Optional[Decimal]:
+        """Maker mid_price used to convert ``max_drift_quote`` (BRL) into a
+        base-asset tolerance. Returns None on missing data (audit skips)."""
         try:
             best_bid = self._safe_price(
                 self.config.maker_connector, self.config.maker_trading_pair, PriceType.BestBid
@@ -1823,169 +1976,135 @@ class XEMMLeadLagController(ControllerBase):
             )
             if best_bid is None or best_ask is None or best_bid <= 0 or best_ask <= 0:
                 raise ValueError(f"invalid prices bid={best_bid} ask={best_ask}")
-            mid_price = (best_bid + best_ask) / Decimal("2")
+            return (best_bid + best_ask) / Decimal("2")
         except Exception as e:
             self.logger().warning(
                 f"[audit/{source}] cannot compute mid_price for "
                 f"{self.config.maker_trading_pair} ({type(e).__name__}: {e}) — "
                 f"skipping audit cycle."
             )
-            return
+            return None
 
+    def _compute_drift_per_asset(
+        self, cfg: "InventoryAuditConfig", mid_price: Decimal
+    ) -> Tuple[Dict[str, Dict[str, Decimal]], bool]:
+        """Returns (results, any_drift). results[asset] contains delta /
+        maker_bal / taker_bal / within / delta_quote for each tracked asset.
+        Special keys prefixed with `_` (e.g. `_drift_active`) are added
+        by the caller."""
+        results: Dict[str, Dict[str, Decimal]] = {}
+        any_drift = False
+        tolerance_abs = cfg.max_drift_quote / mid_price
         for asset, target in cfg.base_targets.items():
-            target = Decimal(str(target))
-            # tolerance_abs in base asset = max_drift_quote / mid_price.
-            # Assumes the asset is the BASE of the maker pair — if you add a
-            # target for an asset that's NOT the maker base, this conversion
-            # will be wrong. For BTC-BRL with BTC target this is correct.
-            tolerance_abs = cfg.max_drift_quote / mid_price
-
+            target_dec = Decimal(str(target))
             maker_bal = self._safe_total_balance(self.config.maker_connector, asset)
             taker_bal = self._safe_total_balance(self.config.taker_connector, asset)
             actual = maker_bal + taker_bal
-            delta = actual - target
+            delta = actual - target_dec
             within = abs(delta) <= tolerance_abs
-
             results[asset] = {
                 "actual": actual,
-                "target": target,
+                "target": target_dec,
                 "delta": delta,
-                # Quote-denominated absolute drift (read by the unrealized-loss
-                # gate in _compute_regime). Computed at audit time using the
-                # same mid_price the tolerance uses, so units are consistent.
                 "delta_quote": abs(delta) * mid_price,
                 "maker_bal": maker_bal,
                 "taker_bal": taker_bal,
                 "within": within,
             }
+            if not within:
+                any_drift = True
+        return results, any_drift
 
-            # P1 observability: side-imbalance warning. The audit only
-            # cares about total drift, but when one side is severely
-            # depleted the balance_gate pauses that side and the bot
-            # only trades one direction until a natural fill restores
-            # parity (3 min outage observed in prod 2026-05-11 14:08).
-            # Surface it explicitly so an operator knows what to expect
-            # without grep'ing balance_gate WARNINGs.  Suppressed in
-            # killed mode (operator already knows something's wrong).
-            if (not killed) and within and target > 0 and source == "boot":
-                low_side_ratio = (
-                    min(maker_bal, taker_bal) / target
-                    if target > 0 else Decimal("1")
-                )
-                if low_side_ratio < Decimal("0.25"):
-                    low_side = (
-                        self.config.maker_connector if maker_bal <= taker_bal
-                        else self.config.taker_connector
-                    )
-                    self.logger().warning(
-                        f"[audit/{source}] {asset} TOTAL OK but side-imbalance: "
-                        f"maker={maker_bal:.8f} taker={taker_bal:.8f} target={target} "
-                        f"({low_side} has <25% of target). Bot may pause one side "
-                        f"of hedging until a natural fill restores parity. "
-                        f"Consider depositing on {low_side} if persistent."
-                    )
-
-            if within:
-                # Drift resolved. In normal mode reset the circuit breaker
-                # counter; in killed mode just record the no-drift state
-                # so auto_terminate sees a clear gate next tick.
-                if not killed:
-                    self._drift_consecutive_audits[asset] = 0
+    def _format_drift_summary(self, results: Dict[str, Dict[str, Decimal]]) -> str:
+        parts = []
+        for asset, r in results.items():
+            if asset.startswith("_") or not isinstance(r, dict):
                 continue
+            d = r.get("delta", 0)
+            t = r.get("target", 0)
+            try:
+                pct = (d / t * 100) if t else Decimal("0")
+            except Exception:
+                pct = Decimal("0")
+            parts.append(
+                f"{asset} delta={d:+f} ({pct:+.2f}%) "
+                f"maker={r.get('maker_bal', 0)} taker={r.get('taker_bal', 0)}"
+            )
+        return " | ".join(parts) or "(empty)"
 
-            # Drift detected — defer if a legitimate trade can explain it.
-            # In killed mode we DON'T defer: any drift, transient or not,
-            # blocks auto_terminate, and there's no auto_rebalance to race
-            # with (kill suppresses it below). Just record the drift.
-            if inflight and not killed:
+    def _log_side_imbalance_if_any(
+        self,
+        results: Dict[str, Dict[str, Decimal]],
+        source: str,
+    ) -> None:
+        """Side-imbalance observability (kept from earlier P1 work). Total
+        may be within tolerance but one exchange depleted — flag it so
+        operator knows balance_gate pauses are expected until natural fills
+        restore parity."""
+        for asset, r in results.items():
+            if asset.startswith("_") or not isinstance(r, dict):
+                continue
+            if not r.get("within"):
+                continue
+            target = r["target"]
+            if target <= 0:
+                continue
+            maker_bal = r["maker_bal"]
+            taker_bal = r["taker_bal"]
+            low_side_ratio = min(maker_bal, taker_bal) / target
+            if low_side_ratio < Decimal("0.25"):
+                low_side = (
+                    self.config.maker_connector if maker_bal <= taker_bal
+                    else self.config.taker_connector
+                )
+                self.logger().warning(
+                    f"[audit/{source}] {asset} TOTAL OK but side-imbalance: "
+                    f"maker={maker_bal:.8f} taker={taker_bal:.8f} target={target} "
+                    f"({low_side} has <25% of target). Bot may pause one side "
+                    f"of hedging until a natural fill restores parity. "
+                    f"Consider depositing on {low_side} if persistent."
+                )
+
+    def _queue_rebalance_for_confirmed(
+        self,
+        now: float,
+        source: str,
+        cfg: "InventoryAuditConfig",
+        results: Dict[str, Dict[str, Decimal]],
+    ) -> None:
+        """Queue auto_rebalance MARKET orders for assets confirmed in drift
+        AFTER the barrier validated them. Respects cooldown to prevent spam.
+        """
+        if cfg.on_drift_action != "auto_rebalance":
+            return  # "pause" handled via _maybe_set_kill_reason_from_drift
+        for asset, r in results.items():
+            if asset.startswith("_") or not isinstance(r, dict):
+                continue
+            if r.get("within"):
+                continue
+            last = self._rebalance_last_time.get(asset, 0.0)
+            if (now - last) < self._rebalance_cooldown_sec:
                 self.logger().info(
-                    f"[audit/{source}] {asset} drift {delta:+f} BUT in-flight "
-                    f"activity present — deferring action (target={target}, "
-                    f"actual={actual}, tolerance={tolerance_abs})"
+                    f"[audit/{source}] {asset} confirmed-drift rebalance "
+                    f"deferred — cooldown active "
+                    f"({self._rebalance_cooldown_sec - (now - last):.0f}s remaining)"
                 )
                 continue
+            self._pending_rebalances[asset] = r["delta"]
 
-            any_drift = True
-
-            action = cfg.on_drift_action
-
-            if not killed:
-                # === Normal-mode-only paths ===
-                # Circuit-breaker: count consecutive audits with unresolved drift
-                # for this asset. If rebalance keeps failing (BELOW_MINIMUM_VOLUME
-                # in prod 2026-05-11), drift persists across many audits — at the
-                # threshold we trip the kill switch instead of looping forever.
-                stuck_count = self._drift_consecutive_audits.get(asset, 0) + 1
-                self._drift_consecutive_audits[asset] = stuck_count
-                if stuck_count >= self._drift_max_consecutive_audits:
-                    if self._kill_reason is None:
-                        self._kill_reason = f"DRIFT_STUCK_{asset}_{stuck_count}_audits"
-                    self.logger().critical(
-                        f"[audit/{source}] {asset} drift unresolved for "
-                        f"{stuck_count} consecutive audits "
-                        f"(~{stuck_count * cfg.audit_interval_sec:.0f}s) — "
-                        f"tripping kill switch (KILL_REASON={self._kill_reason}). "
-                        f"Likely cause: rebalance MARKET order keeps failing — "
-                        f"check connector WARN/ERROR logs for the asset's pair."
-                    )
-
-                self.logger().critical(
-                    f"[audit/{source}] {asset} DRIFT actual={actual:f} "
-                    f"(maker={maker_bal:f} taker={taker_bal:f}) target={target:f} "
-                    f"delta={delta:+f} ({delta/target*100:+.3f}%) tolerance={tolerance_abs:f} "
-                    f"— action={cfg.on_drift_action}"
-                )
-
-                if action == "pause":
-                    # Trip kill switch — same path as the watchdog and other
-                    # circuit breakers. The regime gate transitions to KILLED on
-                    # the next regime evaluation; orders are cancelled gracefully.
-                    if self._kill_reason is None:
-                        self._kill_reason = f"INVENTORY_DRIFT_{asset}"
-
-            # === auto_rebalance path runs in BOTH normal and killed mode ===
-            # In killed mode this is essential: without rebalancing, residual
-            # drift (e.g. LOT_SIZE truncation, partial fills) never resolves,
-            # and the auto_terminate gate stays BLOCKED forever — bot vivo but
-            # inerte. Observed 2026-05-11 19:41–21:48 (2h+ deadlock). Cooldown
-            # still applies so we don't spam orders. Kill-related side-effects
-            # (drift_consecutive increment, kill_reason re-trip) are suppressed
-            # in killed mode above; rebalance itself is safe to run.
-            if action == "auto_rebalance":
-                # Queue a corrective MARKET order (executed async by
-                # _execute_pending_rebalances on the next tick).
-                last = self._rebalance_last_time.get(asset, 0.0)
-                if (now - last) < self._rebalance_cooldown_sec:
-                    # Only log cooldown in normal mode — in killed we'd
-                    # spam every audit_interval_sec.
-                    if not killed:
-                        self.logger().info(
-                            f"[audit/{source}] {asset} auto_rebalance cooldown active "
-                            f"({self._rebalance_cooldown_sec - (now - last):.0f}s remaining)"
-                        )
-                else:
-                    self._pending_rebalances[asset] = delta
-                    if killed:
-                        self.logger().warning(
-                            f"[audit/killed] {asset} drift {delta:+f} → "
-                            f"queueing rebalance to unblock auto_terminate"
-                        )
-            # action == "pause" or "alert" → no rebalance needed
-
-        # In killed mode log only the state transition so an operator
-        # following the log sees when auto_terminate becomes unblocked
-        # (or re-blocks) — without spamming every audit cycle.
-        if killed:
-            prev_drift = bool(self._last_audit_results.get("_drift_active", False))
-            if prev_drift != any_drift:
-                gate = "BLOCKED (drift persists)" if any_drift else "CLEAR (drift resolved)"
-                self.logger().info(
-                    f"[audit/killed] _drift_active {prev_drift} → {any_drift}; "
-                    f"auto_terminate gate now {gate}"
-                )
-
-        results["_drift_active"] = any_drift
-        self._last_audit_results = results
+    def _maybe_set_kill_reason_from_drift(
+        self, results: Dict[str, Dict[str, Decimal]]
+    ) -> None:
+        """For ``on_drift_action="pause"``: trip kill switch when drift is
+        confirmed post-barrier. Same path as watchdog/circuit-breakers."""
+        for asset, r in results.items():
+            if asset.startswith("_") or not isinstance(r, dict):
+                continue
+            if r.get("within"):
+                continue
+            if self._kill_reason is None:
+                self._kill_reason = f"INVENTORY_DRIFT_{asset}"
+            return  # one is enough
 
     def _rebalance_evaluate_exchange(
         self,
@@ -2476,19 +2595,24 @@ class XEMMLeadLagController(ControllerBase):
                 and not self._initial_audit_done
                 and self.config.inventory_audit.enabled):
             await self._run_inventory_audit(now, source="boot")
-            self._initial_audit_done = True
-            if self._kill_reason is None:
-                # No drift, or auto_rebalance/alert (no kill set) → proceed
-                self._boot_paused = False
-                self.logger().info(
-                    "[boot] startup_cleanup OK + audit OK — leaving boot_paused mode"
-                )
-            else:
-                # "pause" action with drift → stay paused until manual fix
-                self.logger().critical(
-                    f"[boot] audit detected drift on boot: {self._kill_reason} — "
-                    f"bot stays paused, manual intervention required"
-                )
+            # With the barrier pattern the boot audit may take multiple ticks
+            # (IDLE → CANCELLING → VALIDATING → IDLE). Only mark boot audit
+            # done when barrier returns to IDLE. At startup the bot has no
+            # active executors, so quiescence is instant and the barrier
+            # completes in a single call — this guard mostly matters if a
+            # boot-time orphan order delays quiescence.
+            if self._barrier_state == "IDLE":
+                self._initial_audit_done = True
+                if self._kill_reason is None:
+                    self._boot_paused = False
+                    self.logger().info(
+                        "[boot] startup_cleanup OK + audit OK — leaving boot_paused mode"
+                    )
+                else:
+                    self.logger().critical(
+                        f"[boot] audit detected drift on boot: {self._kill_reason} — "
+                        f"bot stays paused, manual intervention required"
+                    )
         elif (self._startup_cleanup_done
                 and not self._initial_audit_done
                 and not self.config.inventory_audit.enabled):
@@ -2500,9 +2624,14 @@ class XEMMLeadLagController(ControllerBase):
             )
 
         # === Periodic inventory audit (Tier 4: every audit_interval_sec) ===
+        # While a barrier is in flight we poll every tick (200 ms) instead of
+        # waiting the full audit_interval_sec — CANCELLING needs prompt
+        # quiescence detection, VALIDATING is the post-barrier authoritative
+        # read and should complete asap.
         if (self._initial_audit_done
                 and self.config.inventory_audit.enabled
-                and (now - self._last_audit_time) >= self.config.inventory_audit.audit_interval_sec):
+                and (self._barrier_state != "IDLE"
+                     or (now - self._last_audit_time) >= self.config.inventory_audit.audit_interval_sec)):
             await self._run_inventory_audit(now, source="periodic")
 
         # === Purge stale ghost-order entries (cheap dict trim) ===
@@ -2823,18 +2952,15 @@ class XEMMLeadLagController(ControllerBase):
 
         # 3. Circuit breakers (PnL-based — each measures a different failure mode)
 
-        # 3a. HEDGE_FAILURES — proxy via inventory_audit's drift counter.
-        # When the maker fills and the taker hedge fails, drift appears and
-        # persists across audits. N consecutive stuck audits on ANY base asset
-        # is treated as N consecutive hedge failures. Single source of truth:
-        # we read the same _drift_consecutive_audits the DRIFT_STUCK gate uses.
-        if self._drift_consecutive_audits:
-            worst = max(self._drift_consecutive_audits.values())
-            if worst >= self.config.max_consecutive_hedge_failures:
-                self._kill_reason = f"HEDGE_FAILURES_{worst}_audits"
-                return Regime.KILLED, self._kill_reason
+        # NOTE (2026-05-12): HEDGE_FAILURES_N gate removed. It was based on
+        # the ``_drift_consecutive_audits`` strike rule which fired on false
+        # positives from stale balance / hedge-in-flight races. The barrier-
+        # pattern audit (see _run_inventory_audit) eliminates those races at
+        # the source, so a separate "N strikes" rule serves no purpose.
+        # Real hedge failures still surface via UNREALIZED_LOSS (drift × mid
+        # over the absolute threshold) and DAILY_LOSS_LIMIT (cumulative PnL).
 
-        # 3b. DAILY_LOSS_LIMIT — realized PnL since UTC midnight.
+        # 3a. DAILY_LOSS_LIMIT — realized PnL since UTC midnight.
         if self._daily_realized_pnl <= -self.config.max_daily_loss_quote:
             self._kill_reason = "DAILY_LOSS_LIMIT"
             return Regime.KILLED, "DAILY_LOSS_LIMIT"
@@ -2951,6 +3077,30 @@ class XEMMLeadLagController(ControllerBase):
                     f"Stopped {len(actions)} active executor(s)."
                 )
             return actions
+
+        # === Audit barrier: stop-the-world while audit revalidates drift ===
+        # Triggered by _run_inventory_audit when it suspects drift and wants
+        # an authoritative balance read. We stop ALL active executors and
+        # refuse to create new ones until the barrier resolves (CANCELLING →
+        # VALIDATING → IDLE). Typical duration: 1-3s.
+        if self._barrier_state == "CANCELLING":
+            for executor in active_executors:
+                actions.append(StopExecutorAction(
+                    controller_id=self.config.id,
+                    executor_id=executor.config.id,
+                    keep_position=False,
+                ))
+            if actions:
+                self._last_action_time = now
+                self.logger().info(
+                    f"[barrier] stopping {len(actions)} active executor(s) "
+                    f"to reach quiescence before drift validation"
+                )
+            return actions
+        # While VALIDATING, do not create new executors either — the audit
+        # is computing the authoritative drift; new orders would mutate state.
+        if self._barrier_state == "VALIDATING":
+            return []
 
         # === No new orders in WARMUP or KILLED ===
         if regime == Regime.WARMUP or regime == Regime.KILLED:

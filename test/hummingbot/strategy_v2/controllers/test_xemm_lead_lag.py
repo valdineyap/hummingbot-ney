@@ -487,18 +487,13 @@ class TestPnlSafetyGates(_BaseControllerTest):
             )
         )
 
-    async def test_hedge_failures_via_drift_audits_trips_killed(self):
-        await self._warm()
-        # Three consecutive stuck audits on BTC → matches default max=3.
-        self.controller._drift_consecutive_audits = {"BTC": 3}
-        self.market_data_provider.time.return_value = 1700000050.0
-        await self.controller.update_processed_data()
-        self.assertEqual(self.controller.processed_data["regime"], Regime.KILLED)
-        self.assertTrue(
-            self.controller.processed_data["cancel_reason"].startswith(
-                "HEDGE_FAILURES_"
-            )
-        )
+    # NOTE: test_hedge_failures_via_drift_audits_trips_killed removed
+    # 2026-05-12 — the HEDGE_FAILURES_N strike rule was eliminated in
+    # favour of the barrier-pattern audit (see _run_inventory_audit).
+    # Race-induced false-positive drift no longer accumulates because
+    # the audit reaches quiescence before each authoritative read.
+    # Genuine hedge failures still surface via UNREALIZED_LOSS_quote
+    # gate and DAILY_LOSS_LIMIT.
 
     async def test_killed_reason_is_sticky_across_recovery(self):
         # Trip session drawdown, then restore PnL — should remain KILLED.
@@ -1712,18 +1707,13 @@ class TestInventoryAuditDriftPause(_AuditBaseTest):
         self.assertEqual(self.controller._kill_reason, "INVENTORY_DRIFT_BTC")
         self.assertTrue(self.controller._last_audit_results["_drift_active"])
 
-    async def test_drift_deferred_when_inflight_active(self):
-        # Same drift but in-flight active → defer (no kill)
-        self._mock_total_balance(Decimal("0.001"), Decimal("0.0008"))
-        self.controller._has_inflight_activity = MagicMock(return_value=True)
-
-        await self.controller._run_inventory_audit(now=1700000000.0, source="boot")
-        # No kill set
-        self.assertIsNone(self.controller._kill_reason)
-        # _drift_active stays False (action was deferred)
-        self.assertFalse(self.controller._last_audit_results["_drift_active"])
-        # But inflight flag set
-        self.assertTrue(self.controller._last_audit_results["_inflight_active"])
+    # NOTE: test_drift_deferred_when_inflight_active removed 2026-05-12.
+    # The barrier-pattern audit replaces "defer-on-inflight": when drift is
+    # suspected, the audit enters CANCELLING (stop-the-world) and only acts
+    # AFTER quiescence is reached. There's no longer a "defer because of
+    # in-flight activity" branch — the in-flight orders are simply
+    # cancelled, making the drift detection authoritative.
+    # See TestAuditBarrier for the new flow.
 
 
 class TestInventoryAuditAlertAction(_AuditBaseTest):
@@ -1857,6 +1847,171 @@ class TestAuditPassiveModeWhenKilled(_AuditBaseTest):
         # Drift action="pause" (default in _AuditBaseTest) → kill_reason set.
         self.assertEqual(self.controller._kill_reason, "INVENTORY_DRIFT_BTC")
         self.assertTrue(self.controller._last_audit_results["_drift_active"])
+
+
+class TestAuditBarrier(_AuditBaseTest):
+    """Pins the barrier-pattern audit added 2026-05-12.
+
+    State machine:
+      IDLE → CANCELLING → VALIDATING → IDLE
+    Drift is acted on ONLY after reaching quiescent state (no active
+    executors + no in-flight orders), so race-induced false drift
+    (stale balance, hedge in flight) doesn't trigger spurious actions.
+    """
+
+    async def test_idle_with_no_drift_stays_idle(self):
+        """No drift → barrier doesn't activate."""
+        self._mock_total_balance(Decimal("0.001"), Decimal("0.001"))  # total = target
+        await self.controller._run_inventory_audit(now=1700000000.0, source="periodic")
+        self.assertEqual(self.controller._barrier_state, "IDLE")
+        self.assertFalse(self.controller._last_audit_results["_drift_active"])
+        self.assertNotIn("BTC", self.controller._pending_rebalances)
+
+    async def test_idle_with_drift_and_quiescence_walks_to_validating(self):
+        """When the bot has no active executors, a single audit call walks
+        IDLE → CANCELLING → VALIDATING → IDLE and queues the rebalance."""
+        self.config.inventory_audit.on_drift_action = "auto_rebalance"
+        self._mock_total_balance(Decimal("0.0012"), Decimal("0.001"))  # excess 0.0002
+        self.controller.executors_info = []  # quiescent at boot
+        await self.controller._run_inventory_audit(now=1700000000.0, source="periodic")
+        # Barrier walked all the way to IDLE in one call.
+        self.assertEqual(self.controller._barrier_state, "IDLE")
+        # Rebalance queued for the confirmed drift.
+        self.assertIn("BTC", self.controller._pending_rebalances)
+
+    async def test_idle_with_drift_but_active_executor_stays_cancelling(self):
+        """When an active executor exists, barrier enters CANCELLING and waits."""
+        self.config.inventory_audit.on_drift_action = "auto_rebalance"
+        self._mock_total_balance(Decimal("0.0012"), Decimal("0.001"))
+        active = MagicMock()
+        active.is_done = False
+        active.config.id = "EX-1"
+        self.controller.executors_info = [active]
+        await self.controller._run_inventory_audit(now=1700000000.0, source="periodic")
+        # Barrier stuck in CANCELLING waiting for quiescence.
+        self.assertEqual(self.controller._barrier_state, "CANCELLING")
+        # No rebalance queued YET (will queue when quiescent on next tick).
+        self.assertNotIn("BTC", self.controller._pending_rebalances)
+
+    async def test_cancelling_advances_when_executors_become_done(self):
+        """Second audit call after executors are done → advance through
+        VALIDATING and queue rebalance."""
+        self.config.inventory_audit.on_drift_action = "auto_rebalance"
+        self._mock_total_balance(Decimal("0.0012"), Decimal("0.001"))
+        active = MagicMock()
+        active.is_done = False
+        active.config.id = "EX-1"
+        self.controller.executors_info = [active]
+        # First call: enters CANCELLING
+        await self.controller._run_inventory_audit(now=1700000000.0, source="periodic")
+        self.assertEqual(self.controller._barrier_state, "CANCELLING")
+        # Simulate executor finishing
+        active.is_done = True
+        # Second call: detects quiescence, transitions to VALIDATING, then IDLE
+        await self.controller._run_inventory_audit(now=1700000001.0, source="periodic")
+        self.assertEqual(self.controller._barrier_state, "IDLE")
+        self.assertIn("BTC", self.controller._pending_rebalances)
+
+    async def test_cancelling_timeout_proceeds_with_warning(self):
+        """If quiescence isn't reached within _barrier_timeout_sec, the audit
+        proceeds to VALIDATING anyway (logged as warning, cooldown saves us
+        from rebalance spam)."""
+        self.config.inventory_audit.on_drift_action = "auto_rebalance"
+        self._mock_total_balance(Decimal("0.0012"), Decimal("0.001"))
+        active = MagicMock()
+        active.is_done = False  # never finishes
+        active.config.id = "EX-STUCK"
+        self.controller.executors_info = [active]
+        # Force the barrier into CANCELLING manually
+        self.controller._barrier_state = "CANCELLING"
+        self.controller._barrier_started_at = 1700000000.0
+        # Call audit way past timeout
+        now = 1700000000.0 + self.controller._barrier_timeout_sec + 1.0
+        await self.controller._run_inventory_audit(now=now, source="periodic")
+        # Should have proceeded to IDLE via VALIDATING despite no quiescence
+        self.assertEqual(self.controller._barrier_state, "IDLE")
+
+    async def test_validating_clears_drift_if_race_resolved(self):
+        """Phase 1 saw drift (race / stale read). When VALIDATING runs after
+        quiescence, drift is actually within tolerance — no rebalance queued,
+        and the false alarm is logged."""
+        self.config.inventory_audit.on_drift_action = "auto_rebalance"
+        # Stage: barrier already in VALIDATING (simulating that CANCELLING
+        # cleared). Balance is now within tolerance.
+        self.controller._barrier_state = "VALIDATING"
+        self.controller._barrier_drift_snapshot = {
+            "BTC": {"delta": Decimal("0.0002"), "within": False,
+                    "target": Decimal("0.002"), "maker_bal": Decimal("0.0012"),
+                    "taker_bal": Decimal("0.001"), "actual": Decimal("0.0022"),
+                    "delta_quote": Decimal("60")},
+        }
+        # Now balance reads as target (drift cleared after quiescence)
+        self._mock_total_balance(Decimal("0.001"), Decimal("0.001"))
+        await self.controller._run_inventory_audit(now=1700000000.0, source="periodic")
+        # Returns to IDLE, no rebalance queued (false alarm)
+        self.assertEqual(self.controller._barrier_state, "IDLE")
+        self.assertNotIn("BTC", self.controller._pending_rebalances)
+        self.assertFalse(self.controller._last_audit_results["_drift_active"])
+
+    async def test_validating_confirms_real_drift(self):
+        """Drift persists after quiescence → confirmed real → rebalance queued."""
+        self.config.inventory_audit.on_drift_action = "auto_rebalance"
+        self.controller._barrier_state = "VALIDATING"
+        self.controller._barrier_drift_snapshot = {}
+        # Drift still present in authoritative read
+        self._mock_total_balance(Decimal("0.0012"), Decimal("0.001"))
+        await self.controller._run_inventory_audit(now=1700000000.0, source="periodic")
+        self.assertEqual(self.controller._barrier_state, "IDLE")
+        self.assertIn("BTC", self.controller._pending_rebalances)
+        self.assertTrue(self.controller._last_audit_results["_drift_active"])
+
+    async def test_validating_with_pause_action_sets_kill_reason(self):
+        """``on_drift_action=pause`` — VALIDATING confirms drift → kill_reason set."""
+        self.config.inventory_audit.on_drift_action = "pause"
+        self.controller._barrier_state = "VALIDATING"
+        self.controller._barrier_drift_snapshot = {}
+        self._mock_total_balance(Decimal("0.0012"), Decimal("0.001"))
+        await self.controller._run_inventory_audit(now=1700000000.0, source="periodic")
+        self.assertEqual(self.controller._barrier_state, "IDLE")
+        self.assertEqual(self.controller._kill_reason, "INVENTORY_DRIFT_BTC")
+
+    async def test_determine_actions_stops_all_when_cancelling(self):
+        """``determine_executor_actions`` emits Stop for all active executors
+        when barrier is CANCELLING — that's how stop-the-world happens."""
+        self.controller._barrier_state = "CANCELLING"
+        # Make the bot otherwise healthy
+        ex1 = MagicMock(); ex1.is_done = False; ex1.config.id = "E1"
+        ex2 = MagicMock(); ex2.is_done = False; ex2.config.id = "E2"
+        ex3 = MagicMock(); ex3.is_done = True;  ex3.config.id = "E3"  # ignored
+        self.controller.executors_info = [ex1, ex2, ex3]
+        # Need a processed_data populated to enter determine_executor_actions
+        self.controller.processed_data = {
+            "timestamp": 1700000000.0,
+            "regime": Regime.OK,
+            "cancel_reason": "",
+        }
+        actions = self.controller.determine_executor_actions()
+        stops = [a for a in actions if isinstance(a, StopExecutorAction)]
+        # Both active executors stopped; the is_done one is skipped.
+        self.assertEqual(len(stops), 2)
+        self.assertEqual(
+            {a.executor_id for a in stops}, {"E1", "E2"},
+        )
+
+    async def test_determine_actions_blocks_creation_when_validating(self):
+        """While VALIDATING, no new executors created (would mutate state
+        we're trying to read authoritatively)."""
+        self.controller._barrier_state = "VALIDATING"
+        self.controller.executors_info = []
+        self.controller.processed_data = {
+            "timestamp": 1700000000.0,
+            "regime": Regime.OK,
+            "cancel_reason": "",
+        }
+        actions = self.controller.determine_executor_actions()
+        # No CreateExecutorAction
+        creates = [a for a in actions if isinstance(a, CreateExecutorAction)]
+        self.assertEqual(len(creates), 0)
 
 
 class TestInflightActivityDetection(_AuditBaseTest):
