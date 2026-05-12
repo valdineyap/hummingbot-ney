@@ -1,5 +1,6 @@
 import asyncio
 import json
+import time
 from typing import TYPE_CHECKING, List, Optional
 
 from hummingbot.connector.exchange.bitpreco import bitpreco_constants as CONSTANTS
@@ -33,11 +34,29 @@ class BitprecoAPIUserStreamDataSource(UserStreamTrackerDataSource):
 
         self._listen_key_initialized_event: asyncio.Event = asyncio.Event()
         self._last_listen_key_ping_ts = 0
+        # Q3 instrumentation: track WS lifecycle so dropouts are visible. Each
+        # _connected_websocket_assistant() call = one connect (a reconnect if
+        # we had a prior one). Cycle duration = uptime since previous connect.
+        self._ws_last_connect_ts: float = 0.0
+        self._ws_connect_count: int = 0
 
     async def _connected_websocket_assistant(self) -> WSAssistant:
         ws: WSAssistant = await self._get_ws_assistant()
 
         await ws.connect(ws_url=CONSTANTS.WSS_NOTIFICATIONS_URL)
+        now_t = time.time()
+        self._ws_connect_count += 1
+        if self._ws_last_connect_ts > 0:
+            uptime_s = now_t - self._ws_last_connect_ts
+            self.logger().info(
+                f"[ws_lifecycle] connected #{self._ws_connect_count} "
+                f"(prior connection cycle: {uptime_s:.1f}s)"
+            )
+        else:
+            self.logger().info(
+                f"[ws_lifecycle] connected #{self._ws_connect_count} (initial)"
+            )
+        self._ws_last_connect_ts = now_t
         return ws
 
     async def _subscribe_channels(self, websocket_assistant: WSAssistant):

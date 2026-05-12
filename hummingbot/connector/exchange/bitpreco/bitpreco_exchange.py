@@ -546,6 +546,29 @@ class BitprecoExchange(ExchangePyBase):
             code = response.get("message_cod") if isinstance(response, dict) else None
 
             if code in GONE_CODES:
+                # Q4 instrumentation: when a cancel succeeds with ORDER_CANCELED
+                # (not CANT_CANCEL_FILLED_ORDER), check whether BitPreco's
+                # response contains any indication of partial fill before the
+                # cancel landed. The field name is unknown — we probe common
+                # variants. Any positive hit is a WARNING because it means the
+                # tracker may believe "no fill" while base balance moved.
+                if code == "ORDER_CANCELED" and isinstance(response, dict):
+                    for field in ("exec_amount", "executed_amount", "executed",
+                                  "filled", "filled_amount", "matched_amount"):
+                        raw = response.get(field)
+                        if raw is None:
+                            continue
+                        try:
+                            val = Decimal(str(raw))
+                        except (InvalidOperation, ValueError, TypeError):
+                            continue
+                        if val > 0:
+                            self.logger().warning(
+                                f"[cancel_partial_fill] exchange_order_id={exchange_order_id} "
+                                f"cancelled with {field}={val} — partial fill before cancel. "
+                                f"Full response: {response}"
+                            )
+                            break
                 self.logger().info(
                     f"BitPreco cancel confirmed for exchange_order_id={exchange_order_id} "
                     f"(code={code}, attempt={attempt}): {response}"
@@ -816,13 +839,33 @@ class BitprecoExchange(ExchangePyBase):
                     submit_ts = self._place_order_submit_times.pop(
                         order.client_order_id, None
                     )
+                    # Q2 instrumentation: separate "BitPreco-side fill time" from
+                    # "our detection time". ``timestamp`` (line above) is the
+                    # BitPreco-reported time_stamp in seconds since epoch
+                    # (1-second resolution per the format string). The gap to
+                    # ``time.time()`` answers "how late was our detection in
+                    # absolute terms" — independent of when we placed the order.
+                    bp_to_detection_ms = (time.time() - timestamp) * 1000
                     if submit_ts is not None:
                         e2e_ms = (time.time() - submit_ts) * 1000
                         self.logger().info(
                             f"[bp_timing] fill_detected order={order.client_order_id} "
                             f"side={order.trade_type.name} amount={trade_update.fill_base_amount} "
                             f"price={trade_update.fill_price} → "
-                            f"submit_to_fill={e2e_ms:.0f}ms (REST poll path)"
+                            f"submit_to_fill={e2e_ms:.0f}ms "
+                            f"bp_fill_to_detection={bp_to_detection_ms:.0f}ms "
+                            f"(REST poll path)"
+                        )
+                    else:
+                        # Submit time was already popped (e.g., late detection
+                        # of a ghost cancel) — still log the BitPreco-side gap.
+                        self.logger().info(
+                            f"[bp_timing] fill_detected order={order.client_order_id} "
+                            f"side={order.trade_type.name} amount={trade_update.fill_base_amount} "
+                            f"price={trade_update.fill_price} → "
+                            f"submit_to_fill=unknown "
+                            f"bp_fill_to_detection={bp_to_detection_ms:.0f}ms "
+                            f"(REST poll path, late)"
                         )
         return trade_updates
 
@@ -1110,6 +1153,38 @@ class BitprecoExchange(ExchangePyBase):
 
     async def _user_stream_event_listener(self):
         async for event_message in self._iter_user_event_queue():
+            # Q1 instrumentation: log every event TYPE received from WS
+            # (not the payload — would flood). Currently only `flash` is acted
+            # on; if BitPreco's WS emits fill-specific events we'd be missing
+            # them silently. Throttled to 1 log per type per 60s, plus a
+            # one-shot "first seen" log per unknown type.
+            evt_type = event_message.get("event", "<no-event>")
+            if not hasattr(self, "_ws_event_seen_counts"):
+                self._ws_event_seen_counts: Dict[str, int] = {}
+                self._ws_event_last_log_ts: Dict[str, float] = {}
+                self._ws_event_first_seen_logged: set = set()
+            self._ws_event_seen_counts[evt_type] = (
+                self._ws_event_seen_counts.get(evt_type, 0) + 1
+            )
+            now_t = time.time()
+            # First-seen: log payload sample for unknown types (helps discover
+            # new event shapes BitPreco might send).
+            if evt_type not in self._ws_event_first_seen_logged and evt_type != "flash":
+                self._ws_event_first_seen_logged.add(evt_type)
+                self.logger().info(
+                    f"[ws_event_seen] FIRST event={evt_type!r} "
+                    f"sample={str(event_message)[:300]}"
+                )
+            # Periodic count log per type (60s window).
+            last_log = self._ws_event_last_log_ts.get(evt_type, 0.0)
+            if now_t - last_log >= 60.0:
+                self._ws_event_last_log_ts[evt_type] = now_t
+                count = self._ws_event_seen_counts[evt_type]
+                self.logger().info(
+                    f"[ws_event_seen] event={evt_type} count_in_window={count}"
+                )
+                self._ws_event_seen_counts[evt_type] = 0
+
             if event_message.get("event") == "flash":
                 # Instrumentation: how long after our most recent place_order
                 # did this WS flash arrive? Identifies whether the lag is on
