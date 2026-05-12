@@ -3,18 +3,44 @@ import os
 from hummingbot.core.api_throttler.data_types import LinkedLimitWeightPair, RateLimit
 from hummingbot.core.data_type.in_flight_order import OrderState
 
-ORDER_BOOK_PATH_URL = "https://api.bitpreco.com/{}/orderbook"
+# ----------------------------------------------------------------------------
+# Fast-path internal routing (BitPreco-owned operators only)
+# ----------------------------------------------------------------------------
+# Two independent host overrides, one per endpoint category:
+#
+#   BITPRECO_INTERNAL_BOOKS  → public market data (order book, ticker, trades)
+#   BITPRECO_INTERNAL_API    → private REST trading (place/cancel/balance/etc.)
+#
+# Both default to the public host. If set, there is NO fallback to the public
+# host on failure — the internal host MUST be reachable. A network error on
+# the internal host propagates as a normal IOError, intentionally (silent
+# fallback would mask a real outage).
+#
+# Legacy env vars `BITPRECO_ORDER_BOOK_URL` and `BITPRECO_TRADING_URL` are
+# kept as low-level escape hatches: if set, they win over the `*_INTERNAL_*`
+# variables for their specific endpoints.
+# ----------------------------------------------------------------------------
 
-if os.environ.get('BITPRECO_ORDER_BOOK_URL') is not None:
-    url = os.environ.get("BITPRECO_ORDER_BOOK_URL", "")
-    slash = "" if url.endswith("/") else "/"
-    ORDER_BOOK_PATH_URL = url + slash + "{}/orderbook"
+_DEFAULT_HOST = "https://api.bitpreco.com"
+
+_PUBLIC_HOST = os.environ.get("BITPRECO_INTERNAL_BOOKS", _DEFAULT_HOST).rstrip("/")
+_TRADING_HOST = os.environ.get("BITPRECO_INTERNAL_API", _DEFAULT_HOST).rstrip("/")
+
+# Public market data endpoints
+ORDER_BOOK_PATH_URL = f"{_PUBLIC_HOST}/{{}}/orderbook"
 
 
 # REST API ENDPOINTS
 TRADING_PATH_URL = "trading"
 DEFAULT_DOMAIN = "bitpreco_trading"
-REST_URL = f'https://api.bitpreco.com/{TRADING_PATH_URL}'
+REST_URL = f"{_TRADING_HOST}/{TRADING_PATH_URL}"
+
+# Legacy escape hatches — take precedence over *_INTERNAL_* for their endpoint.
+if os.environ.get('BITPRECO_ORDER_BOOK_URL') is not None:
+    url = os.environ.get("BITPRECO_ORDER_BOOK_URL", "")
+    slash = "" if url.endswith("/") else "/"
+    ORDER_BOOK_PATH_URL = url + slash + "{}/orderbook"
+
 if os.environ.get('BITPRECO_TRADING_URL') is not None:
     REST_URL = os.environ.get('BITPRECO_TRADING_URL')
 
@@ -53,8 +79,8 @@ REQUEST_WEIGHT = "REQUEST_WEIGHT"
 RAW_REQUESTS = "RAW_REQUESTS"
 
 # Base URL
-PING_PATH_URL = "https://api.bitpreco.com/btc-brl/ticker"
-ALL_CURRENCY_TICKER_PATH_URL = "https://api.bitpreco.com/all-brl/ticker"
+PING_PATH_URL = f"{_PUBLIC_HOST}/btc-brl/ticker"
+ALL_CURRENCY_TICKER_PATH_URL = f"{_PUBLIC_HOST}/all-brl/ticker"
 
 WSS_ORDERBOOK_URL = "wss://bp-channels.gigalixirapp.com/orderbook/socket/websocket"
 WSS_NOTIFICATIONS_URL = "wss://bp-channels.gigalixirapp.com/notifications/socket/websocket"

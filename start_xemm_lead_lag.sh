@@ -30,6 +30,22 @@ if [ -z "$1" ]; then
     exit 1
 fi
 
+# ============================================================
+# BitPreco fast-path routing (BitPreco-owned operators only)
+# ============================================================
+# Route BitPreco traffic through the internal network instead of the
+# public internet. Two independent toggles:
+#
+#   BITPRECO_INTERNAL_BOOKS — public endpoints (book, ticker, trades)
+#   BITPRECO_INTERNAL_API   — private REST trading (auth_token; place/cancel/balance)
+#
+# NO fallback: if set, the internal host must always be reachable.
+# Read by hummingbot/connector/exchange/bitpreco/bitpreco_constants.py
+# at import time, so it MUST be exported here (before python boots).
+# ============================================================
+# export BITPRECO_INTERNAL_BOOKS="http://54.232.138.12"
+# export BITPRECO_INTERNAL_API="http://<internal-trading-host>"   # phase 2
+
 # Kill any running instance gracefully
 if pgrep -f "conf_xemm_lead_lag_shadow" > /dev/null; then
     echo "Stopping existing bot..."
