@@ -47,8 +47,8 @@ fi
 # Read by hummingbot/connector/exchange/bitpreco/bitpreco_constants.py
 # at import time, so it MUST be exported here (before python boots).
 # ============================================================
-# export BITPRECO_INTERNAL_BOOKS="http://54.232.138.12"
-# export BITPRECO_INTERNAL_API="https://backend.bitpreco.com/exchange/exch_api.php"
+export BITPRECO_INTERNAL_BOOKS="http://54.232.138.12"
+export BITPRECO_INTERNAL_API="https://backend.bitpreco.com/exchange/exch_api.php"
 
 # Kill any running instance gracefully
 if pgrep -f "conf_xemm_lead_lag_shadow" > /dev/null; then
