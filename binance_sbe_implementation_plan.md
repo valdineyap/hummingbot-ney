@@ -4,13 +4,21 @@
 
 O bot XEMM Lead-Lag (BTC-BRL, branch `claude/xemm-leadlag`) consome market data da Binance via WebSocket JSON em `wss://stream.binance.com:9443/ws`, usando o conector `binance` para signal (BTC-USDT) e taker (BTC-BRL). A Binance publicou **SBE Market Data Streams** em `wss://stream-sbe.binance.com:9443/ws`, com payload binário menor e parse mais rápido.
 
-**Escopo desta implementação (Fase 1):** apenas market data público via SBE. Trading, user-stream e REST permanecem em JSON+HMAC herdados do conector `binance` original. **Importante:** Binance Spot **também oferece SBE para trading** via WebSocket API (schema `spot_3_0.xml`, endpoint distinto) — isso é capturado como Fase 3 no final do plano para referência futura, mas NÃO entra na Fase 1.
+**Escopo desta implementação (Fase 1):** apenas market data público via SBE. Trading continua REST/HTTPS+HMAC herdado do conector `binance` original. **Importante distinção que motivou várias revisões deste plano:** a Binance Spot oferece três caminhos distintos relacionados a SBE/WebSocket que NÃO devem ser confundidos:
+
+1. **SBE Market Data WS** (`wss://stream-sbe.binance.com:9443/ws/...`) — binário, schema `stream_1_0.xml`. **É o que esta Fase 1 implementa.**
+2. **WebSocket API Trading** (`wss://ws-api.binance.com:443/ws-api/v3`) — JSON nas requests, com **opcional** `?responseFormat=sbe` para receber respostas em binário (schema `spot_3_0.xml` contém só os response templates). **Não está nesta Fase 1.** Seria um projeto separado, capturado como "Fase futura" no fim deste plano.
+3. **REST trading** (`api.binance.com/api/v3/order` etc.) — JSON, HMAC. É o que `binance_sbe` herda inalterado de `BinanceExchange` e continua usando.
+
+Não existe "trading SBE" como protocolo coeso na Binance Spot — SBE é só um encoding opcional de respostas no WS Trading API. Misturar esses conceitos foi uma confusão em iterações anteriores do plano; agora explicitada acima.
 
 O objetivo desta Fase 1 é adicionar um conector **irmão** chamado `binance_sbe` que herda 100% do `binance` atual e sobrescreve **apenas** o `OrderBookTrackerDataSource` para consumir o stream SBE. Zero modificações ao conector `binance` existente — o XEMM ativo hoje fica intocado até cutover via 1 linha de YAML. Conector novo entrega potencial de redução de latência e jitter no caminho de sinal/taker, validado em script standalone antes de plugar no bot real.
 
 Decisões registradas:
 - **Conector irmão**, não flag — Opção B do framework simples/robusto. Permite rodar `binance` e `binance_sbe` simultâneos para validação AB.
-- **Full trading capability via herança REST/JSON** (custo zero de código). Rollout live começa por `signal_connector` apenas. Taker fica em `binance` JSON até N dias de estabilidade do signal. Usar `binance_sbe` como taker em Fase 2 apenas centraliza config — sem ganho de latência, porque o trading **na Fase 1** continua REST `api.binance.com`. **Ganho real de latência em trading só vem em Fase 3**, migrando trading para o endpoint SBE WebSocket API.
+- **Full trading capability via herança REST/JSON** (custo zero de código): `binance_sbe` herda o trading atual do `BinanceExchange`. Envio/cancelamento de ordens continuam via REST `api.binance.com` com HMAC, exatamente como no conector `binance`. Rollout live começa por `signal_connector` apenas. Taker fica em `binance` JSON até N dias de estabilidade do signal.
+- **Trading via WebSocket API existe na Binance Spot, mas é JSON e usa endpoint separado** (`wss://ws-api.binance.com:443/ws-api/v3`) — **não é SBE**. SBE é apenas um formato opcional de resposta (`?responseFormat=sbe`), as requests são JSON. WS trading é um projeto separado (`binance_ws_trading`), fora do escopo desta entrega. Ver seção "Fase futura" no fim deste plano.
+- **Usar `binance_sbe` como `taker_connector` nesta fase não reduz latência de execução**, pois ordens continuam REST. Única razão seria centralização operacional de config — provavelmente não vale. Mantém-se `taker_connector: binance` até existir projeto próprio de WS trading.
 - **Multipair genérico** — implementar como o conector original (qualquer pair que a Binance Spot suporte em SBE).
 - **Ed25519 já provisionada** pelo usuário — config recebe apenas a **API key string** Ed25519 (não PEM). Header `X-MBX-APIKEY` consome a string direto, sem signing (market data público).
 - **Decoder primeiro como gate** — `sbe_decoder.py` + golden fixtures de bytes verdes ANTES de qualquer outro arquivo.
@@ -23,11 +31,13 @@ Decisões registradas:
 
 A Binance publica vários schemas SBE em `binance-spot-api-docs/sbe/schemas/`, cobrindo superfícies distintas:
 
-| Schema | Endpoint | Cobre | Escopo desta entrega |
+| Schema | Onde aparece | O que é | Escopo desta entrega |
 |---|---|---|---|
-| `stream_1_0.xml` | `wss://stream-sbe.binance.com:9443/ws/...` | Public market data (trade, depth, bestBidAsk, depth20) | **Fase 1 ✅** |
-| `spot_3_0.xml` | `wss://ws-api.binance.com:443/ws-api/v3?responseFormat=sbe&...` | Trading (NewOrder, CancelOrder, etc.) + user stream binário | Fase 3 (não nesta entrega) |
+| `stream_1_0.xml` | `wss://stream-sbe.binance.com:9443/ws/...` — frames de notificação push | **Protocolo de market data SBE.** Trade, depth, bestBidAsk, depth20. Binário tanto na request (subscribe é JSON, mas conteúdo é binário) quanto nas respostas. | **Fase 1 ✅** |
+| `spot_3_0.xml` | `wss://ws-api.binance.com:443/ws-api/v3?responseFormat=sbe` — respostas opcionais em binário | **Encoding alternativo de respostas do WS Trading API**, que continua sendo JSON nas requests. Contém apenas `*Response` templates (NewOrderAckResponse, CancelOrderResponse, ExchangeInfoResponse, etc.). | Fora desta entrega — projeto futuro de WS trading pode usar |
 | `spot-fixsbe-1_*.xml` | FIX gateway | Trading via FIX | Fora de escopo (sem caso de uso aqui) |
+
+**Insight crítico para futuras implementações:** `spot_3_0.xml` **não habilita trading binário** — só economiza bytes nas respostas. Requests continuam JSON. Se um dia migrarmos trading pro WS API, podemos optar por response format SBE pra parsing mais rápido, mas isso é uma decisão de optimização ortogonal ao "usar WS-API trading".
 
 ### Detalhes do `stream_1_0.xml` (Fase 1)
 
@@ -343,33 +353,56 @@ Se decidir avançar:
 2. Editar YAML: `taker_connector: binance` → `taker_connector: binance_sbe`.
 3. Restart. Observar primeiros 30 min — orders criadas/canceladas com sucesso, REST latency comparável.
 
-### Fase 3 — Trading via SBE WebSocket API (futuro, escopo separado)
+### Fase futura — Binance Spot WebSocket API trading (projeto separado, NÃO nesta entrega)
 
-**NÃO está implementado nesta entrega.** Capturando aqui para não esquecer o conhecimento.
+**Não confundir com SBE.** O que existe é trading via WebSocket API, JSON nas requests, com SBE opcional só na resposta. Captura abaixo para não esquecermos o conhecimento. Recomendado virar um projeto novo (`binance_ws_trading` ou `binance_ws_api`) depois do `binance_sbe` estar estável ≥7 dias live, NÃO um Phase do PR atual — superfície de risco já está saturada com decoder + order book + reconnect + shadow validation.
 
-Binance Spot oferece SBE também para trading via WebSocket API (não confundir com REST). Endpoint, schema e auth são **diferentes** do market data SBE:
+**Resumo do que é diferente do que `binance_sbe` herda hoje:**
 
-| | Market data SBE (Fase 1 ✅) | Trading SBE (Fase 3 — pendente) |
+| | REST trading (herdado em Fase 1) | WS-API trading (projeto futuro) |
 |---|---|---|
-| Endpoint | `wss://stream-sbe.binance.com:9443/ws/<sym>@trade/...` | `wss://ws-api.binance.com:443/ws-api/v3?responseFormat=sbe&sbeSchemaId=3&sbeSchemaVersion=0` |
-| Schema | `stream_1_0.xml` (templates 10000-10003) | `spot_3_0.xml` (templates 50-313) |
-| Auth | `X-MBX-APIKEY: <api-key-string>`, **sem signing** | Ed25519 signing por request (PEM privada usada localmente) |
-| Cobertura | Trade, depth, bestBidAsk, depth20 | NewOrderAck (300), NewOrderResult (301), NewOrderFull (302), OrderTest (303), Order (304), CancelOrder (305), CancelOpenOrders (306), CancelReplaceOrder (307), OrdersResponse (308), OrderList (309-313), ExchangeInfo (103), user data stream em SBE binário |
+| Endpoint | `https://api.binance.com/api/v3/order` etc. | `wss://ws-api.binance.com:443/ws-api/v3?returnRateLimits=false` |
+| Formato request | JSON sobre HTTPS, params query | JSON envelope `{"id":..., "method":"order.place", "params":{...}}` |
+| Formato response | JSON sobre HTTPS | JSON ou (opcional) SBE binário com `responseFormat=sbe` (schema `spot_3_0.xml`) |
+| Auth | HMAC: query param `signature=<hmac(secret, payload)>` + `timestamp` | Per-request `signature` + `timestamp` em `params`. Suporta HMAC, RSA OU Ed25519 (à escolha conforme tipo da key). |
+| Auth alternativa | n/a | `session.logon` — autentica a sessão WS uma vez; **só funciona com chaves Ed25519** e ainda exige `timestamp` em requests assinados |
+| Métodos relevantes | `POST /order`, `DELETE /order`, `POST /order/cancelReplace` | `order.place`, `order.cancel`, `order.cancelReplace`, `order.test`, `account.rateLimits.orders` |
+| Rate limits | `ORDERS` + `REQUEST_WEIGHT` (compartilhados com REST) | Mesmos limites do REST — não há "ganho de quota" por usar WS |
 
-**Ganho potencial (a validar com benchmark):**
-- Payload menor → menor RTT efetivo
-- Parse binário → menor jitter de processamento
-- Mais relevante para trading do que pra market data, porque cada ms de latência em order placement vira slippage direto
+**Ganho potencial real:** redução de latência de envio/cancelamento (não precisa estabelecer TCP+TLS por request — sessão WS já está aberta). Cada ms economizado em order placement vira slippage evitada em market making. Magnitude esperada ~5-30ms dependendo do RTT geográfico.
 
-**O que precisa para implementar:**
-1. Novo módulo: `binance_sbe_trading_auth.py` com Ed25519 signing (carrega PEM, assina request com timestamp + body)
-2. Override de `_create_web_assistants_factory` ou de `_place_order`/`_cancel_order` em `BinanceSbeExchange` para usar WS-API endpoint ao invés de REST
-3. Mais um decoder (ou extensão do atual) para `spot_3_0.xml` — bem mais templates que `stream_1_0`
-4. Manejo de session logon (templates 51-53 no schema) — WS-API trading mantém sessão autenticada
-5. Config: campo novo `binance_sbe_ed25519_pem` no `BinanceSbeConfigMap` (ou path para arquivo PEM)
-6. Reescrita de testes de trading (não dá pra herdar do REST/HMAC)
+**Riscos críticos que tornam isso um projeto separado, não Phase do PR atual:**
 
-**Quando faz sentido perseguir:** depois da Fase 1 estabilizada (≥7 dias live verde), se medições mostrarem que latência REST em ordens é gargalo material. Senão, REST/HMAC é mais simples e robusto.
+1. **`order.cancelReplace` pode falhar parcialmente** — cancelar OK, recriar fail; ou vice-versa. Estado do bot fica ambíguo entre WS response e user stream update.
+2. **Reconciliação de estado** — não dar por finalizado um order baseado SÓ na resposta WS síncrona. Sempre confirmar via user stream / order updates. Risco de double-fill se confiar na resposta e disparar hedge sem confirmação.
+3. **Idempotência** — usar `newClientOrderId` consistente para que retries em timeout não criem duas ordens.
+4. **Auth chain** — se decidirmos por Ed25519 + `session.logon`, precisamos gerar/proteger PEM privada e implementar signing. Se ficarmos com HMAC per-request, é mais simples mas perde a otimização de session.
+
+**O que precisa para implementar (briefing futuro):**
+
+- Novo módulo `binance_ws_trading_auth.py` com signing (HMAC ou Ed25519 conforme escolha)
+- Novo data source para o WS API (gerenciar request/response IDs, timeouts, retry)
+- Override de `_place_order` / `_place_cancel` no exchange para rotear pro WS quando habilitado, com fallback REST automático em erro de conexão
+- Métodos a habilitar (em ordem): `order.test` (smoke) → `order.cancel` → `order.place` → `order.cancelReplace` (com cuidado adicional)
+- Config novo separado:
+  ```python
+  binance_ws_trading_api_key: Optional[SecretStr]            # API key string
+  binance_ws_trading_secret: Optional[SecretStr]             # HMAC secret OU
+  binance_ws_trading_ed25519_private_key_path: Optional[str] # Ed25519 PEM path (alternativo)
+  ```
+- Sanity: manter REST como fallback manual via flag, pra revert sem rebuild
+- Considerar `newOrderRespType=ACK` (vs default `RESULT`/`FULL`) para minimizar payload de respostas em ordens normais; usar `FULL` só quando precisar do trade detail síncrono
+
+**Critérios de benchmark (rodar contra REST como baseline antes de virar default):**
+
+- `local_send_ts → Binance transactTime` (medida server-side)
+- `local_send_ts → response_recv_ts` (latência RTT completa)
+- Cancel latency (`cancel_send → cancel_ack`)
+- CancelReplace latency (e taxa de partial-failure)
+- Throughput sustentado (orders/segundo) sob rate limits
+- Validar idempotência via reenvio de `order.test` com mesmo `newClientOrderId`
+
+**Quando faz sentido perseguir:** somente após (1) `binance_sbe` market data estável ≥7 dias live, (2) medições no shadow XEMM mostrando que **latência de execução** (não de signal) é o gargalo material, (3) volume de orders/min justifica o esforço de testes adicional. Caso contrário, REST+HMAC é mais simples e robusto.
 
 ### Revert (qualquer fase)
 
@@ -388,16 +421,19 @@ Binance Spot oferece SBE também para trading via WebSocket API (não confundir 
 6. `tools/binance_sbe_shadow.py` + `binance_sbe_analyze.py`
 7. **GATE 2**: rodar shadow staged (10min/30min/2h calm/2h volatile/24h soak), validar critério GO em cada etapa
 8. Cutover Fase 1 (signal_connector apenas) + observação ≥7 dias
-9. Cutover Fase 2 (taker_connector, opcional) só se houver motivo concreto
-10. **Fase 3 (escopo separado, não nesta entrega):** trading via SBE WebSocket API com Ed25519 signing — exige decoder novo para `spot_3_0.xml`, auth Ed25519, e endpoint distinto (`ws-api.binance.com`). Avaliar somente se latência REST de orders for medida como gargalo material.
+9. Cutover Fase 2 (taker_connector, opcional) só se houver motivo concreto — **sem ganho de latência**, só centralização de config.
+
+**Fora desta sequência (projeto separado, briefing capturado em "Fase futura"):**
+
+10. `binance_ws_trading` — WebSocket API trading via JSON requests (com SBE opcional nas responses). Não confundir com SBE market data. Avaliar somente se latência REST de orders for medida como gargalo material no shadow XEMM, e somente após `binance_sbe` estável ≥7 dias live.
 
 ## O que NÃO entra neste plano
 
 - **Sem mudança no conector `binance` original** — zero risco de regressão.
 - **Sem tocar XEMM controller** ou executors — cutover é puro YAML.
 - **Sem flag global em `bitpreco_constants.py` ou similar** — modelo é conector irmão, não env var.
-- **User stream em SBE fora de escopo** — Binance oferece SBE para user data streams (eventos em binary frames quando session conecta com `responseFormat=sbe`), mas Fase 1 mantém user stream JSON+HMAC herdado. Migração possível em Fase 3 quando trading SBE for implementado (mesma session WS-API serve trading + user stream em SBE).
-- **Trading via SBE WebSocket API fora de escopo desta entrega** — existe na Binance Spot (schema `spot_3_0.xml`, endpoint `wss://ws-api.binance.com:443/ws-api/v3`, auth Ed25519 com signing). É a Fase 3 do plano, capturada em seção dedicada acima.
+- **User stream em SBE fora de escopo** — quando a session WS-API conecta com `responseFormat=sbe`, eventos de user stream chegam em binary. Migração possível só se/quando o projeto separado de WS-API trading for implementado.
+- **WebSocket API trading fora de escopo desta entrega** — existe na Binance Spot mas é JSON (com SBE opcional só nas responses). Endpoint diferente (`wss://ws-api.binance.com:443/ws-api/v3`), auth diferente (signing per-request com HMAC/RSA/Ed25519, ou Ed25519 `session.logon`), critérios de validação diferentes (latência de execução, partial-failure de `order.cancelReplace`, idempotência via `newClientOrderId`). Deve virar projeto separado (`binance_ws_trading`) depois de `binance_sbe` estável. Briefing capturado na seção "Fase futura".
 - **`@bestBidAsk` (templateId 10001) e `@depth20` (10002) ficam para Fase 2 do decoder** — XEMM atual não consome BBO separado nem precisa de top-20 snapshot. REST snapshot de 1000 níveis (JSON) continua sendo fonte de snapshot pro `OrderBookTracker`.
 - **Sem fallback automático para JSON em runtime** — se SBE quebrar, o XEMM eleva exception e para (mesma política dos outros conectores). Revert é manual via YAML.
 
