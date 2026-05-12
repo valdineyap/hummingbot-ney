@@ -826,6 +826,21 @@ class XEMMLeadLagController(ControllerBase):
         # them visible without flooding.
         self._arb_last_gate_log_ts: float = 0.0
 
+        # === Fresh-REST refresh for BitPreco-side arb VWAP ===
+        # BitPreco's order book "WS" is REST-polled (~500ms cadence, see
+        # bitpreco_api_order_book_data_source.py: listen_for_subscriptions),
+        # so the cached OrderBook used by `_compute_arb_gross_bps` can be
+        # 500-1000ms stale. When the cached net_bps is close to threshold
+        # (within `_fresh_arb_trigger_margin_bps`), we override with a fresh
+        # REST snapshot. TTL prevents duplicate fetches within one tick.
+        self._fresh_arb_cached_at: float = 0.0
+        self._fresh_arb_long_net_bps: Optional[Decimal] = None
+        self._fresh_arb_short_net_bps: Optional[Decimal] = None
+        self._fresh_arb_cache_ttl_sec: float = 0.2
+        # Margin (bps) below threshold to trigger fresh fetch. 10 bps covers
+        # the typical staleness slippage we observed (~11 bps on 0.0002 BTC).
+        self._fresh_arb_trigger_margin_bps: Decimal = Decimal("10")
+
         # === Inventory audit state (state-based reconciliation) ===
         # Audit compares (maker_balance + taker_balance) against config target
         # for each base asset every audit_interval_sec. Drift action only fires
@@ -1913,7 +1928,11 @@ class XEMMLeadLagController(ControllerBase):
         results, any_drift = self._compute_drift_per_asset(cfg, mid_price)
 
         if any_drift:
-            self.logger().critical(
+            # Confirmed drift is the normal trigger for the auto-rebalance
+            # MARKET — not an emergency. Pause action escalates separately
+            # below. WARNING level keeps it visible without dominating the
+            # log feed.
+            self.logger().warning(
                 f"[barrier] drift CONFIRMED after quiescence — "
                 f"{self._format_drift_summary(results)}"
             )
@@ -2424,6 +2443,91 @@ class XEMMLeadLagController(ControllerBase):
             return gross  # propagate sentinel
         return gross - self._estimate_arb_tx_cost_bps()
 
+    async def _maybe_refresh_fresh_arb_bps(
+        self,
+        now: float,
+        cached_long_net_bps: Decimal,
+        cached_short_net_bps: Decimal,
+        tx_cost_bps: Decimal,
+    ) -> Tuple[Optional[Decimal], Optional[Decimal]]:
+        """Conditional fresh-REST refresh for BitPreco-side arb VWAP.
+
+        Triggered only when:
+          - ``enable_pure_arb`` is on AND
+          - bitpreco is one of the legs AND
+          - cached net_bps on either side is within
+            ``_fresh_arb_trigger_margin_bps`` of ``arb_min_profitability``
+            (so a spawn could happen this tick or the next)
+
+        Reuses a stashed value within ``_fresh_arb_cache_ttl_sec`` to avoid
+        duplicate REST calls inside one controller tick.
+
+        Returns ``(fresh_long_net, fresh_short_net)`` or ``(None, None)``
+        when refresh is not warranted or failed. Caller treats ``None`` as
+        "keep the cached value".
+        """
+        if not self.config.enable_pure_arb:
+            return (None, None)
+        if "bitpreco" not in (self.config.maker_connector, self.config.taker_connector):
+            return (None, None)
+
+        threshold_bps = self.config.arb_min_profitability * Decimal("10000")
+        trigger_floor = threshold_bps - self._fresh_arb_trigger_margin_bps
+        if (cached_long_net_bps < trigger_floor) and (cached_short_net_bps < trigger_floor):
+            return (None, None)
+
+        if (now - self._fresh_arb_cached_at) < self._fresh_arb_cache_ttl_sec:
+            return (self._fresh_arb_long_net_bps, self._fresh_arb_short_net_bps)
+
+        bp_conn = self.market_data_provider.get_connector("bitpreco")
+        fetch_fn = getattr(bp_conn, "fetch_fresh_vwap", None)
+        if fetch_fn is None:
+            return (None, None)
+
+        amount = self.config.arb_order_amount
+        try:
+            bp_buy_vwap = await fetch_fn(self.config.maker_trading_pair, True, amount)
+            bp_sell_vwap = await fetch_fn(self.config.maker_trading_pair, False, amount)
+        except Exception as e:
+            self.logger().warning(
+                f"[fresh_arb] fetch failed: {type(e).__name__}: {e}"
+            )
+            return (None, None)
+
+        if bp_buy_vwap is None or bp_sell_vwap is None:
+            return (None, None)
+
+        binance_buy_vwap = self._vwap_for_amount(
+            self.config.taker_connector, self.config.taker_trading_pair,
+            is_buy=True, amount=amount,
+        )
+        binance_sell_vwap = self._vwap_for_amount(
+            self.config.taker_connector, self.config.taker_trading_pair,
+            is_buy=False, amount=amount,
+        )
+        if binance_buy_vwap is None or binance_sell_vwap is None:
+            return (None, None)
+
+        long_gross = (bp_sell_vwap - binance_buy_vwap) / binance_buy_vwap * Decimal("10000")
+        short_gross = (binance_sell_vwap - bp_buy_vwap) / bp_buy_vwap * Decimal("10000")
+        fresh_long_net = long_gross - tx_cost_bps
+        fresh_short_net = short_gross - tx_cost_bps
+
+        self._fresh_arb_cached_at = now
+        self._fresh_arb_long_net_bps = fresh_long_net
+        self._fresh_arb_short_net_bps = fresh_short_net
+
+        long_delta = fresh_long_net - cached_long_net_bps
+        short_delta = fresh_short_net - cached_short_net_bps
+        if abs(long_delta) > Decimal("2") or abs(short_delta) > Decimal("2"):
+            self.logger().info(
+                f"[fresh_arb] staleness detected: cached(long={cached_long_net_bps:.2f} "
+                f"short={cached_short_net_bps:.2f}) fresh(long={fresh_long_net:.2f} "
+                f"short={fresh_short_net:.2f}) | tx_cost={tx_cost_bps:.2f}bps"
+            )
+
+        return (fresh_long_net, fresh_short_net)
+
     def _market_fingerprint(self) -> tuple:
         """
         Tuple of all market state that, if unchanged, means nothing actionable
@@ -2791,6 +2895,19 @@ class XEMMLeadLagController(ControllerBase):
             else arb_short_gross_bps
         )
 
+        # 6.5b. Fresh-REST override for BitPreco-side staleness. Only fires
+        # when cached net_bps is close to threshold (gate inside helper).
+        arb_fresh_used = False
+        fresh_long, fresh_short = await self._maybe_refresh_fresh_arb_bps(
+            now, arb_long_net_bps, arb_short_net_bps, arb_tx_cost_bps,
+        )
+        if fresh_long is not None:
+            arb_long_net_bps = fresh_long
+            arb_fresh_used = True
+        if fresh_short is not None:
+            arb_short_net_bps = fresh_short
+            arb_fresh_used = True
+
         # 6.6. Arb near-threshold alert (fires even with enable_pure_arb=False)
         thr = Decimal(str(self.config.arb_alert_threshold_bps))
         arb_near_threshold = thr > 0 and (
@@ -2876,6 +2993,7 @@ class XEMMLeadLagController(ControllerBase):
             "arb_long_net_bps": arb_long_net_bps,
             "arb_short_net_bps": arb_short_net_bps,
             "arb_tx_cost_bps": arb_tx_cost_bps,
+            "arb_fresh_used": arb_fresh_used,
             "arb_near_threshold": arb_near_threshold,
             "arb_failures_today": self._arb_failures_today,
             "arb_realized_loss_today": self._arb_realized_loss_today,

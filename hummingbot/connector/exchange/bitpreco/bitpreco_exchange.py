@@ -2,7 +2,7 @@ import asyncio
 import copy
 import datetime
 import time
-from decimal import Decimal
+from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional, Tuple
 
 from bidict import bidict
@@ -332,19 +332,29 @@ class BitprecoExchange(ExchangePyBase):
         # BitPreco has no native LIMIT_MAKER (post-only) flag; treat LIMIT_MAKER
         # as a regular LIMIT order. See supported_order_types() for the rationale.
         is_limited = order_type in (OrderType.LIMIT, OrderType.LIMIT_MAKER)
+        transact_time = time.time()
         data = {
             "cmd": CONSTANTS.CMD_BUY if trade_type is TradeType.BUY else CONSTANTS.CMD_SELL,
             "market": market,
             "limited": is_limited,
             "amount": amount_str,
-            "price": price_str
+            "price": price_str,
+            # Nanosecond Unix timestamp — defeats BitPreco's server-side
+            # request deduplication. Observed in prod 2026-05-12 (4 incidents):
+            # placing the same (side, price, amount) within ~3-5s of a cancel
+            # made BitPreco return the *previous* exchange_order_id without
+            # creating a real new order — the subsequent cancel of that
+            # phantom returned INVALID_ORDER_ID. With a unique timestamp per
+            # request the API sees each call as distinct. ``time_ns`` is used
+            # (not ms) so two back-to-back placements in the same wall-clock
+            # millisecond still get distinct values. The field is ignored by
+            # BitPreco's matching logic (unknown-field tolerance).
+            "timestamp": time.time_ns(),
         }
         # MARKET BUY: add the mandatory `volume` field per BitPreco docs.
         # `amount` and `price` above are ignored server-side for limited=False.
         if volume_str is not None:
             data["volume"] = volume_str
-
-        transact_time = time.time()
 
         # Wrap the request itself: on network/parse exceptions the order may
         # have been accepted by BitPreco anyway. Try to recover before
@@ -818,6 +828,52 @@ class BitprecoExchange(ExchangePyBase):
 
     def _create_order_book_data_source(self) -> BitprecoAPIOrderBookDataSource:
         return BitprecoAPIOrderBookDataSource(trading_pairs=self._trading_pairs, connector=self)
+
+    async def fetch_fresh_vwap(
+        self,
+        trading_pair: str,
+        is_buy: bool,
+        amount: Decimal,
+    ) -> Optional[Decimal]:
+        """Bypass the 500ms-polled OrderBook cache and compute VWAP directly
+        from a fresh REST snapshot of /orderbook/<pair>.
+
+        BitPreco's order-book "WS" is a REST poll loop with a 500ms sleep
+        (see bitpreco_api_order_book_data_source.py: listen_for_subscriptions),
+        so the cached OrderBook can be up to ~500ms stale plus the REST
+        latency itself. For latency-sensitive checks (arbitrage spawn gate)
+        this method forces a fresh snapshot at the cost of one extra REST
+        call (~50-100ms).
+
+        Returns ``None`` on REST failure, empty side, or insufficient depth.
+        """
+        try:
+            data = await self._orderbook_ds._request_order_book_snapshot(trading_pair)
+        except Exception as e:
+            self.logger().warning(
+                f"[fresh_vwap] REST snapshot failed for {trading_pair} "
+                f"is_buy={is_buy}: {type(e).__name__}: {e}"
+            )
+            return None
+
+        levels = data.get("asks" if is_buy else "bids") or []
+        if not levels:
+            return None
+
+        remaining = amount
+        quote_total = Decimal("0")
+        for level in levels:
+            try:
+                price = Decimal(str(level["price"]))
+                size = Decimal(str(level["amount"]))
+            except (KeyError, TypeError, ValueError, InvalidOperation):
+                continue
+            take = min(size, remaining)
+            quote_total += take * price
+            remaining -= take
+            if remaining <= 0:
+                return quote_total / amount
+        return None
 
     def _get_fee(self,
                  base_currency: str,

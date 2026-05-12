@@ -2407,3 +2407,173 @@ class TestGhostFillEventHandling(_GhostFillBaseTest):
         # Claim happened despite failure.
         self.assertNotIn("OID-F", self.controller._pending_ghost_orders)
         self.assertIn("OID-F", self.controller._already_hedged_ghost_ids)
+
+
+class TestFreshArbRefresh(_ArbBaseTest):
+    """Gated REST-snapshot override for BitPreco-side arb VWAP.
+
+    Pins: trigger floor, TTL reuse, and the BitPreco-presence gate. The
+    cached path already has dedicated coverage in TestArbDetection — these
+    tests focus on the override-path semantics only.
+    """
+
+    def setUp(self):
+        super().setUp()
+        # Override the default maker_connector="bybit" with "bitpreco" so the
+        # fresh-arb code path engages.
+        self.config.maker_connector = "bitpreco"
+        self.controller = XEMMLeadLagController(
+            config=self.config,
+            market_data_provider=self.market_data_provider,
+            actions_queue=self.actions_queue,
+        )
+        self.set_loggers([self.controller.logger()])
+        self._setup_default_market_data()
+
+    def _set_bitpreco_connector(self, fresh_buy: Optional[Decimal],
+                                 fresh_sell: Optional[Decimal]):
+        bp = MagicMock()
+        bp.fetch_fresh_vwap = AsyncMock(side_effect=lambda pair, is_buy, amount:
+                                         fresh_buy if is_buy else fresh_sell)
+        self.market_data_provider.get_connector.side_effect = (
+            lambda name: bp if name == "bitpreco" else MagicMock()
+        )
+        return bp
+
+    async def test_no_refresh_when_arb_disabled(self):
+        self.controller.config.enable_pure_arb = False
+        bp = self._set_bitpreco_connector(Decimal("100000"), Decimal("100200"))
+        # Cached value near threshold to ensure trigger floor isn't the blocker
+        result = await self.controller._maybe_refresh_fresh_arb_bps(
+            now=100.0,
+            cached_long_net_bps=Decimal("20"),
+            cached_short_net_bps=Decimal("20"),
+            tx_cost_bps=Decimal("3"),
+        )
+        self.assertEqual(result, (None, None))
+        bp.fetch_fresh_vwap.assert_not_called()
+
+    async def test_no_refresh_when_bitpreco_not_in_legs(self):
+        self.controller.config.maker_connector = "bybit"
+        bp = self._set_bitpreco_connector(Decimal("100000"), Decimal("100200"))
+        result = await self.controller._maybe_refresh_fresh_arb_bps(
+            now=100.0,
+            cached_long_net_bps=Decimal("20"),
+            cached_short_net_bps=Decimal("20"),
+            tx_cost_bps=Decimal("3"),
+        )
+        self.assertEqual(result, (None, None))
+        bp.fetch_fresh_vwap.assert_not_called()
+
+    async def test_no_refresh_when_cached_far_below_threshold(self):
+        """Both cached values < threshold − margin → skip the REST fetch."""
+        bp = self._set_bitpreco_connector(Decimal("100000"), Decimal("100200"))
+        threshold = self.controller.config.arb_min_profitability * Decimal("10000")
+        margin = self.controller._fresh_arb_trigger_margin_bps
+        far_below = threshold - margin - Decimal("1")  # 1 bps below floor
+        result = await self.controller._maybe_refresh_fresh_arb_bps(
+            now=100.0,
+            cached_long_net_bps=far_below,
+            cached_short_net_bps=far_below,
+            tx_cost_bps=Decimal("3"),
+        )
+        self.assertEqual(result, (None, None))
+        bp.fetch_fresh_vwap.assert_not_called()
+
+    async def test_refreshes_and_overrides_when_close_to_threshold(self):
+        # Bitpreco fresh: buy_vwap=100100, sell_vwap=100200
+        # Binance cached: buy=100000, sell=100150 (set via _set_vwap)
+        self._set_vwap(
+            taker_buy=Decimal("100000"),    # binance asks (we buy)
+            taker_sell=Decimal("100150"),   # binance bids (we sell)
+        )
+        bp = self._set_bitpreco_connector(
+            fresh_buy=Decimal("100100"),    # bp asks (we buy)
+            fresh_sell=Decimal("100200"),   # bp bids (we sell)
+        )
+        # Cached short_net just under threshold (margin window), forcing refresh
+        threshold = self.controller.config.arb_min_profitability * Decimal("10000")
+        cached_short = threshold - Decimal("5")  # within margin → trigger
+        result = await self.controller._maybe_refresh_fresh_arb_bps(
+            now=100.0,
+            cached_long_net_bps=Decimal("-50"),  # long way below floor
+            cached_short_net_bps=cached_short,
+            tx_cost_bps=Decimal("3"),
+        )
+        # Refresh happened
+        self.assertEqual(bp.fetch_fresh_vwap.await_count, 2)
+        # Result is a populated tuple
+        fresh_long, fresh_short = result
+        self.assertIsNotNone(fresh_long)
+        self.assertIsNotNone(fresh_short)
+        # Sanity: gross_short = (binance_sell - bp_buy) / bp_buy * 10000
+        # = (100150 - 100100) / 100100 * 10000 = ~4.995 bps
+        # net_short = 4.995 - 3 ≈ 1.995 bps
+        self.assertAlmostEqual(float(fresh_short), 1.995, places=2)
+        # State cached for TTL reuse
+        self.assertEqual(self.controller._fresh_arb_cached_at, 100.0)
+        self.assertEqual(self.controller._fresh_arb_short_net_bps, fresh_short)
+
+    async def test_ttl_reuse_within_window(self):
+        """Second call within TTL returns stashed value without re-fetching."""
+        self._set_vwap(
+            taker_buy=Decimal("100000"),
+            taker_sell=Decimal("100150"),
+        )
+        bp = self._set_bitpreco_connector(
+            fresh_buy=Decimal("100100"),
+            fresh_sell=Decimal("100200"),
+        )
+        threshold = self.controller.config.arb_min_profitability * Decimal("10000")
+        cached_short = threshold - Decimal("5")
+
+        # First call — does fetch
+        await self.controller._maybe_refresh_fresh_arb_bps(
+            now=100.0,
+            cached_long_net_bps=Decimal("-50"),
+            cached_short_net_bps=cached_short,
+            tx_cost_bps=Decimal("3"),
+        )
+        first_count = bp.fetch_fresh_vwap.await_count
+        # Second call inside TTL window — returns cached, no new fetch
+        result = await self.controller._maybe_refresh_fresh_arb_bps(
+            now=100.0 + self.controller._fresh_arb_cache_ttl_sec * 0.5,
+            cached_long_net_bps=Decimal("-50"),
+            cached_short_net_bps=cached_short,
+            tx_cost_bps=Decimal("3"),
+        )
+        self.assertEqual(bp.fetch_fresh_vwap.await_count, first_count)  # no extra fetch
+        self.assertIsNotNone(result[1])
+
+    async def test_fetch_returns_none_propagates_none(self):
+        bp = self._set_bitpreco_connector(fresh_buy=None, fresh_sell=None)
+        threshold = self.controller.config.arb_min_profitability * Decimal("10000")
+        cached_short = threshold - Decimal("5")
+        result = await self.controller._maybe_refresh_fresh_arb_bps(
+            now=100.0,
+            cached_long_net_bps=Decimal("-50"),
+            cached_short_net_bps=cached_short,
+            tx_cost_bps=Decimal("3"),
+        )
+        self.assertEqual(result, (None, None))
+
+    async def test_processed_data_exposes_arb_fresh_used_flag(self):
+        """Integration: update_processed_data sets arb_fresh_used when override applies."""
+        self._set_vwap(
+            taker_buy=Decimal("100000"),
+            taker_sell=Decimal("100150"),
+            # bp cached vwap is used as initial; will be overridden by fresh
+            maker_buy=Decimal("100000"),
+            maker_sell=Decimal("100200"),
+        )
+        self._set_bitpreco_connector(
+            fresh_buy=Decimal("100100"),
+            fresh_sell=Decimal("100200"),
+        )
+        # Lower threshold so cached values already pass the trigger floor
+        self.controller.config.arb_min_profitability = Decimal("0.0001")  # 1 bps
+        await self._warm(ticks=2)
+        pd = self.controller.processed_data
+        self.assertIn("arb_fresh_used", pd)
+        # Should have triggered the refresh on at least one tick
+        self.assertTrue(pd["arb_fresh_used"])
