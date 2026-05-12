@@ -1,0 +1,284 @@
+"""Order-book data source for the ``binance_sbe`` connector.
+
+Inherits from :class:`BinanceAPIOrderBookDataSource` and overrides the
+WebSocket-side concerns:
+
+* connects to ``stream-sbe.binance.com:9443`` with ``X-MBX-APIKEY`` header;
+* subscribes to ``<sym>@trade`` and ``<sym>@depth`` (no ``@100ms`` — SBE
+  depth is 25ms by design);
+* parses binary frames via :func:`sbe_decoder.decode_frame` rather than
+  JSON;
+* proactively recycles the connection before Binance's 24h hard cap.
+
+REST snapshot retrieval (``_request_order_book_snapshot``) and the
+high-level orchestration in :class:`OrderBookTrackerDataSource` are reused
+verbatim — the SBE stream does not provide a 1000-level snapshot, so the
+public REST endpoint remains the authoritative source for tracker
+initialisation.
+"""
+from __future__ import annotations
+
+import asyncio
+import time
+from typing import TYPE_CHECKING, Any, Dict, List, Optional
+
+from hummingbot.connector.exchange.binance.binance_api_order_book_data_source import (
+    BinanceAPIOrderBookDataSource,
+)
+from hummingbot.connector.exchange.binance_sbe import binance_sbe_constants as CONSTANTS
+from hummingbot.connector.exchange.binance_sbe import sbe_decoder
+from hummingbot.connector.exchange.binance_sbe.sbe_decoder import SbeDecodeError
+from hummingbot.core.web_assistant.connections.data_types import WSJSONRequest, WSResponse
+from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
+from hummingbot.core.web_assistant.ws_assistant import WSAssistant
+
+if TYPE_CHECKING:
+    from hummingbot.connector.exchange.binance_sbe.binance_sbe_exchange import BinanceSbeExchange
+
+
+class BinanceSbeAPIOrderBookDataSource(BinanceAPIOrderBookDataSource):
+    """SBE variant of the Binance public WS order-book source."""
+
+    def __init__(self,
+                 trading_pairs: List[str],
+                 connector: "BinanceSbeExchange",
+                 api_factory: WebAssistantsFactory,
+                 sbe_api_key: str,
+                 domain: str = CONSTANTS.DEFAULT_DOMAIN):
+        super().__init__(
+            trading_pairs=trading_pairs,
+            connector=connector,
+            api_factory=api_factory,
+            domain=domain,
+        )
+        # The Ed25519 API key STRING that goes verbatim into X-MBX-APIKEY.
+        # Stored on the data source (not pulled from the exchange) so this
+        # class is fully self-contained for testing.
+        self._sbe_api_key = sbe_api_key
+        # Monotonic timestamp of the most recent (re)connection; used to
+        # decide when to proactively recycle the WS to dodge Binance's
+        # 24h connection TTL. See _process_websocket_messages.
+        self._connect_monotonic: Optional[float] = None
+
+    # ------------------------------------------------------------------
+    # Stream-name helpers — used by every subscribe/unsubscribe path.
+    # Keeping them in one place prevents drift between the initial
+    # subscribe and dynamic add/remove of trading pairs.
+    # ------------------------------------------------------------------
+
+    @staticmethod
+    def _trade_stream(symbol: str) -> str:
+        return f"{symbol.lower()}@trade"
+
+    @staticmethod
+    def _depth_stream(symbol: str) -> str:
+        # SBE depth stream is 25ms by design — no @100ms suffix.
+        return f"{symbol.lower()}@depth"
+
+    # ------------------------------------------------------------------
+    # Connection
+    # ------------------------------------------------------------------
+
+    async def _connected_websocket_assistant(self) -> WSAssistant:
+        if not self._sbe_api_key:
+            raise ValueError(
+                "binance_sbe requires a non-empty SBE API key (Ed25519 string). "
+                "Set 'binance_sbe_api_key' in the connector config."
+            )
+        ws: WSAssistant = await self._api_factory.get_ws_assistant()
+        await ws.connect(
+            ws_url=CONSTANTS.WSS_SBE_URL,
+            ws_headers={"X-MBX-APIKEY": self._sbe_api_key},
+            ping_timeout=CONSTANTS.WS_HEARTBEAT_TIME_INTERVAL,
+        )
+        self._connect_monotonic = time.monotonic()
+        return ws
+
+    # ------------------------------------------------------------------
+    # Subscribe — initial bulk subscribe at session start.
+    # ------------------------------------------------------------------
+
+    async def _subscribe_channels(self, ws: WSAssistant):
+        """Subscribe to trade+depth streams for every initial trading pair.
+
+        Subscription payloads themselves are JSON — only the response
+        frames are binary SBE. We reuse :class:`WSJSONRequest` here.
+        """
+        try:
+            trade_params: List[str] = []
+            depth_params: List[str] = []
+            for trading_pair in self._trading_pairs:
+                symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+                trade_params.append(self._trade_stream(symbol))
+                depth_params.append(self._depth_stream(symbol))
+
+            await ws.send(WSJSONRequest(payload={
+                "method": "SUBSCRIBE", "params": trade_params, "id": 1,
+            }))
+            await ws.send(WSJSONRequest(payload={
+                "method": "SUBSCRIBE", "params": depth_params, "id": 2,
+            }))
+            self.logger().info("Subscribed to SBE public order book and trade channels...")
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self.logger().exception(
+                "Unexpected error occurred subscribing to SBE order book trading and delta streams..."
+            )
+            raise
+
+    # ------------------------------------------------------------------
+    # Dynamic add/remove of trading pairs over an already-open WS.
+    # Override the JSON-side implementations because they use the
+    # `@depth@100ms` suffix that SBE doesn't accept.
+    # ------------------------------------------------------------------
+
+    async def subscribe_to_trading_pair(self, trading_pair: str) -> bool:
+        if self._ws_assistant is None:
+            self.logger().warning(f"Cannot subscribe to {trading_pair}: WebSocket not connected")
+            return False
+        try:
+            symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+
+            await self._ws_assistant.send(WSJSONRequest(payload={
+                "method": "SUBSCRIBE",
+                "params": [self._trade_stream(symbol)],
+                "id": self._get_next_subscribe_id(),
+            }))
+            await self._ws_assistant.send(WSJSONRequest(payload={
+                "method": "SUBSCRIBE",
+                "params": [self._depth_stream(symbol)],
+                "id": self._get_next_subscribe_id(),
+            }))
+
+            self.add_trading_pair(trading_pair)
+            self.logger().info(f"Subscribed to SBE {trading_pair} order book and trade channels")
+            return True
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self.logger().exception(f"Unexpected error subscribing to SBE {trading_pair} channels")
+            return False
+
+    async def unsubscribe_from_trading_pair(self, trading_pair: str) -> bool:
+        if self._ws_assistant is None:
+            self.logger().warning(f"Cannot unsubscribe from {trading_pair}: WebSocket not connected")
+            return False
+        try:
+            symbol = await self._connector.exchange_symbol_associated_to_pair(trading_pair=trading_pair)
+            await self._ws_assistant.send(WSJSONRequest(payload={
+                "method": "UNSUBSCRIBE",
+                "params": [self._trade_stream(symbol), self._depth_stream(symbol)],
+                "id": self._get_next_subscribe_id(),
+            }))
+            self.remove_trading_pair(trading_pair)
+            self.logger().info(f"Unsubscribed from SBE {trading_pair} order book and trade channels")
+            return True
+        except asyncio.CancelledError:
+            raise
+        except Exception:
+            self.logger().exception(f"Unexpected error unsubscribing from SBE {trading_pair} channels")
+            return False
+
+    # ------------------------------------------------------------------
+    # Message processing
+    # ------------------------------------------------------------------
+
+    async def _process_websocket_messages(self, websocket_assistant: WSAssistant):
+        """Read frames off the wire and route them to the right queue.
+
+        For SBE we receive a mix of:
+          * binary frames (``ws_response.data`` is ``bytes``) — actual
+            market events, decoded by :func:`sbe_decoder.decode_frame`;
+          * JSON frames (``ws_response.data`` is ``dict``) — SUBSCRIBE
+            and UNSUBSCRIBE acks, e.g. ``{"id": 1, "result": null}``.
+
+        We do not rely on ``WSResponse.type`` because the framework's
+        ``_build_resp`` does not preserve the underlying ``aiohttp``
+        message type — we type-discriminate on ``data`` itself.
+
+        This override also implements proactive reconnect: when the
+        elapsed time on the current connection exceeds
+        :data:`CONSTANTS.WS_RECONNECT_INTERVAL_SEC` we raise
+        ``ConnectionError`` which the base ``listen_for_subscriptions``
+        loop catches and treats as a normal reconnect cycle.
+        """
+        async for ws_response in websocket_assistant.iter_messages():
+            self._maybe_force_reconnect()  # cheap check, runs each message
+
+            data = ws_response.data
+            if data is None:
+                # iter_messages emits None on disconnect; the loop will exit naturally.
+                continue
+
+            if isinstance(data, (bytes, bytearray)):
+                await self._process_binary_frame(bytes(data))
+            elif isinstance(data, dict):
+                self._handle_subscription_ack(data)
+            else:
+                self.logger().warning(
+                    f"[binance_sbe] unexpected WS payload type {type(data).__name__}; ignoring"
+                )
+
+    def _maybe_force_reconnect(self) -> None:
+        """If the current WS has been open longer than the configured
+        interval, raise ``ConnectionError`` so the base reconnect cycle
+        runs cleanly before Binance enforces its 24h cap."""
+        if self._connect_monotonic is None:
+            return
+        elapsed = time.monotonic() - self._connect_monotonic
+        if elapsed >= CONSTANTS.WS_RECONNECT_INTERVAL_SEC:
+            self.logger().info(
+                f"[binance_sbe] proactive reconnect after {elapsed:.0f}s "
+                f"(threshold={CONSTANTS.WS_RECONNECT_INTERVAL_SEC}s, "
+                f"avoids Binance 24h hard cap)"
+            )
+            # Force reset so we don't re-enter this branch repeatedly if
+            # the base loop's reconnect takes a moment.
+            self._connect_monotonic = None
+            raise ConnectionError("binance_sbe proactive reconnect")
+
+    async def _process_binary_frame(self, frame: bytes) -> None:
+        try:
+            events = sbe_decoder.decode_frame(frame)
+        except SbeDecodeError:
+            # Log + skip the frame. Schema-id mismatch and truncated
+            # frames both raise here; we don't kill the whole stream
+            # because a single malformed frame should be recoverable
+            # (the next frame will succeed).
+            self.logger().exception("[binance_sbe] failed to decode SBE frame")
+            return
+
+        valid_channels = self._get_messages_queue_keys()
+        for event in events:
+            channel = self._channel_originating_message(event_message=event)
+            if channel in valid_channels:
+                self._message_queue[channel].put_nowait(event)
+            else:
+                # Decoder returned an event we don't know how to route;
+                # surface it for diagnostics but don't crash.
+                self.logger().debug(
+                    f"[binance_sbe] decoded event with unrouted channel "
+                    f"(e={event.get('e')}); dropping"
+                )
+
+    def _handle_subscription_ack(self, data: Dict[str, Any]) -> None:
+        """Acknowledge a JSON subscribe/unsubscribe response.
+
+        Binance returns ``{"id": <int>, "result": null}`` on success and
+        ``{"id": <int>, "error": {...}}`` on failure. We log either way
+        but don't block the stream — the next binary frame will arrive
+        regardless.
+        """
+        if "result" in data:
+            # Best-effort log; subscription_id helps correlate to the
+            # caller in case multiple subscribes are in-flight.
+            self.logger().debug(
+                f"[binance_sbe] subscription ack id={data.get('id')} result={data.get('result')}"
+            )
+        elif "error" in data:
+            self.logger().error(
+                f"[binance_sbe] subscription error id={data.get('id')} error={data.get('error')}"
+            )
+        else:
+            self.logger().debug(f"[binance_sbe] unknown JSON ws payload: {data}")

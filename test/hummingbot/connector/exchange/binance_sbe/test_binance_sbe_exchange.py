@@ -1,0 +1,159 @@
+"""Tests for the ``BinanceSbeExchange`` class.
+
+We pin only the SBE-specific contract — name, the override of the order
+book data source factory, the trading-required validation, and a smoke
+check that inherited methods still resolve to the base class. Full
+trading-path coverage is the JSON connector's responsibility and not
+re-tested here (those tests would just exercise the parent class).
+"""
+from __future__ import annotations
+
+import unittest
+
+from hummingbot.connector.exchange.binance.binance_api_order_book_data_source import (
+    BinanceAPIOrderBookDataSource,
+)
+from hummingbot.connector.exchange.binance.binance_exchange import BinanceExchange
+from hummingbot.connector.exchange.binance_sbe.binance_sbe_api_order_book_data_source import (
+    BinanceSbeAPIOrderBookDataSource,
+)
+from hummingbot.connector.exchange.binance_sbe.binance_sbe_exchange import (
+    BinanceSbeExchange,
+)
+
+
+class BinanceSbeExchangeNameTest(unittest.TestCase):
+
+    def test_name_property_returns_binance_sbe_for_com(self):
+        ex = BinanceSbeExchange(
+            binance_sbe_api_key="K",
+            binance_api_key="",
+            binance_api_secret="",
+            trading_pairs=["BTC-USDT"],
+            trading_required=False,
+            domain="com",
+        )
+        self.assertEqual(ex.name, "binance_sbe")
+
+    def test_name_property_includes_domain_for_non_com(self):
+        ex = BinanceSbeExchange(
+            binance_sbe_api_key="K",
+            binance_api_key="",
+            binance_api_secret="",
+            trading_pairs=["BTC-USDT"],
+            trading_required=False,
+            domain="us",
+        )
+        self.assertEqual(ex.name, "binance_sbe_us")
+
+
+class CreateOrderBookDataSourceTest(unittest.TestCase):
+
+    def test_create_data_source_returns_sbe_variant(self):
+        ex = BinanceSbeExchange(
+            binance_sbe_api_key="K",
+            binance_api_key="",
+            binance_api_secret="",
+            trading_pairs=["BTC-USDT"],
+            trading_required=False,
+        )
+        ds = ex._create_order_book_data_source()
+        # SBE-specific class, NOT the JSON-side base.
+        self.assertIsInstance(ds, BinanceSbeAPIOrderBookDataSource)
+        # IsInstance check inherits, so also pin the exact type.
+        self.assertIs(type(ds), BinanceSbeAPIOrderBookDataSource)
+
+    def test_create_data_source_forwards_sbe_api_key(self):
+        ex = BinanceSbeExchange(
+            binance_sbe_api_key="my-ed25519-key",
+            binance_api_key="",
+            binance_api_secret="",
+            trading_pairs=["BTC-USDT"],
+            trading_required=False,
+        )
+        ds = ex._create_order_book_data_source()
+        self.assertEqual(ds._sbe_api_key, "my-ed25519-key")
+
+
+class TradingRequiredValidationTest(unittest.TestCase):
+
+    def test_trading_required_without_hmac_raises_value_error(self):
+        with self.assertRaises(ValueError) as cm:
+            BinanceSbeExchange(
+                binance_sbe_api_key="K",
+                binance_api_key=None,
+                binance_api_secret=None,
+                trading_pairs=["BTC-USDT"],
+                trading_required=True,
+            )
+        # Error message must mention both fields so the operator knows
+        # exactly what to fix.
+        self.assertIn("binance_api_key", str(cm.exception))
+        self.assertIn("binance_api_secret", str(cm.exception))
+
+    def test_trading_required_with_only_key_missing_secret_raises(self):
+        with self.assertRaises(ValueError):
+            BinanceSbeExchange(
+                binance_sbe_api_key="K",
+                binance_api_key="hmac-key",
+                binance_api_secret=None,
+                trading_pairs=["BTC-USDT"],
+                trading_required=True,
+            )
+
+    def test_trading_required_with_empty_strings_raises(self):
+        # Empty strings are common in test setups; treat them as "missing".
+        with self.assertRaises(ValueError):
+            BinanceSbeExchange(
+                binance_sbe_api_key="K",
+                binance_api_key="",
+                binance_api_secret="",
+                trading_pairs=["BTC-USDT"],
+                trading_required=True,
+            )
+
+    def test_signal_only_role_does_not_require_hmac(self):
+        # The Phase 1 deployment path: connector loaded as signal_connector,
+        # no trading. Must construct cleanly with empty HMAC credentials.
+        ex = BinanceSbeExchange(
+            binance_sbe_api_key="K",
+            trading_pairs=["BTC-USDT"],
+            trading_required=False,
+        )
+        self.assertEqual(ex.name, "binance_sbe")
+
+
+class InheritanceSmokeTest(unittest.TestCase):
+
+    def test_inherits_binance_exchange(self):
+        ex = BinanceSbeExchange(
+            binance_sbe_api_key="K",
+            trading_pairs=["BTC-USDT"],
+            trading_required=False,
+        )
+        self.assertIsInstance(ex, BinanceExchange)
+
+    def test_authenticator_inherited_from_binance(self):
+        # We rely on BinanceAuth (HMAC) for trading paths. Asserting that
+        # the @property is the same callable that the JSON connector
+        # exposes pins the inheritance contract.
+        ex = BinanceSbeExchange(
+            binance_sbe_api_key="K",
+            trading_pairs=["BTC-USDT"],
+            trading_required=False,
+        )
+        # The property must come from BinanceExchange (not overridden in
+        # the SBE subclass). Comparing descriptors directly checks this.
+        self.assertIs(type(ex).authenticator, BinanceExchange.authenticator)
+
+    def test_data_source_factory_overridden_not_inherited(self):
+        # The override is the whole point of the subclass — assert that
+        # we are NOT using the JSON connector's data source factory.
+        self.assertIsNot(
+            BinanceSbeExchange._create_order_book_data_source,
+            BinanceExchange._create_order_book_data_source,
+        )
+
+
+if __name__ == "__main__":
+    unittest.main()
