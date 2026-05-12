@@ -1,0 +1,288 @@
+# XEMM Lead-Lag controller — BTC-BRL  (EXAMPLE — copy to conf/controllers/)
+#
+# To use: copy this file to `conf/controllers/xemm_lead_lag_btc_brl.yml`
+# (the conf/ directory is gitignored — it's where runtime configs live).
+#
+# Maker: Bybit BTC-BRL  |  Taker (hedge): Binance BTC-BRL
+# Signal: Binance BTC-USDT × Binance USDT-BRL (used only as lead-lag indicator)
+#
+# Read first:
+#   * Always start with shadow_mode: true. Collect ≥48h of CSV data and
+#     analyze before flipping to live.
+#   * The XEMMExecutor handles fees automatically via _tx_cost_pct, so
+#     `min/target/max_profitability` are NET edges (after fees).
+#   * Confirm your real fee tier via "My Fee Rate" on each exchange.
+#     Reference (subject to change):
+#       - Binance VIP4 spot:  0.040% maker / 0.052% taker
+#       - Bybit VIP4 spot fiat-crypto: ~0.050% maker / ~0.060% taker
+#     Round-trip cost ≈ 9–11 bps; min_profitability=7 bps NET means the bot
+#     refreshes when the gross edge falls below ~16 bps gross.
+#   * The controller uses XEMMLeadLagExecutor (LIMIT_MAKER), not XEMMExecutor
+#     (LIMIT). This is a hard requirement to avoid maker→taker conversion
+#     under home latency.
+
+id: xemm_lead_lag_btcbrl_v1
+controller_name: xemm_lead_lag
+controller_type: generic
+
+# ============================================================ #
+# Markets                                                      #
+# ============================================================ #
+maker_connector: bitpreco
+maker_trading_pair: BTC-BRL
+taker_connector: binance
+taker_trading_pair: BTC-BRL
+signal_connector: binance
+signal_base_pair: BTC-USDT
+signal_fx_pair: USDT-BRL
+
+# ============================================================ #
+# Sizing                                                       #
+# ============================================================ #
+# Cap on total budget tracked by the framework (BRL).
+total_amount_quote: "1000"
+# Per-order amount in base asset (BTC). At ~390k BRL/BTC, 0.0002 ≈ 78 BRL.
+# Confirm Bybit min_notional and tick_size before going live.
+# NOTE: Aumentar para 0.0005+ requer saldos mínimos de 0.0015 BTC e 600 BRL
+# em cada exchange para o budget allocator do hummingbot conseguir spawnar.
+# 2026-05-12: +1 satoshi vs 0.0002 para compensar a dedução de 1 sat que o
+# adjust_order_candidates do framework aplica antes de placing. Resultado
+# observado: maker chega exatamente em 0.00020 (= 20,000 sats), múltiplo
+# do Binance LOT_SIZE (1,000 sats step) — sem residual de truncamento no
+# hedge. Sem este ajuste, cada fill deixava ~1,000 sats de drift acumulado
+# que a barrier-audit precisava rebalancear periodicamente.
+order_amount: "0.00020001"
+
+# ============================================================ #
+# Profitability (NET of fees — XEMMExecutor adds tx_cost_pct)  #
+# All values are decimals: 0.001 = 10 bps                      #
+# ============================================================ #
+min_profitability: "0.0002"     # bps net floor (cancel below)
+target_profitability: "0.0003"  # bps net target
+max_profitability: "0.0005"     # bps net ceiling (refresh above)
+
+# ============================================================ #
+# Lead-lag signal                                              #
+# ============================================================ #
+lead_windows_seconds:
+  - 5
+  - 10
+  - 15
+profitability_adjust_threshold_bps: "5"   # |lead| above → adjust targets
+soft_cancel_threshold_bps: "8"            # |lead| above → DEGRADED state
+fast_cancel_threshold_bps: "15"            # |lead| above → PAUSED + cancel
+w_lead: "0.20"                             # weight applied to lead in target
+ema_alpha_fx: "0.30"                       # USDT-BRL smoothing for fair_slow
+
+# ============================================================ #
+# Feed staleness (seconds)                                     #
+# ============================================================ #
+max_leader_staleness_sec: 3.0
+max_fx_staleness_sec: 10.0    # USDT-BRL is less liquid; allow more
+max_local_staleness_sec: 3.0
+
+# ============================================================ #
+# Risk gates                                                   #
+# ============================================================ #
+basis_hard_threshold_bps: "150"
+max_local_spread_bps: "200"
+
+# ============================================================ #
+# Anti-churn                                                   #
+# ============================================================ #
+# Phase 3: 5s cooldown — only blocks NEW order creation; cancellation paths
+# (max_profitability, regime gates, kill switch) are NOT gated by this and
+# remain instantaneous. Higher value reduces OTR / exchange rate-limit pressure.
+min_requote_interval_sec: 5.0
+
+# ============================================================ #
+# Book-aware placement                                         #
+# ============================================================ #
+# Extra margin above min_profitability used only at placement (not for cancel).
+# Creates hysteresis so placed orders don't immediately re-trigger the cancel floor.
+placement_profitability_buffer: "0.0002"  # 2 bps → effective placement floor = 9 bps
+
+# Lead-aware placement (Priority 4):
+# Adjusts effective_min at placement time per side based on lead-lag signal.
+# - When lead favours the side (BUY w/ lead>thr, SELL w/ lead<-thr):
+#     effective_min reduced by `placement_lead_aware_delta_bps` (place tighter)
+# - When lead opposes the side:
+#     effective_min increased by `placement_lead_aware_delta_bps` (more conservative)
+# - In dead zone (|lead| < placement_lead_signal_threshold_bps): no adjustment
+# Set to 0 to disable.
+placement_lead_aware_delta_bps: "1.5"          # ±1.5 bps adjustment when lead is informative
+placement_lead_signal_threshold_bps: "3"       # |lead| > 3 bps to apply adjustment
+
+# ============================================================ #
+# Inventory (per-exchange)                                     #
+# ============================================================ #
+inventory_target_pct: "0.5"
+inventory_skew_strength: "0.001"
+
+# Basis-aware directional skew (Priority 5):
+# Biases target_profitability per side based on persistent basis between
+# maker (Bybit) and taker (Binance):
+#   basis_bps > 0  (Bybit above Binance)  → favour SELL on Bybit (target_sell down)
+#   basis_bps < 0  (Bybit below Binance)  → favour BUY on Bybit (target_buy down)
+# Empirically: basis mean ≈ +0.14 bps, so the bias is small but real.
+# Strength is in absolute Decimal terms applied per bp of basis.
+# Set to 0 to disable.
+basis_skew_strength: "0.00002"   # 0.2 bps target shift per 10 bps of basis
+# Taker balance gate as a fraction of the maker order's hedge cost.
+#   required_balance = order_amount * taker_mid * (1 + taker_hedge_buffer_pct)
+# 0.01 = 1% buffer over a single hedge (covers fee + slippage typical).
+# Use 1.01 to require buffer for two consecutive fills, 2.01 for three.
+# Replaces the previous absolute thresholds; scales with order_amount/price.
+taker_hedge_buffer_pct: "0.01"
+
+# ============================================================ #
+# Warmup                                                       #
+# ============================================================ #
+# Must be >= max(lead_windows_seconds) + 5
+warmup_seconds: 25.0
+
+# ============================================================ #
+# Circuit breakers — layered PnL protection (defense in depth) #
+# ============================================================ #
+# Each gate measures a different failure mode. All values are in BRL (quote).
+# In-process trip → regime=KILLED → cancel all orders → refuse new orders.
+# An EXTERNAL watchdog (tools/watchdog_pnl.sh, cron every 1 min) runs with
+# LOOSER thresholds (150/120 BRL) as a redundancy layer if these fail.
+#
+# 1. Hedge failures (proxy via inventory_audit drift counter):
+#    N consecutive stuck audits on any base asset → KILL.
+max_consecutive_hedge_failures: 3
+# 2. Realized loss since UTC midnight:
+max_daily_loss_quote: "100"
+# 3. Peak-to-trough drawdown since process start. Catches "won early, gave
+#    it back" patterns. Resets only on bot restart.
+max_session_drawdown_quote: "50"
+# 4. Consecutive closed executors with net_pnl_quote < 0. Detects adverse
+#    selection clusters before daily limit fires.
+max_consecutive_losing_fills: 5
+# 5. Rolling 1h burn rate: sum of net_pnl over the last 3600s ≤ -limit.
+#    Catches slow bleeds that wouldn't trip daily_loss until hours later.
+max_hourly_burn_quote: "50"
+# 6. Sum across base assets of |drift| * mid_price. Defense-in-depth against
+#    auto_rebalance failing to keep up with growing drift (kills before the
+#    30-audit DRIFT_STUCK gate fires at ~5 min).
+max_unrealized_loss_quote: "100"
+
+# Self-termination on KILLED: when no executors are active and inventory is
+# in tolerance, SIGTERM the process so the supervisor restarts cleanly.
+# Opt-in to avoid surprising shutdowns in shadow_mode. Grace period gives
+# Phase-1 cancel logic time to fly out cancels AND the next audit cycle
+# time to confirm zero drift.
+auto_terminate_on_kill: true
+auto_terminate_grace_sec: 30
+
+# ============================================================ #
+# Operational modes (independent switches)                     #
+# ============================================================ #
+enable_market_making: true
+# DESABILITADO 2026-05-11 18:30 (segunda vez): incidente 18:06 — arb leg-2 (Binance SELL)
+# fillou, leg-1 (BitPreco MARKET BUY) falhou com BELOW_MINIMUM_VOLUME (bug do campo
+# `volume`); unwind também falhou (kwarg `connector` errado, deveria ser `exchange`).
+# Resultado: posição SHORT 0.00022 BTC aberta + bot em deadlock KILLED.
+# Reabilitar SÓ depois de:
+#   1. Pelo menos 1h de operação MM normal sem novos BELOW_MINIMUM_VOLUME
+#   2. Validação do fix do `volume` em MARKET BUY (via auto_rebalance natural)
+#   3. Validação do fix do unwind kwarg (forçar 1 arb intencional e observar fim a fim)
+# 2026-05-12: re-enabled. Conditions 1+2 met (≥1h MM clean, fixes in commits
+# b5080b48c/d1504b122). Condition 3 is now the live test itself.
+enable_pure_arb: true
+
+# ============================================================ #
+# Pure arbitrage (taker:taker)                                 #
+# ============================================================ #
+# IMPORTANTE: arb_min_profitability é NET (depois das fees), igual aos
+# limites do MM (min/target/max_profitability) e do executor. O spawn
+# gate calcula `net_bps = gross_bps - tx_cost_bps` e compara com este
+# valor. tx_cost_bps = taker_fee_maker_conn + taker_fee_taker_conn.
+# Para BitPreco (0 bps taker) + Binance VIP5 (3.1 bps taker), tx_cost
+# ≈ 3.1 bps → gross necessário ≈ arb_min_profitability + 3.1 bps.
+arb_order_amount: "0.00020001"      # +1 sat: mesmo motivo do order_amount (alinhar pós-adjust com Binance LOT_SIZE de 1,000 sats)
+# Subido de 2 → 4 bps NET após observação 2026-05-11: arbs 1/2 fecharam com
+# net_pnl negativo apesar de spawnar com net positivo, porque slippage na
+# leg-2 (BitPreco MARKET) comeu a edge. 4 bps NET dá margem de segurança
+# contra slippage típica enquanto não corrigirmos a latência (workaround
+# em paralelo no _user_stream_event_listener).
+arb_min_profitability: "0.0004"     # 4 bps NET
+arb_lead_aggressive_delta: "0.0003" # -3 bps quando lead favorece
+arb_lead_conservative_delta: "0.0005" # +5 bps quando lead contradiz
+# Apertado de 5 → 3 bps. Em 16:19 e 16:50 os arbs LONG spawnaram com
+# lead=-4.9 e -4.7 (mercado caindo); abs(-4.9)<5 → dead zone → threshold
+# base inalterado. Com 3, abs(-4.9)>3 → conservative threshold (base+5bps)
+# teria bloqueado os arbs equivocados.
+arb_lead_signal_threshold_bps: "3"  # zona morta de ±3 bps
+
+# Rate limits
+arb_max_per_hour: 10
+arb_min_interval_sec: 5.0
+
+# Capital strategy (verifica saldo livre na hora do spawn)
+arb_capital_strategy: "skip_if_insufficient"   # ou "cancel_xemm_to_free"
+
+# Unwind on partial-leg failure
+arb_max_unwind_slippage_bps: "50"      # 50 bps máximo aceitável
+arb_unwind_strategy: "abort_and_alert" # ou "force_unwind"
+
+# Circuit breakers extras
+arb_failure_pause_sec: 1800.0           # 30 min após falha
+arb_max_failures_per_day: 3             # 3 falhas → desliga pelo dia
+arb_daily_loss_limit_quote: "100"       # 100 BRL prejuízo realizado/dia
+
+# Alert: loga INFO + marca CSV quando spread bruto cruza este valor (mesmo com arb desligado).
+# Abaixo dos ~11bps de fees para capturar near-misses. 0 = desabilitado.
+arb_alert_threshold_bps: 8.0
+
+# ============================================================ #
+# Inventory audit (state-based reconciliation)                 #
+# ============================================================ #
+# Compara periodicamente (maker_balance + taker_balance) por asset base
+# contra um target fixo. Só dispara ação se NÃO houver trade in-flight que
+# possa explicar a divergência (executor ativo, in_flight_orders, fill <10s).
+#
+# Importante:
+#   * Apenas assets BASE (BTC, ETH…) têm target — quote (BRL) cresce com PnL.
+#   * max_drift_quote é absoluto em quote currency (BRL): drift abaixo disso
+#     é IGNORADO silenciosamente. Não escala com order_amount nem com target —
+#     reflete o break-even real de fees+slippage do MARKET rebalance.
+#   * on_drift_action="pause" aciona kill switch (regime → KILLED), cancela
+#     ordens, recusa criar novas. Substitui o detect-and-hedge reativo.
+#
+# Boot-paused mode: bot inicia recusando criar ordens. Só transita para ativo
+# após (1) startup_cleanup confirmar 0 ordens órfãs E (2) audit inicial
+# encontrar 0 drift. Drift no boot → KILL imediato, intervenção manual.
+inventory_audit:
+  enabled: true
+  # 10s entre audits + janela _has_inflight_activity de 10s = cobertura
+  # 100% do gap fill→hedge XEMM (que completa em <2s normalmente, com folga
+  # para slippage do taker). Reduzido de 300s (default) mas elevado de 5s
+  # (anterior) porque 5s permitia a corrida audit×hedge: maker fill em T=0,
+  # audit em T=0.5 (executor ainda não is_done), queue auto_rebalance,
+  # hedge XEMM completa em T=1.5, audit market order em T=2.0 — hedge
+  # duplicado. Audit interval ≥ inflight window elimina a corrida.
+  # _rebalance_cooldown_sec=120s continua prevenindo flapping.
+  audit_interval_sec: 10
+  # Drift máximo aceitável em BRL (quote currency). Convertido para BTC em
+  # runtime via mid_price corrente. Acima disso → auto_rebalance. Abaixo →
+  # ignorado silenciosamente (sem CRITICAL, sem contador).
+  # 60 BRL ≈ $12 USD — acima do min_notional típico das exchanges e do
+  # break-even fees+slippage. NÃO escala com order_amount ou target: faz
+  # sentido tanto para 0.002 BTC quanto para 1 BTC de target. Substitui
+  # tolerance_pct (removido) que escalava com target e dava 10 sats =
+  # 0.004 BRL — apertado demais e disparava DRIFT_STUCK por LOT_SIZE
+  # truncation residual (observado em prod 2026-05-11 11:15-11:20).
+  max_drift_quote: "60"
+  on_drift_action: "auto_rebalance"  # alert | pause | auto_rebalance
+  base_targets:
+    BTC: "0.002"                # 0.001 maker + 0.001 taker = 0.002 total
+    # ETH: "0.05"               # adicione novos assets aqui
+
+# ============================================================ #
+# Operational                                                  #
+# ============================================================ #
+shadow_mode: false  # validated 2026-05-05 — live with BitPreco as maker
+log_dir: "logs/xemm_lead_lag"
+kill_switch_file: "/tmp/xemm_lead_lag_pause"  # touch this file to pause live

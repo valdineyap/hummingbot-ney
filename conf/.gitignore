@@ -1,3 +1,8 @@
 *.yml
 *.json
 .password_verification
+
+# Track the XEMM Lead-Lag controller config — it has no secrets (API keys
+# live in conf/connectors/bitpreco.yml, encrypted) and is the source of
+# truth for strategy parameters. Every change is auditable in git history.
+!controllers/xemm_lead_lag_btc_brl.yml
