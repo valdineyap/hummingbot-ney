@@ -17,6 +17,25 @@ sintético. Branch ativa: `claude/xemm-leadlag`.
 - **Kill switch** (pausa imediata): `touch /tmp/xemm_lead_lag_pause`
 - **Bot vivo?** `pgrep -fa hummingbot_quickstart | grep -v grep`
 
+## Antes de implementar: ofereça a opção simples
+
+Para qualquer mudança não-trivial (refactor, nova feature, correção de bug
+que envolva mais de um arquivo), **proponha duas soluções antes de codar**:
+
+1. **Solução simples** — menos código, menos estado, menos abstração. Cite o
+   custo (ex: "mais lento em X", "menos preciso em Y", "não cobre o caso Z").
+2. **Solução performática/robusta** — a "ideal" técnica. Cite o custo em
+   complexidade, superfície de teste e risco de manutenção.
+
+Sempre deixe o usuário decidir qual caminho seguir. **Default = simples**
+quando o ganho da versão complexa for marginal ou não-medido.
+
+Motivo: o refactor do audit (2026-05-11/12) começou com 3 camadas de defesa
+(timer in-flight + 3-strike + killed-mode passive audit) quando uma barreira
+stop-the-world resolveria tudo. A solução simples só apareceu quando o
+usuário perguntou "será que não estamos complicando?". Isso não pode
+depender da intuição do usuário — tem que vir no primeiro plano.
+
 ## "Ligar o monitoramento" — protocolo obrigatório
 
 Quando o usuário pedir para monitorar a cada N minutos (ex: "rode o robo e
