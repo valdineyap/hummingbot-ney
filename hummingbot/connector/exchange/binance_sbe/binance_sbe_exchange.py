@@ -15,6 +15,7 @@ Optional credentials model:
 """
 from __future__ import annotations
 
+import logging
 import os
 from decimal import Decimal
 from typing import Dict, List, Optional
@@ -25,6 +26,8 @@ from hummingbot.connector.exchange.binance_sbe.binance_sbe_api_order_book_data_s
     BinanceSbeAPIOrderBookDataSource,
 )
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
+
+_logger = logging.getLogger(__name__)
 
 
 # Env var consulted as a fallback when the constructor's ``binance_sbe_api_key``
@@ -80,8 +83,10 @@ class BinanceSbeExchange(BinanceExchange):
         # standard encrypted-config path); fall back to the env var if
         # the kwarg is empty. Either route must yield a non-empty string
         # — fail loud here rather than hitting an opaque WS 401 later.
+        _key_source = "encrypted_config"  # operator-facing label for the log
         if not binance_sbe_api_key:
             binance_sbe_api_key = os.environ.get(_SBE_API_KEY_ENV_VAR, "")
+            _key_source = "env" if binance_sbe_api_key else "missing"
         if not binance_sbe_api_key:
             raise ValueError(
                 "binance_sbe requires an Ed25519 API key string. "
@@ -91,6 +96,18 @@ class BinanceSbeExchange(BinanceExchange):
                 "(e.g. via the repo's .env file)."
             )
         self._sbe_api_key = binance_sbe_api_key
+        # Boot-time positive signal: which credential path was used and
+        # whether HMAC is configured. Important diagnostic for tickets
+        # like "bot started but SBE never connected" or "trading_required
+        # raised — but we DID provide HMAC?".
+        _logger.info(
+            "[binance_sbe] boot: sbe_api_key resolved via %s (length=%d), "
+            "trading_required=%s, hmac=%s",
+            _key_source,
+            len(self._sbe_api_key),
+            trading_required,
+            "present" if (binance_api_key and binance_api_secret) else "absent",
+        )
 
         # Pass through the HMAC creds (possibly empty strings, mirroring
         # how BinanceExchange handles read-only mode). The framework's

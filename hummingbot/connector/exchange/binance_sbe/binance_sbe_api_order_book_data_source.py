@@ -59,6 +59,12 @@ class BinanceSbeAPIOrderBookDataSource(BinanceAPIOrderBookDataSource):
         # decide when to proactively recycle the WS to dodge Binance's
         # 24h connection TTL. See _process_websocket_messages.
         self._connect_monotonic: Optional[float] = None
+        # Set to True after the first successful binary-frame decode in
+        # the current session. Reset to False on every reconnect so each
+        # new session emits a single "pipeline healthy" log line at INFO
+        # level — operator's positive signal that decode is working end
+        # to end (vs. silent connection that never produces events).
+        self._first_frame_logged: bool = False
 
     # ------------------------------------------------------------------
     # Stream-name helpers — used by every subscribe/unsubscribe path.
@@ -92,6 +98,15 @@ class BinanceSbeAPIOrderBookDataSource(BinanceAPIOrderBookDataSource):
             ping_timeout=CONSTANTS.WS_HEARTBEAT_TIME_INTERVAL,
         )
         self._connect_monotonic = time.monotonic()
+        # Reset the "first frame seen" flag so each new connection emits
+        # one healthy-pipeline log line. Crucial for the 24h reconnect
+        # case — without this, post-reconnect there'd be no positive
+        # signal that the new session is actually delivering frames.
+        self._first_frame_logged = False
+        self.logger().info(
+            f"[binance_sbe] connected to SBE WS at {CONSTANTS.WSS_SBE_URL} "
+            f"(X-MBX-APIKEY header set, key length={len(self._sbe_api_key)})"
+        )
         return ws
 
     # ------------------------------------------------------------------
@@ -239,6 +254,12 @@ class BinanceSbeAPIOrderBookDataSource(BinanceAPIOrderBookDataSource):
             raise ConnectionError("binance_sbe proactive reconnect")
 
     async def _process_binary_frame(self, frame: bytes) -> None:
+        # First successful decode per session is logged at INFO so the
+        # operator gets a positive signal that the SBE pipeline is
+        # actually delivering events (vs. just a successful TCP handshake
+        # with no data). After this fires once, the OrderBookTracker's
+        # own ``best_bid``/``best_ask`` updates are the steady-state
+        # heartbeat.
         try:
             events = sbe_decoder.decode_frame(frame)
         except SbeSchemaMismatchError:
@@ -271,6 +292,21 @@ class BinanceSbeAPIOrderBookDataSource(BinanceAPIOrderBookDataSource):
                     f"(e={event.get('e')}); dropping"
                 )
 
+        # One-time positive signal per session: the SBE pipeline is
+        # actually decoding frames and the events are well-formed.
+        # Runs once after the very first successful decode of each
+        # (re)connection; for steady-state runtime visibility we rely
+        # on the order book's own update cadence.
+        if not self._first_frame_logged and events:
+            first = events[0]
+            self.logger().info(
+                f"[binance_sbe] first SBE frame decoded — pipeline healthy "
+                f"(event_type={first.get('e')!r}, "
+                f"symbol={first.get('s')!r}, "
+                f"events_in_frame={len(events)})"
+            )
+            self._first_frame_logged = True
+
     def _handle_subscription_ack(self, data: Dict[str, Any]) -> None:
         """Acknowledge a JSON subscribe/unsubscribe response.
 
@@ -280,9 +316,12 @@ class BinanceSbeAPIOrderBookDataSource(BinanceAPIOrderBookDataSource):
         regardless.
         """
         if "result" in data:
-            # Best-effort log; subscription_id helps correlate to the
-            # caller in case multiple subscribes are in-flight.
-            self.logger().debug(
+            # Logged at INFO (not DEBUG) because acks are sparse — one
+            # per SUBSCRIBE/UNSUBSCRIBE call — and they're the proof
+            # the request actually reached the server. Failure mode
+            # this guards against: subscribes silently never being
+            # acknowledged, with no log of what we sent vs received.
+            self.logger().info(
                 f"[binance_sbe] subscription ack id={data.get('id')} result={data.get('result')}"
             )
         elif "error" in data:
@@ -290,4 +329,4 @@ class BinanceSbeAPIOrderBookDataSource(BinanceAPIOrderBookDataSource):
                 f"[binance_sbe] subscription error id={data.get('id')} error={data.get('error')}"
             )
         else:
-            self.logger().debug(f"[binance_sbe] unknown JSON ws payload: {data}")
+            self.logger().warning(f"[binance_sbe] unknown JSON ws payload: {data}")
