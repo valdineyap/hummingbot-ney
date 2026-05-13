@@ -916,12 +916,20 @@ class BitprecoExchange(ExchangePyBase):
                         order.client_order_id, None
                     )
                     # Q2 instrumentation: separate "BitPreco-side fill time" from
-                    # "our detection time". ``timestamp`` (line above) is the
-                    # BitPreco-reported time_stamp in seconds since epoch
-                    # (1-second resolution per the format string). The gap to
-                    # ``time.time()`` answers "how late was our detection in
-                    # absolute terms" — independent of when we placed the order.
-                    bp_to_detection_ms = (time.time() - timestamp) * 1000
+                    # "our detection time".
+                    #
+                    # BitPreco returns ``time_stamp`` as a UTC string. The
+                    # ``timestamp`` variable computed earlier in this function
+                    # uses ``datetime.strptime(...).timestamp()`` which treats
+                    # the parsed datetime as LOCAL time — on a UTC-3 host that
+                    # yielded a +3h offset, making the metric useless (observed
+                    # 2026-05-13: bp_fill_to_detection=10.8M ms ≈ 3h). Re-parse
+                    # with explicit UTC tzinfo for the diff so the result is
+                    # the real detection lag in milliseconds.
+                    bp_fill_epoch_utc = datetime.datetime.strptime(
+                        executed_order.get("time_stamp"), "%Y-%m-%d %H:%M:%S"
+                    ).replace(tzinfo=datetime.timezone.utc).timestamp()
+                    bp_to_detection_ms = (time.time() - bp_fill_epoch_utc) * 1000
                     if submit_ts is not None:
                         e2e_ms = (time.time() - submit_ts) * 1000
                         self.logger().info(
