@@ -49,6 +49,7 @@ from hummingbot.strategy_v2.models.executor_actions import (
     ExecutorAction,
     StopExecutorAction,
 )
+from hummingbot.strategy_v2.models.executors import CloseType
 from hummingbot.strategy_v2.utils.lead_lag_signal import (
     LeadLagSignalProvider,
     SignalQuality,
@@ -2681,21 +2682,43 @@ class XEMMLeadLagController(ControllerBase):
                         if net_pnl < Decimal("0"):
                             # Store loss as a POSITIVE magnitude (matches the
                             # gate at line ~2561: `>= arb_daily_loss_limit_quote`).
+                            # All losses (small or large) contribute to the
+                            # daily BRL limit.
                             self._arb_realized_loss_today += abs(net_pnl)
-                            self._arb_failures_today += 1
-                            # Per-failure cooldown: pause arb spawning for
-                            # arb_failure_pause_sec. Read at _maybe_create_arb_action.
-                            self._arb_paused_until = max(
-                                self._arb_paused_until,
-                                time.time() + self.config.arb_failure_pause_sec,
-                            )
-                            self.logger().warning(
-                                f"[arb_failure] executor {ex.id} closed with "
-                                f"net_pnl={net_pnl} → failures_today="
-                                f"{self._arb_failures_today}, "
-                                f"loss_today={self._arb_realized_loss_today}, "
-                                f"paused for {self.config.arb_failure_pause_sec:.0f}s"
-                            )
+
+                            # Differentiate "dangerous" from "ordinary" loss:
+                            #   UNWIND_ABORTED → first leg filled, unwind of
+                            #     second leg aborted → we have an OPEN
+                            #     directional position. This is the failure
+                            #     mode the circuit-breaker was designed for.
+                            #   anything else (COMPLETED, UNWOUND, FAILED with
+                            #     no fill) with net_pnl < 0 → ordinary loss
+                            #     from slippage/spread, no open exposure.
+                            # Only the dangerous case advances the failure
+                            # counter and engages the failure_pause cooldown;
+                            # ordinary small losses are noted but not gated.
+                            close_type = getattr(ex, "close_type", None)
+                            is_dangerous = close_type == CloseType.UNWIND_ABORTED
+                            if is_dangerous:
+                                self._arb_failures_today += 1
+                                self._arb_paused_until = max(
+                                    self._arb_paused_until,
+                                    time.time() + self.config.arb_failure_pause_sec,
+                                )
+                                self.logger().warning(
+                                    f"[arb_failure] DANGEROUS executor {ex.id} "
+                                    f"closed UNWIND_ABORTED with net_pnl={net_pnl} "
+                                    f"→ failures_today={self._arb_failures_today}, "
+                                    f"loss_today={self._arb_realized_loss_today}, "
+                                    f"paused for {self.config.arb_failure_pause_sec:.0f}s"
+                                )
+                            else:
+                                self.logger().info(
+                                    f"[arb_loss] executor {ex.id} closed "
+                                    f"close_type={close_type} net_pnl={net_pnl} "
+                                    f"(ordinary loss; loss_today="
+                                    f"{self._arb_realized_loss_today}, no pause)"
+                                )
                     self.logger().info(
                         f"[fill_detected] executor {ex.id} done "
                         f"filled_quote={filled_quote} net_pnl={net_pnl} "

@@ -218,7 +218,7 @@ arb_lead_signal_threshold_bps: "3"  # zona morta de ±3 bps
 
 # Rate limits
 arb_max_per_hour: 10
-arb_min_interval_sec: 5.0
+arb_min_interval_sec: 3.0
 
 # Capital strategy (verifica saldo livre na hora do spawn)
 arb_capital_strategy: "skip_if_insufficient"   # ou "cancel_xemm_to_free"
@@ -228,8 +228,14 @@ arb_max_unwind_slippage_bps: "50"      # 50 bps máximo aceitável
 arb_unwind_strategy: "abort_and_alert" # ou "force_unwind"
 
 # Circuit breakers extras
-arb_failure_pause_sec: 1800.0           # 30 min após falha
-arb_max_failures_per_day: 3             # 3 falhas → desliga pelo dia
+arb_failure_pause_sec: 180.0            # 3 min após falha DANGEROUS (UNWIND_ABORTED)
+arb_max_failures_per_day: 10            # 10 falhas DANGEROUS → desliga pelo dia
+# 2026-05-13: diferenciação ativa. Só close_type=UNWIND_ABORTED (primeira
+# perna filou, unwind da segunda falhou → posição direcional aberta)
+# adianta failures_today e aciona failure_pause_sec. Perdas ordinárias
+# (close_type=COMPLETED|UNWOUND|FAILED com net_pnl < 0) ainda somam em
+# arb_daily_loss_limit_quote mas NÃO pausam. Razão: 3 centavos de
+# slippage não é o mesmo modo de falha que posição desnuda aberta.
 arb_daily_loss_limit_quote: "100"       # 100 BRL prejuízo realizado/dia
 
 # Alert: loga INFO + marca CSV quando spread bruto cruza este valor (mesmo com arb desligado).

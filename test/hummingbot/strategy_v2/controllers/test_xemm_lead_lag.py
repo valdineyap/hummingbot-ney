@@ -1339,6 +1339,90 @@ class TestArbCounterReset(_ArbBaseTest):
         self.assertEqual(self.controller._arb_realized_loss_today, Decimal("0"))
 
 
+class TestArbDangerousFailure(_ArbBaseTest):
+    """Differentiates UNWIND_ABORTED (dangerous, open position) from ordinary
+    arb losses (small slippage on a flat close). Only the dangerous path
+    increments the daily failure counter and engages failure_pause_sec.
+    """
+
+    def _make_closed_arb_executor(
+        self, executor_id: str, net_pnl: Decimal, close_type,
+    ):
+        from hummingbot.strategy_v2.models.executors import CloseType  # noqa: F401
+        ex = MagicMock()
+        ex.id = executor_id
+        ex.is_done = True
+        ex.close_type = close_type
+        ex.net_pnl_quote = net_pnl
+        ex.cum_fees_quote = Decimal("0")
+        ex.filled_amount_quote = Decimal("80")
+        ex.custom_info = {}
+        ex.config = MagicMock()
+        ex.config.type = "lead_lag_arbitrage_executor"
+        ex.config.id = executor_id
+        ex.timestamp = self.market_data_provider.time.return_value - 5.0
+        return ex
+
+    async def _drive_update_with_executor(self, ex):
+        """Simulate one update_processed_data tick that observes `ex` closing."""
+        self.controller.executors_info = [ex]
+        # Force a fresh tick (skip the fingerprint short-circuit).
+        self.controller._last_fingerprint = None
+        self.controller._last_full_update = 0.0
+        # Pre-set today's reset-day key so the daily reset block in
+        # update_processed_data doesn't zero `_arb_failures_today` AFTER
+        # our processed_data ticker increments it.
+        from datetime import datetime as _dt
+        now_ts = self.market_data_provider.time.return_value
+        self.controller._arb_last_reset_day = _dt.utcfromtimestamp(now_ts).strftime("%Y-%m-%d")
+        self.controller._daily_pnl_last_reset_day = self.controller._arb_last_reset_day
+        await self.controller.update_processed_data()
+
+    async def test_unwind_aborted_loss_increments_failure_counter_and_pauses(self):
+        from hummingbot.strategy_v2.models.executors import CloseType
+        ex = self._make_closed_arb_executor(
+            "ARB-DANGER", Decimal("-0.50"), CloseType.UNWIND_ABORTED,
+        )
+        before_failures = self.controller._arb_failures_today
+        before_pause = self.controller._arb_paused_until
+        await self._drive_update_with_executor(ex)
+
+        self.assertEqual(self.controller._arb_failures_today, before_failures + 1)
+        self.assertGreater(self.controller._arb_paused_until, before_pause)
+        # Realized loss is recorded regardless of close type.
+        self.assertEqual(self.controller._arb_realized_loss_today, Decimal("0.50"))
+
+    async def test_ordinary_loss_records_loss_but_does_not_pause(self):
+        from hummingbot.strategy_v2.models.executors import CloseType
+        ex = self._make_closed_arb_executor(
+            "ARB-NORMAL", Decimal("-0.03"), CloseType.COMPLETED,
+        )
+        before_failures = self.controller._arb_failures_today
+        before_pause = self.controller._arb_paused_until
+        await self._drive_update_with_executor(ex)
+
+        # Failure counter NOT advanced for ordinary close types.
+        self.assertEqual(self.controller._arb_failures_today, before_failures)
+        # No pause engaged.
+        self.assertEqual(self.controller._arb_paused_until, before_pause)
+        # But the loss still hits the BRL daily limit.
+        self.assertEqual(self.controller._arb_realized_loss_today, Decimal("0.03"))
+
+    async def test_unwound_with_small_loss_does_not_pause(self):
+        """UNWOUND means we successfully exited the leftover leg — flat,
+        just paid slippage. Not the dangerous case."""
+        from hummingbot.strategy_v2.models.executors import CloseType
+        ex = self._make_closed_arb_executor(
+            "ARB-UNWOUND", Decimal("-0.10"), CloseType.UNWOUND,
+        )
+        before_pause = self.controller._arb_paused_until
+        await self._drive_update_with_executor(ex)
+
+        self.assertEqual(self.controller._arb_paused_until, before_pause)
+        self.assertEqual(self.controller._arb_failures_today, 0)
+        self.assertEqual(self.controller._arb_realized_loss_today, Decimal("0.10"))
+
+
 # ===================================================================== #
 # Group H — Inventory audit & boot-paused mode                          #
 # ===================================================================== #
