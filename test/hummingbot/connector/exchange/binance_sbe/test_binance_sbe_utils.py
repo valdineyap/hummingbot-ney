@@ -54,20 +54,26 @@ class ConfigMapShapeTest(unittest.TestCase):
         )
         self.assertEqual(cm.binance_sbe_api_key.get_secret_value(), "my-key")
 
-    def test_configmap_has_only_sbe_key_no_hmac_fields(self):
-        # The ConfigMap intentionally omits HMAC fields. Earlier
-        # iterations had them as ``Optional[SecretStr] = None`` but
-        # that broke Security.decrypt_all() across all connectors when
-        # the resulting yaml serialised them as ``null``. See the
-        # docstring of binance_sbe_utils.BinanceSbeConfigMap for the
-        # full history; Phase 2 (taker role) will need a different
-        # mechanism if/when it lands.
+    def test_configmap_has_all_three_required_fields(self):
+        # All three are REQUIRED (not Optional). Optional[SecretStr]
+        # with None default would serialise as ``null`` in the encrypted
+        # yaml and break ``Security.decrypt_all()`` for unrelated
+        # connectors — see module docstring of binance_sbe_utils for
+        # the full incident history.
         fields = binance_sbe_utils.BinanceSbeConfigMap.model_fields
         self.assertIn("binance_sbe_api_key", fields)
-        self.assertNotIn("binance_api_key", fields,
-                         "binance_api_key must NOT be on the ConfigMap — null serialisation breaks decrypt_all")
-        self.assertNotIn("binance_api_secret", fields,
-                         "binance_api_secret must NOT be on the ConfigMap — null serialisation breaks decrypt_all")
+        self.assertIn("binance_api_key", fields,
+                      "HMAC required by the framework's signed REST polls during startup")
+        self.assertIn("binance_api_secret", fields)
+        # Each must be required (no default of Ellipsis means
+        # PydanticUndefined; we expose Ellipsis as default so it stays
+        # required at validation time).
+        for fname in ("binance_sbe_api_key", "binance_api_key", "binance_api_secret"):
+            field_info = fields[fname]
+            self.assertTrue(
+                field_info.is_required(),
+                f"{fname} must be required to avoid null serialisation",
+            )
 
     def test_example_pair_present(self):
         self.assertTrue(binance_sbe_utils.EXAMPLE_PAIR)

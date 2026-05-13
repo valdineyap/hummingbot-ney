@@ -67,17 +67,19 @@ class BinanceSbeExchange(BinanceExchange):
                  trading_required: bool = True,
                  domain: str = CONSTANTS.DEFAULT_DOMAIN,
                  ):
-        if trading_required and (not binance_api_key or not binance_api_secret):
-            # Fail-loud at boot. The alternative — letting the inherited
-            # BinanceExchange.__init__ proceed with empty strings — would
-            # produce an opaque HTTP 401 on the first order placement,
-            # which is much harder to diagnose in live operations.
-            raise ValueError(
-                "binance_sbe requires HMAC binance_api_key + binance_api_secret "
-                "when trading_required=True. For signal-only roles "
-                "(signal_connector) configure with trading_required=False "
-                "and omit the HMAC credentials."
-            )
+        # ``trading_required=True`` is what Hummingbot's framework passes
+        # uniformly to every connector — including signal-only roles.
+        # We respect it. The parent ``BinanceExchange`` issues signed
+        # REST calls (``/api/v3/account``, ``/api/v3/exchangeInfo`` with
+        # auth header, listen-key for user data stream) during startup
+        # regardless of whether the controller intends to trade on this
+        # connector; without valid HMAC those calls return HTTP 401
+        # ``API-key format invalid`` and the connector never reaches
+        # ``ready=True``. ``BinanceSbeConfigMap`` therefore *requires*
+        # HMAC creds (alongside the SBE-specific key) and
+        # ``binance_sbe_register.py`` populates them by copying from the
+        # existing ``binance.yml`` so the operator doesn't need to type
+        # the same secrets twice.
 
         # Resolve the SBE API key. The constructor arg wins (Hummingbot's
         # standard encrypted-config path); fall back to the env var if

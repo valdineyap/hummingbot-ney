@@ -89,21 +89,49 @@ def main():
         # only as a defensive measure in case of future async refactors.
         Security.decrypt_all()
 
-    # Build the ConfigMap and wrap in the adapter that save_to_yml expects.
-    # IMPORTANT: pass ONLY the SBE API key. The ConfigMap intentionally
-    # has no other fields (Phase 1 is signal-only). Adding more fields
-    # with None values would cause Security.decrypt_all to crash with a
-    # TypeError on the null SecretStr — see the docstring of
-    # ``binance_sbe_utils.BinanceSbeConfigMap`` for the full history.
+    # Copy the HMAC credentials from the existing `binance` connector
+    # config. Hummingbot's framework polls signed REST endpoints
+    # (/api/v3/account, listen-key, exchangeInfo via the auth header)
+    # on every connector regardless of role, so binance_sbe needs HMAC
+    # too — even in signal-only Phase 1. The simplest and most secure
+    # approach is to reuse what the operator already has: the
+    # `conf/connectors/binance.yml` decrypts under the same master
+    # password and contains the keys we need. Fail loud if it's absent.
+    binance_keys = Security.api_keys("binance")
+    if not binance_keys:
+        print(
+            "ERROR: conf/connectors/binance.yml not found (or empty). "
+            "Run `connect binance` on the Hummingbot CLI first so this "
+            "tool can copy the HMAC creds into binance_sbe.yml.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+    hmac_key = binance_keys.get("binance_api_key")
+    hmac_secret = binance_keys.get("binance_api_secret")
+    if not hmac_key or not hmac_secret:
+        print(
+            "ERROR: binance config is missing binance_api_key or "
+            "binance_api_secret. Re-run `connect binance` to fix.",
+            file=sys.stderr,
+        )
+        sys.exit(1)
+
     cm = BinanceSbeConfigMap.model_construct(
         binance_sbe_api_key=SecretStr(sbe_key),
+        binance_api_key=SecretStr(hmac_key),
+        binance_api_secret=SecretStr(hmac_secret),
     )
     adapter = ClientConfigAdapter(cm)
     Security.update_secure_config(adapter)
 
-    print("OK wrote conf/connectors/binance_sbe.yml "
-          f"(key length={len(sbe_key)}, "
-          "hmac fields=empty — signal-only role).")
+    print(
+        f"OK wrote conf/connectors/binance_sbe.yml "
+        f"(sbe key length={len(sbe_key)}, "
+        f"hmac key length={len(hmac_key)}, "
+        f"hmac secret length={len(hmac_secret)}). "
+        "HMAC creds copied from binance.yml — both connectors now share "
+        "the same Binance HMAC."
+    )
 
 
 if __name__ == "__main__":

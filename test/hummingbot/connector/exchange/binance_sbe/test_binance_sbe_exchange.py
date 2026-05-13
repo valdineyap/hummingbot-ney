@@ -77,52 +77,36 @@ class CreateOrderBookDataSourceTest(unittest.TestCase):
         self.assertEqual(ds._sbe_api_key, "my-ed25519-key")
 
 
-class TradingRequiredValidationTest(unittest.TestCase):
+class TradingRequiredCompatibilityTest(unittest.TestCase):
+    """HMAC creds are required by the framework even for signal-only
+    roles (the parent BinanceExchange issues signed REST calls during
+    startup regardless of role). These tests pin that contract: full
+    construction with HMAC works, partial construction is documented
+    as the unsupported path."""
 
-    def test_trading_required_without_hmac_raises_value_error(self):
-        with self.assertRaises(ValueError) as cm:
-            BinanceSbeExchange(
-                binance_sbe_api_key="K",
-                binance_api_key=None,
-                binance_api_secret=None,
-                trading_pairs=["BTC-USDT"],
-                trading_required=True,
-            )
-        # Error message must mention both fields so the operator knows
-        # exactly what to fix.
-        self.assertIn("binance_api_key", str(cm.exception))
-        self.assertIn("binance_api_secret", str(cm.exception))
-
-    def test_trading_required_with_only_key_missing_secret_raises(self):
-        with self.assertRaises(ValueError):
-            BinanceSbeExchange(
-                binance_sbe_api_key="K",
-                binance_api_key="hmac-key",
-                binance_api_secret=None,
-                trading_pairs=["BTC-USDT"],
-                trading_required=True,
-            )
-
-    def test_trading_required_with_empty_strings_raises(self):
-        # Empty strings are common in test setups; treat them as "missing".
-        with self.assertRaises(ValueError):
-            BinanceSbeExchange(
-                binance_sbe_api_key="K",
-                binance_api_key="",
-                binance_api_secret="",
-                trading_pairs=["BTC-USDT"],
-                trading_required=True,
-            )
-
-    def test_signal_only_role_does_not_require_hmac(self):
-        # The Phase 1 deployment path: connector loaded as signal_connector,
-        # no trading. Must construct cleanly with empty HMAC credentials.
+    def test_full_construction_with_hmac(self):
         ex = BinanceSbeExchange(
             binance_sbe_api_key="K",
+            binance_api_key="hmac-key",
+            binance_api_secret="hmac-secret",
+            trading_pairs=["BTC-USDT"],
+            trading_required=True,
+        )
+        self.assertEqual(ex.name, "binance_sbe")
+        # trading_required NOT downgraded — framework's value preserved.
+        self.assertTrue(ex._trading_required)
+
+    def test_trading_required_false_also_constructs(self):
+        # If the framework explicitly says trading_required=False (rare
+        # — e.g. when running tools manually), we still accept it.
+        ex = BinanceSbeExchange(
+            binance_sbe_api_key="K",
+            binance_api_key="hmac-key",
+            binance_api_secret="hmac-secret",
             trading_pairs=["BTC-USDT"],
             trading_required=False,
         )
-        self.assertEqual(ex.name, "binance_sbe")
+        self.assertFalse(ex._trading_required)
 
 
 class SbeApiKeyResolutionTest(unittest.TestCase):
