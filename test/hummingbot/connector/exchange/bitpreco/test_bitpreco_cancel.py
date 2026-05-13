@@ -174,5 +174,122 @@ class PlaceCancelResilienceTest(unittest.TestCase):
         self.assertEqual(ex._api_request.await_count, 3)
 
 
+class LateFillRecoveryTest(unittest.TestCase):
+    """When the cancel response signals the order is gone *because it
+    filled* (CANT_CANCEL_FILLED_ORDER, ORDER_FILLED, or ORDER_CANCELED
+    with non-zero partial fill field), the connector must fetch and
+    emit the trade(s) immediately — otherwise the framework removes
+    the order from in_flight_orders and the periodic status poll never
+    sees the fill.
+    """
+
+    def _run(self, coro):
+        return asyncio.get_event_loop().run_until_complete(coro)
+
+    def _make_exchange_with_tracker(self, trade_updates):
+        """Exchange with a mocked _order_tracker and a stubbed
+        _all_trade_updates_for_order returning the given updates."""
+        ex = _make_exchange()
+        ex._order_tracker = MagicMock()
+        ex._all_trade_updates_for_order = AsyncMock(return_value=trade_updates)
+        return ex
+
+    def test_cant_cancel_filled_emits_fill_via_tracker(self):
+        """CANT_CANCEL_FILLED_ORDER → fetch trade updates → process via tracker."""
+        fake_trade = MagicMock(name="TradeUpdate")
+        ex = self._make_exchange_with_tracker([fake_trade])
+        ex._api_request = AsyncMock(return_value={
+            "success": False, "message_cod": "CANT_CANCEL_FILLED_ORDER"})
+        order = _make_tracked_order(exchange_order_id="2055000200")
+
+        result = self._run(ex._place_cancel("SBCBL_test_cancel", order))
+        self.assertTrue(result)
+        # Trade update fetched and emitted exactly once
+        ex._all_trade_updates_for_order.assert_awaited_once_with(order=order)
+        ex._order_tracker.process_trade_update.assert_called_once_with(fake_trade)
+
+    def test_order_filled_emits_fill_via_tracker(self):
+        """ORDER_FILLED is treated like CANT_CANCEL_FILLED_ORDER."""
+        fake_trade = MagicMock(name="TradeUpdate")
+        ex = self._make_exchange_with_tracker([fake_trade])
+        ex._api_request = AsyncMock(return_value={
+            "success": False, "message_cod": "ORDER_FILLED"})
+        order = _make_tracked_order(exchange_order_id="2055000201")
+
+        result = self._run(ex._place_cancel("SBCBL_test_cancel", order))
+        self.assertTrue(result)
+        ex._order_tracker.process_trade_update.assert_called_once_with(fake_trade)
+
+    def test_order_canceled_with_partial_fill_emits_trade(self):
+        """ORDER_CANCELED + exec_amount > 0 → emit the partial fill."""
+        fake_trade = MagicMock(name="TradeUpdate")
+        ex = self._make_exchange_with_tracker([fake_trade])
+        ex._api_request = AsyncMock(return_value={
+            "success": True,
+            "message_cod": "ORDER_CANCELED",
+            "exec_amount": "0.0001",
+        })
+        order = _make_tracked_order(exchange_order_id="2055000202")
+
+        result = self._run(ex._place_cancel("SBCBL_test_cancel", order))
+        self.assertTrue(result)
+        ex._order_tracker.process_trade_update.assert_called_once_with(fake_trade)
+
+    def test_clean_order_canceled_does_not_emit_trade(self):
+        """ORDER_CANCELED with NO partial fill field → no trade fetch."""
+        ex = self._make_exchange_with_tracker([])
+        ex._api_request = AsyncMock(return_value={
+            "success": True, "message_cod": "ORDER_CANCELED"})
+        order = _make_tracked_order(exchange_order_id="2055000203")
+
+        result = self._run(ex._place_cancel("SBCBL_test_cancel", order))
+        self.assertTrue(result)
+        # Crucially: NO extra REST call on the happy path
+        ex._all_trade_updates_for_order.assert_not_called()
+        ex._order_tracker.process_trade_update.assert_not_called()
+
+    def test_order_canceled_with_zero_partial_does_not_emit(self):
+        """ORDER_CANCELED + exec_amount=0 is treated as clean cancel."""
+        ex = self._make_exchange_with_tracker([])
+        ex._api_request = AsyncMock(return_value={
+            "success": True,
+            "message_cod": "ORDER_CANCELED",
+            "exec_amount": "0",
+        })
+        order = _make_tracked_order(exchange_order_id="2055000204")
+
+        result = self._run(ex._place_cancel("SBCBL_test_cancel", order))
+        self.assertTrue(result)
+        ex._all_trade_updates_for_order.assert_not_called()
+
+    def test_late_fill_fetch_failure_does_not_break_cancel(self):
+        """If _all_trade_updates_for_order raises, log warning and still
+        return True. The fill loss will still be caught by orphan_check
+        later — better partial recovery than blocking the cancel return."""
+        ex = self._make_exchange_with_tracker([])
+        ex._api_request = AsyncMock(return_value={
+            "success": False, "message_cod": "CANT_CANCEL_FILLED_ORDER"})
+        ex._all_trade_updates_for_order = AsyncMock(
+            side_effect=ConnectionError("REST down")
+        )
+        order = _make_tracked_order(exchange_order_id="2055000205")
+
+        result = self._run(ex._place_cancel("SBCBL_test_cancel", order))
+        # Cancel itself still confirms — framework moves on
+        self.assertTrue(result)
+        # No trade emitted (the fetch failed)
+        ex._order_tracker.process_trade_update.assert_not_called()
+
+    def test_no_tracker_skips_emission_gracefully(self):
+        """Test fixture path without _order_tracker — code logs and moves on."""
+        ex = _make_exchange()  # no _order_tracker set
+        ex._api_request = AsyncMock(return_value={
+            "success": False, "message_cod": "CANT_CANCEL_FILLED_ORDER"})
+        order = _make_tracked_order(exchange_order_id="2055000206")
+
+        result = self._run(ex._place_cancel("SBCBL_test_cancel", order))
+        self.assertTrue(result)
+
+
 if __name__ == "__main__":
     unittest.main()

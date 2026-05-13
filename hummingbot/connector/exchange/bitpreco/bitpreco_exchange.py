@@ -37,7 +37,15 @@ class BitprecoExchange(ExchangePyBase):
     # notices. We tighten both intervals — the 100 req/s rate limit makes
     # this trivially affordable at our order volume.
     SHORT_POLL_INTERVAL = 3.0
-    LONG_POLL_INTERVAL = 30.0
+    # Tightened from 30s → 5s on 2026-05-13 after observing detection lag
+    # of 146s on a maker fill (incident 12:33). BitPreco's user-stream WS
+    # drops frequently (~70-90s), and when an executor stops cancel-cycling
+    # an order (because profitability stabilises), the fill is invisible to
+    # us until either ``orphan_check`` notices the tracker/exchange mismatch
+    # OR the long-poll fires. 5s caps the worst-case detection lag at the
+    # cost of ~6× REST traffic in quiet periods (still trivial vs the
+    # 100 req/s rate limit).
+    LONG_POLL_INTERVAL = 5.0
     # Minimum gap between two ``_update_order_status`` calls. Below this the
     # connector skips the call and waits — a guard against frantic polling
     # when both the user-stream listener and the status loop fire together.
@@ -517,9 +525,19 @@ class BitprecoExchange(ExchangePyBase):
         # order is no longer cancelable because it's gone (filled). Treating
         # it as GONE avoids noisy ERROR logs and saves the framework a retry
         # cycle. The fill propagates separately through OrderFilledEvent.
+        # BitPreco's actual response codes (verified against apidocs.bitpreco.com):
+        # ``ORDER_ALREADY_FILLED`` does NOT exist in the API; removed 2026-05-13.
+        # ``ORDER_FILLED`` kept as a defensive entry in case a future endpoint
+        # variant returns it instead of ``CANT_CANCEL_FILLED_ORDER``.
         GONE_CODES = {"ORDER_CANCELED", "ORDER_NOT_FOUND", "ORDER_ALREADY_CANCELED",
-                      "ORDER_FILLED", "ORDER_ALREADY_FILLED",
+                      "ORDER_FILLED",
                       "CANT_CANCEL_FILLED_ORDER"}
+        # Subset of GONE_CODES that signal "the order is gone because it
+        # FILLED" (not because it was actually cancelled). For these we need
+        # to recover the fill data — otherwise the framework removes the
+        # order from in_flight_orders on the next tick and the periodic
+        # status poll never sees it.
+        GONE_BY_FILL_CODES = {"CANT_CANCEL_FILLED_ORDER", "ORDER_FILLED"}
         TRANSIENT_CODES = {"RATE_LIMIT_EXCEEDED", "INVALID_ORDER_ID"}
         max_attempts = 3
         backoff_sec = 0.5
@@ -546,12 +564,30 @@ class BitprecoExchange(ExchangePyBase):
             code = response.get("message_cod") if isinstance(response, dict) else None
 
             if code in GONE_CODES:
-                # Q4 instrumentation: when a cancel succeeds with ORDER_CANCELED
-                # (not CANT_CANCEL_FILLED_ORDER), check whether BitPreco's
-                # response contains any indication of partial fill before the
-                # cancel landed. The field name is unknown — we probe common
-                # variants. Any positive hit is a WARNING because it means the
-                # tracker may believe "no fill" while base balance moved.
+                # Detect two failure modes that LOOK like clean cancel but
+                # actually have an un-emitted fill behind them:
+                #
+                #   (1) ``CANT_CANCEL_FILLED_ORDER`` / ``ORDER_FILLED`` — the
+                #       order fully filled before the cancel landed.
+                #   (2) ``ORDER_CANCELED`` with a non-zero partial fill field
+                #       (response carries ``exec_amount`` / ``filled`` > 0)
+                #       — partial fill before cancel landed.
+                #
+                # In both cases the framework removes the order from
+                # ``in_flight_orders`` shortly after we return True, and the
+                # periodic ``_all_trade_updates_for_order`` poll will never
+                # find it again — the fill is invisible until ``orphan_check``
+                # picks up the inventory mismatch (10+s later) and rebalance
+                # corrects it via a MARKET on the same exchange (paying the
+                # spread instead of cross-exchange hedging on Binance).
+                #
+                # Recovery path: fetch the trade(s) NOW via the same REST
+                # endpoint the periodic poll would use, and feed them through
+                # ``_order_tracker.process_trade_update`` so the executor
+                # sees ``OrderFilledEvent`` in real time. Cost: one extra
+                # REST call to ``cmd=executed_orders`` only on the race path
+                # (zero on the happy ORDER_CANCELED case with no partial).
+                needs_fill_emission = code in GONE_BY_FILL_CODES
                 if code == "ORDER_CANCELED" and isinstance(response, dict):
                     for field in ("exec_amount", "executed_amount", "executed",
                                   "filled", "filled_amount", "matched_amount"):
@@ -563,12 +599,52 @@ class BitprecoExchange(ExchangePyBase):
                         except (InvalidOperation, ValueError, TypeError):
                             continue
                         if val > 0:
+                            needs_fill_emission = True
                             self.logger().warning(
                                 f"[cancel_partial_fill] exchange_order_id={exchange_order_id} "
                                 f"cancelled with {field}={val} — partial fill before cancel. "
                                 f"Full response: {response}"
                             )
                             break
+
+                if needs_fill_emission:
+                    tracker = getattr(self, "_order_tracker", None)
+                    if tracker is None:
+                        # Test fixture path (BitprecoExchange.__new__ bypass)
+                        # — skip emission, log so it's visible in test output.
+                        self.logger().debug(
+                            f"[late_fill_recovery] no _order_tracker available "
+                            f"for {exchange_order_id} ({code}); skipping emission"
+                        )
+                    else:
+                        try:
+                            trade_updates = await self._all_trade_updates_for_order(
+                                order=tracked_order
+                            )
+                            for tu in trade_updates:
+                                tracker.process_trade_update(tu)
+                            if trade_updates:
+                                self.logger().info(
+                                    f"[late_fill_recovery] cancel of "
+                                    f"{exchange_order_id} returned {code} → "
+                                    f"emitted {len(trade_updates)} TradeUpdate(s) "
+                                    f"immediately (bypassed periodic status poll)"
+                                )
+                            else:
+                                self.logger().warning(
+                                    f"[late_fill_recovery] cancel of "
+                                    f"{exchange_order_id} returned {code} but "
+                                    f"executed_orders REST returned no matching "
+                                    f"trade — orphan_check/reconcile may still "
+                                    f"pick it up later"
+                                )
+                        except Exception as e:
+                            self.logger().warning(
+                                f"[late_fill_recovery] failed for "
+                                f"{exchange_order_id} ({code}): "
+                                f"{type(e).__name__}: {e}"
+                            )
+
                 self.logger().info(
                     f"BitPreco cancel confirmed for exchange_order_id={exchange_order_id} "
                     f"(code={code}, attempt={attempt}): {response}"
