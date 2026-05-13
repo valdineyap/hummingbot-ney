@@ -8,7 +8,9 @@ re-tested here (those tests would just exercise the parent class).
 """
 from __future__ import annotations
 
+import os
 import unittest
+from unittest.mock import patch
 
 from hummingbot.connector.exchange.binance.binance_api_order_book_data_source import (
     BinanceAPIOrderBookDataSource,
@@ -121,6 +123,62 @@ class TradingRequiredValidationTest(unittest.TestCase):
             trading_required=False,
         )
         self.assertEqual(ex.name, "binance_sbe")
+
+
+class SbeApiKeyResolutionTest(unittest.TestCase):
+    """The SBE API key may come from either Hummingbot's encrypted config
+    (constructor kwarg) OR a plaintext .env (env var fallback). Test both
+    and the failure mode when neither is set."""
+
+    def setUp(self):
+        # Snapshot env and strip the fallback so tests don't see whatever
+        # the dev's shell has exported.
+        self._saved_env = os.environ.get("BINANCE_SBE_API_KEY")
+        os.environ.pop("BINANCE_SBE_API_KEY", None)
+
+    def tearDown(self):
+        if self._saved_env is None:
+            os.environ.pop("BINANCE_SBE_API_KEY", None)
+        else:
+            os.environ["BINANCE_SBE_API_KEY"] = self._saved_env
+
+    def test_constructor_arg_wins_over_env(self):
+        # Hummingbot's encrypted-config path supplies the kwarg; that
+        # MUST take precedence over any env var so operators can
+        # override per-instance without exporting different env vars.
+        with patch.dict(os.environ, {"BINANCE_SBE_API_KEY": "from-env"}):
+            ex = BinanceSbeExchange(
+                binance_sbe_api_key="from-kwarg",
+                trading_pairs=["BTC-USDT"],
+                trading_required=False,
+            )
+        self.assertEqual(ex._sbe_api_key, "from-kwarg")
+
+    def test_env_var_used_when_kwarg_empty(self):
+        # Headless deployments without `connect binance_sbe`: the
+        # framework calls the constructor with empty string, env var
+        # picks up the slack.
+        with patch.dict(os.environ, {"BINANCE_SBE_API_KEY": "from-env-only"}):
+            ex = BinanceSbeExchange(
+                binance_sbe_api_key="",
+                trading_pairs=["BTC-USDT"],
+                trading_required=False,
+            )
+        self.assertEqual(ex._sbe_api_key, "from-env-only")
+
+    def test_no_key_anywhere_raises(self):
+        # Both paths empty → fail loud at boot, not later at WS 401.
+        with self.assertRaises(ValueError) as cm:
+            BinanceSbeExchange(
+                binance_sbe_api_key="",
+                trading_pairs=["BTC-USDT"],
+                trading_required=False,
+            )
+        # Error message must point to BOTH credential paths so the
+        # operator knows their options.
+        msg = str(cm.exception)
+        self.assertIn("connect binance_sbe", msg)
+        self.assertIn("BINANCE_SBE_API_KEY", msg)
 
 
 class InheritanceSmokeTest(unittest.TestCase):

@@ -95,6 +95,10 @@ coverage.xml
 
 .env
 
+# Local runtime data — shadow runs, ad-hoc CSVs, anything the tools
+# produce that doesn't belong in source control.
+/var/
+
 **/.claude/settings.local.json
 
 # Editor/AI tool directories

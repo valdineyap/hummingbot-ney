@@ -156,13 +156,13 @@ Função pura: `decode_frame(buf: bytes) -> list[dict]` (lista vazia se template
 - Reusa: `_request_order_book_snapshot` (REST snapshot **continua JSON 1000 níveis** — não usamos `@depth20` SBE para isso), `_order_book_snapshot`, todo boilerplate de `OrderBookTrackerDataSource`.
 - **Reconnect proativo:** override `listen_for_subscriptions` para forçar reconexão a cada ~23h (margem de 1h vs TTL de 24h da Binance). Implementação simples: `asyncio.wait_for` com timeout, captura `TimeoutError`, deixa o ciclo de `_connected_websocket_assistant` re-conectar.
 
-### 6. `binance_sbe_exchange.py` (~60 linhas)
+### 6. `binance_sbe_exchange.py` (~95 linhas, atualizado)
 
 `class BinanceSbeExchange(BinanceExchange)`:
 
 - `@property name → "binance_sbe"`
-- `__init__`: aceita `binance_sbe_api_key: str` (a API key Ed25519, não PEM), armazena, repassa para o data source na factory. Recebe HMAC (`binance_api_key`/`binance_api_secret`) como `Optional` — só usados se trading via este conector estiver habilitado.
-- **Trava explícita de boot:**
+- `__init__`: aceita `binance_sbe_api_key: str = ""` (default vazio para permitir fallback), armazena, repassa para o data source na factory. Recebe HMAC (`binance_api_key`/`binance_api_secret`) como `Optional` — só usados se trading via este conector estiver habilitado.
+- **Trava explícita de boot (HMAC obrigatório quando trading_required):**
   ```python
   if self._trading_required and (not binance_api_key or not binance_api_secret):
       raise ValueError(
@@ -170,11 +170,50 @@ Função pura: `decode_frame(buf: bytes) -> list[dict]` (lista vazia se template
           "when trading_required=True. For signal-only use, pass trading_required=False."
       )
   ```
-  Em Fase 1 (signal_connector), o framework instancia com `trading_required=False`. Se alguém configurar como taker sem HMAC, falha no boot com erro acionável — não silencioso no primeiro `buy()`.
+- **Fallback para env var quando o kwarg vier vazio:** se Hummingbot's `Security.api_keys("binance_sbe")` não retornar nada e o framework passar `binance_sbe_api_key=""`, o construtor consulta `os.environ["BINANCE_SBE_API_KEY"]` (carregado do `.env` pelo start script). Permite deployments sem o fluxo interativo `connect binance_sbe`. Falha loud se nenhum dos dois caminhos forneceu key:
+  ```python
+  if not binance_sbe_api_key:
+      binance_sbe_api_key = os.environ.get("BINANCE_SBE_API_KEY", "")
+  if not binance_sbe_api_key:
+      raise ValueError("provide via `connect binance_sbe` OR via BINANCE_SBE_API_KEY env var")
+  ```
+- Em Fase 1 (signal_connector), o framework instancia com `trading_required=False`. Se alguém configurar como taker sem HMAC, falha no boot com erro acionável — não silencioso no primeiro `buy()`.
 - `_create_order_book_data_source()`: retorna `BinanceSbeAPIOrderBookDataSource(..., sbe_api_key=self._sbe_api_key)`.
 - Todo o resto (auth HMAC, trading, user stream, fees, rate limits, REST) **herdado sem mudança**.
 
-**Total novo:** ~530 linhas (decoder enxugou pra ~250 sem bestBidAsk/depth20). **Reusado por herança:** ~1200 linhas do binance original.
+### 7. `tools/binance_sbe_register.py` (~110 linhas, helper headless)
+
+Embora o conector tenha fallback env var, o `ConnectorManager` do Hummingbot ainda exige uma entrada em `Security.api_keys("binance_sbe")` para passar o gate de "API keys required for live trading connector" (`hummingbot/core/connector_manager.py:85`). Por isso é necessário ter `conf/connectors/binance_sbe.yml` (encrypted) com a key.
+
+Este helper escreve esse arquivo programaticamente, sem precisar do TTY do CLI interativo `connect binance_sbe`:
+
+```bash
+python tools/binance_sbe_register.py <master-password>
+```
+
+Lê `BINANCE_SBE_API_KEY` do `.env`, monta um `BinanceSbeConfigMap`, e chama `Security.update_secure_config()`. Idempotente — pode rodar de novo pra rotação de key (edita `.env`, roda o helper, restart do bot).
+
+### 8. `start_xemm_lead_lag_sbe.sh` (launcher isolado do legado)
+
+Clone do `start_xemm_lead_lag.sh` com identificadores trocados para não conflitar com a versão antiga (que outro projeto pode estar usando em paralelo):
+
+| Recurso | Legado | SBE |
+|---|---|---|
+| Script config | `conf_xemm_lead_lag_shadow.yml` | `conf_xemm_lead_lag_sbe.yml` |
+| Controller config | `xemm_lead_lag_btc_brl.yml` | `xemm_lead_lag_btc_brl_sbe.yml` |
+| Log file | `logs_conf_xemm_lead_lag_shadow.log` | `logs_conf_xemm_lead_lag_sbe.log` |
+| Kill switch | `/tmp/xemm_lead_lag_pause` | `/tmp/xemm_lead_lag_sbe_pause` |
+| pgrep pattern | `conf_xemm_lead_lag_shadow` | `conf_xemm_lead_lag_sbe` |
+
+Pgrep patterns são mutuamente exclusivos — nenhum dos scripts mata processos do outro. **Mas os dois bots NÃO podem rodar simultâneos** porque compartilham:
+
+- WS user stream da BitPreco (limite 1 session/conta)
+- Ordens maker abertas em `bitpreco BTC-BRL`
+- `all_orders_cancel` global na conta BitPreco no precleanup
+
+Operacional: pausar o antigo antes de subir o SBE (`touch /tmp/xemm_lead_lag_pause`; aguardar ~12s; subir SBE).
+
+**Total novo:** ~640 linhas (530 do código + 110 do registro). **Reusado por herança:** ~1200 linhas do binance original.
 
 ## Plano de testes — 3 camadas
 

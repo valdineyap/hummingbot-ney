@@ -15,6 +15,7 @@ Optional credentials model:
 """
 from __future__ import annotations
 
+import os
 from decimal import Decimal
 from typing import Dict, List, Optional
 
@@ -26,6 +27,25 @@ from hummingbot.connector.exchange.binance_sbe.binance_sbe_api_order_book_data_s
 from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
 
 
+# Env var consulted as a fallback when the constructor's ``binance_sbe_api_key``
+# is empty. The shadow tools and the start script already source ``.env``
+# (see :mod:`tools.binance_sbe_shadow` and ``start_xemm_lead_lag.sh``), so by
+# the time the Hummingbot framework instantiates this connector this variable
+# is already in ``os.environ``. Falling back to it here means a deployment
+# can choose between two credential paths:
+#
+#   1. Hummingbot's encrypted ``conf/connectors/binance_sbe.yml`` (via
+#      ``connect binance_sbe`` on the CLI). The framework reads it and
+#      passes ``binance_sbe_api_key`` as a constructor kwarg — same path
+#      used by every other connector.
+#
+#   2. A plaintext ``.env`` file at the repo root (gitignored). Simpler
+#      for headless deployments where running the interactive ``connect``
+#      flow is awkward. Lower security guarantees than the encrypted path
+#      because the file isn't password-protected — operator's choice.
+_SBE_API_KEY_ENV_VAR = "BINANCE_SBE_API_KEY"
+
+
 class BinanceSbeExchange(BinanceExchange):
     """Binance Spot connector that consumes the SBE market data stream.
 
@@ -35,7 +55,7 @@ class BinanceSbeExchange(BinanceExchange):
     """
 
     def __init__(self,
-                 binance_sbe_api_key: str,
+                 binance_sbe_api_key: str = "",
                  binance_api_key: Optional[str] = None,
                  binance_api_secret: Optional[str] = None,
                  balance_asset_limit: Optional[Dict[str, Dict[str, Decimal]]] = None,
@@ -56,6 +76,20 @@ class BinanceSbeExchange(BinanceExchange):
                 "and omit the HMAC credentials."
             )
 
+        # Resolve the SBE API key. The constructor arg wins (Hummingbot's
+        # standard encrypted-config path); fall back to the env var if
+        # the kwarg is empty. Either route must yield a non-empty string
+        # — fail loud here rather than hitting an opaque WS 401 later.
+        if not binance_sbe_api_key:
+            binance_sbe_api_key = os.environ.get(_SBE_API_KEY_ENV_VAR, "")
+        if not binance_sbe_api_key:
+            raise ValueError(
+                "binance_sbe requires an Ed25519 API key string. "
+                "Provide it either via Hummingbot's encrypted config "
+                "(run `connect binance_sbe` on the CLI) OR by exporting "
+                f"the {_SBE_API_KEY_ENV_VAR} environment variable "
+                "(e.g. via the repo's .env file)."
+            )
         self._sbe_api_key = binance_sbe_api_key
 
         # Pass through the HMAC creds (possibly empty strings, mirroring
