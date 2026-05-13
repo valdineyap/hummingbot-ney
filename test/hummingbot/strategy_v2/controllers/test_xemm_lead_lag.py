@@ -2433,8 +2433,14 @@ class TestFreshArbRefresh(_ArbBaseTest):
     def _set_bitpreco_connector(self, fresh_buy: Optional[Decimal],
                                  fresh_sell: Optional[Decimal]):
         bp = MagicMock()
-        bp.fetch_fresh_vwap = AsyncMock(side_effect=lambda pair, is_buy, amount:
-                                         fresh_buy if is_buy else fresh_sell)
+        # Plural (single-REST) form — what the controller now prefers.
+        bp.fetch_fresh_vwaps = AsyncMock(
+            side_effect=lambda pair, amount: (fresh_buy, fresh_sell)
+        )
+        # Singular form kept on the mock for any legacy test that probes it.
+        bp.fetch_fresh_vwap = AsyncMock(
+            side_effect=lambda pair, is_buy, amount: fresh_buy if is_buy else fresh_sell
+        )
         self.market_data_provider.get_connector.side_effect = (
             lambda name: bp if name == "bitpreco" else MagicMock()
         )
@@ -2443,7 +2449,6 @@ class TestFreshArbRefresh(_ArbBaseTest):
     async def test_no_refresh_when_arb_disabled(self):
         self.controller.config.enable_pure_arb = False
         bp = self._set_bitpreco_connector(Decimal("100000"), Decimal("100200"))
-        # Cached value near threshold to ensure trigger floor isn't the blocker
         result = await self.controller._maybe_refresh_fresh_arb_bps(
             now=100.0,
             cached_long_net_bps=Decimal("20"),
@@ -2451,7 +2456,7 @@ class TestFreshArbRefresh(_ArbBaseTest):
             tx_cost_bps=Decimal("3"),
         )
         self.assertEqual(result, (None, None))
-        bp.fetch_fresh_vwap.assert_not_called()
+        bp.fetch_fresh_vwaps.assert_not_called()
 
     async def test_no_refresh_when_bitpreco_not_in_legs(self):
         self.controller.config.maker_connector = "bybit"
@@ -2463,22 +2468,28 @@ class TestFreshArbRefresh(_ArbBaseTest):
             tx_cost_bps=Decimal("3"),
         )
         self.assertEqual(result, (None, None))
-        bp.fetch_fresh_vwap.assert_not_called()
+        bp.fetch_fresh_vwaps.assert_not_called()
 
-    async def test_no_refresh_when_cached_far_below_threshold(self):
-        """Both cached values < threshold − margin → skip the REST fetch."""
+    async def test_no_refresh_when_cached_outside_symmetric_band(self):
+        """Both cached values outside ±margin of threshold → skip REST fetch.
+        The gate is symmetric so being far ABOVE the threshold also skips
+        (no spawn decision can flip by recomputing fresher when both
+        directions are decisively negative)."""
         bp = self._set_bitpreco_connector(Decimal("100000"), Decimal("100200"))
         threshold = self.controller.config.arb_min_profitability * Decimal("10000")
         margin = self.controller._fresh_arb_trigger_margin_bps
-        far_below = threshold - margin - Decimal("1")  # 1 bps below floor
+        # Just outside band on both sides (one below, one above) — neither
+        # within ±margin of threshold.
+        long_far_below = threshold - margin - Decimal("1")
+        short_far_above = threshold + margin + Decimal("1")
         result = await self.controller._maybe_refresh_fresh_arb_bps(
             now=100.0,
-            cached_long_net_bps=far_below,
-            cached_short_net_bps=far_below,
+            cached_long_net_bps=long_far_below,
+            cached_short_net_bps=short_far_above,
             tx_cost_bps=Decimal("3"),
         )
         self.assertEqual(result, (None, None))
-        bp.fetch_fresh_vwap.assert_not_called()
+        bp.fetch_fresh_vwaps.assert_not_called()
 
     async def test_refreshes_and_overrides_when_close_to_threshold(self):
         # Bitpreco fresh: buy_vwap=100100, sell_vwap=100200
@@ -2491,17 +2502,17 @@ class TestFreshArbRefresh(_ArbBaseTest):
             fresh_buy=Decimal("100100"),    # bp asks (we buy)
             fresh_sell=Decimal("100200"),   # bp bids (we sell)
         )
-        # Cached short_net just under threshold (margin window), forcing refresh
+        # Cached short_net just below threshold (within ±3bps band).
         threshold = self.controller.config.arb_min_profitability * Decimal("10000")
-        cached_short = threshold - Decimal("5")  # within margin → trigger
+        cached_short = threshold - Decimal("2")  # |Δ| = 2 ≤ 3 → trigger
         result = await self.controller._maybe_refresh_fresh_arb_bps(
             now=100.0,
-            cached_long_net_bps=Decimal("-50"),  # long way below floor
+            cached_long_net_bps=Decimal("-50"),  # long way outside band
             cached_short_net_bps=cached_short,
             tx_cost_bps=Decimal("3"),
         )
-        # Refresh happened
-        self.assertEqual(bp.fetch_fresh_vwap.await_count, 2)
+        # Single-REST path: ONE call to fetch_fresh_vwaps (not two singular).
+        self.assertEqual(bp.fetch_fresh_vwaps.await_count, 1)
         # Result is a populated tuple
         fresh_long, fresh_short = result
         self.assertIsNotNone(fresh_long)
@@ -2525,7 +2536,7 @@ class TestFreshArbRefresh(_ArbBaseTest):
             fresh_sell=Decimal("100200"),
         )
         threshold = self.controller.config.arb_min_profitability * Decimal("10000")
-        cached_short = threshold - Decimal("5")
+        cached_short = threshold - Decimal("2")  # within ±3 band
 
         # First call — does fetch
         await self.controller._maybe_refresh_fresh_arb_bps(
@@ -2534,7 +2545,7 @@ class TestFreshArbRefresh(_ArbBaseTest):
             cached_short_net_bps=cached_short,
             tx_cost_bps=Decimal("3"),
         )
-        first_count = bp.fetch_fresh_vwap.await_count
+        first_count = bp.fetch_fresh_vwaps.await_count
         # Second call inside TTL window — returns cached, no new fetch
         result = await self.controller._maybe_refresh_fresh_arb_bps(
             now=100.0 + self.controller._fresh_arb_cache_ttl_sec * 0.5,
@@ -2542,13 +2553,13 @@ class TestFreshArbRefresh(_ArbBaseTest):
             cached_short_net_bps=cached_short,
             tx_cost_bps=Decimal("3"),
         )
-        self.assertEqual(bp.fetch_fresh_vwap.await_count, first_count)  # no extra fetch
+        self.assertEqual(bp.fetch_fresh_vwaps.await_count, first_count)  # no extra fetch
         self.assertIsNotNone(result[1])
 
     async def test_fetch_returns_none_propagates_none(self):
         bp = self._set_bitpreco_connector(fresh_buy=None, fresh_sell=None)
         threshold = self.controller.config.arb_min_profitability * Decimal("10000")
-        cached_short = threshold - Decimal("5")
+        cached_short = threshold - Decimal("2")  # within ±3 band
         result = await self.controller._maybe_refresh_fresh_arb_bps(
             now=100.0,
             cached_long_net_bps=Decimal("-50"),
@@ -2570,10 +2581,10 @@ class TestFreshArbRefresh(_ArbBaseTest):
             fresh_buy=Decimal("100100"),
             fresh_sell=Decimal("100200"),
         )
-        # Lower threshold so cached values already pass the trigger floor
-        self.controller.config.arb_min_profitability = Decimal("0.0001")  # 1 bps
+        # cached short_net ≈ (100150-100000)/100000 * 10000 - tx_cost (~3 bps) ≈ 12 bps
+        # Threshold tuned so cached falls inside the ±3 trigger band.
+        self.controller.config.arb_min_profitability = Decimal("0.0012")  # 12 bps
         await self._warm(ticks=2)
         pd = self.controller.processed_data
         self.assertIn("arb_fresh_used", pd)
-        # Should have triggered the refresh on at least one tick
         self.assertTrue(pd["arb_fresh_used"])

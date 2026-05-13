@@ -872,6 +872,35 @@ class BitprecoExchange(ExchangePyBase):
     def _create_order_book_data_source(self) -> BitprecoAPIOrderBookDataSource:
         return BitprecoAPIOrderBookDataSource(trading_pairs=self._trading_pairs, connector=self)
 
+    @staticmethod
+    def _walk_levels_for_vwap(
+        levels: List[Dict[str, Any]],
+        amount: Decimal,
+    ) -> Optional[Decimal]:
+        """Walk one side of an order book snapshot and compute VWAP for
+        ``amount`` of base asset. Returns ``None`` if the side is empty or
+        depth is insufficient.
+
+        Shared helper between ``fetch_fresh_vwap`` (one-sided) and
+        ``fetch_fresh_vwaps`` (both sides from a single REST snapshot).
+        """
+        if not levels:
+            return None
+        remaining = amount
+        quote_total = Decimal("0")
+        for level in levels:
+            try:
+                price = Decimal(str(level["price"]))
+                size = Decimal(str(level["amount"]))
+            except (KeyError, TypeError, ValueError, InvalidOperation):
+                continue
+            take = min(size, remaining)
+            quote_total += take * price
+            remaining -= take
+            if remaining <= 0:
+                return quote_total / amount
+        return None
+
     async def fetch_fresh_vwap(
         self,
         trading_pair: str,
@@ -889,6 +918,10 @@ class BitprecoExchange(ExchangePyBase):
         call (~50-100ms).
 
         Returns ``None`` on REST failure, empty side, or insufficient depth.
+
+        For computing BOTH buy and sell VWAPs, prefer ``fetch_fresh_vwaps``
+        which uses a single REST snapshot (one /orderbook response carries
+        both asks and bids).
         """
         try:
             data = await self._orderbook_ds._request_order_book_snapshot(trading_pair)
@@ -900,23 +933,33 @@ class BitprecoExchange(ExchangePyBase):
             return None
 
         levels = data.get("asks" if is_buy else "bids") or []
-        if not levels:
-            return None
+        return self._walk_levels_for_vwap(levels, amount)
 
-        remaining = amount
-        quote_total = Decimal("0")
-        for level in levels:
-            try:
-                price = Decimal(str(level["price"]))
-                size = Decimal(str(level["amount"]))
-            except (KeyError, TypeError, ValueError, InvalidOperation):
-                continue
-            take = min(size, remaining)
-            quote_total += take * price
-            remaining -= take
-            if remaining <= 0:
-                return quote_total / amount
-        return None
+    async def fetch_fresh_vwaps(
+        self,
+        trading_pair: str,
+        amount: Decimal,
+    ) -> Tuple[Optional[Decimal], Optional[Decimal]]:
+        """Single-snapshot variant of ``fetch_fresh_vwap``: one REST call
+        returns both buy and sell VWAPs.
+
+        Same staleness guarantees as ``fetch_fresh_vwap`` but halves the REST
+        traffic when the caller needs both sides (the typical arb-gate case).
+        Returns ``(buy_vwap, sell_vwap)``; either entry is ``None`` on its
+        side having insufficient depth.
+        """
+        try:
+            data = await self._orderbook_ds._request_order_book_snapshot(trading_pair)
+        except Exception as e:
+            self.logger().warning(
+                f"[fresh_vwap] REST snapshot failed for {trading_pair} "
+                f"(both sides): {type(e).__name__}: {e}"
+            )
+            return (None, None)
+
+        buy_vwap = self._walk_levels_for_vwap(data.get("asks") or [], amount)
+        sell_vwap = self._walk_levels_for_vwap(data.get("bids") or [], amount)
+        return (buy_vwap, sell_vwap)
 
     def _get_fee(self,
                  base_currency: str,

@@ -837,9 +837,14 @@ class XEMMLeadLagController(ControllerBase):
         self._fresh_arb_long_net_bps: Optional[Decimal] = None
         self._fresh_arb_short_net_bps: Optional[Decimal] = None
         self._fresh_arb_cache_ttl_sec: float = 0.2
-        # Margin (bps) below threshold to trigger fresh fetch. 10 bps covers
-        # the typical staleness slippage we observed (~11 bps on 0.0002 BTC).
-        self._fresh_arb_trigger_margin_bps: Decimal = Decimal("10")
+        # Margin (bps) around threshold to trigger fresh fetch (symmetric):
+        # fire only when |cached_net_bps - threshold| <= this on either side.
+        # Tightened from 10 → 3 bps on 2026-05-12 after the wider gate caused
+        # fresh fetches to fire every tick in normal markets (cached net_bps
+        # spends most time within 10 bps of threshold), saturating BitPreco
+        # REST and tripping the event-loop watchdog. 3 bps keeps the fresh
+        # check active only when a spawn is plausibly imminent.
+        self._fresh_arb_trigger_margin_bps: Decimal = Decimal("3")
 
         # === Inventory audit state (state-based reconciliation) ===
         # Audit compares (maker_balance + taker_balance) against config target
@@ -2472,22 +2477,35 @@ class XEMMLeadLagController(ControllerBase):
             return (None, None)
 
         threshold_bps = self.config.arb_min_profitability * Decimal("10000")
-        trigger_floor = threshold_bps - self._fresh_arb_trigger_margin_bps
-        if (cached_long_net_bps < trigger_floor) and (cached_short_net_bps < trigger_floor):
+        margin = self._fresh_arb_trigger_margin_bps
+        # Symmetric proximity gate: fire only when EITHER side is within
+        # ±margin bps of the threshold. Outside that band the spawn decision
+        # won't flip regardless of staleness, so the fresh REST is wasted.
+        long_close = abs(cached_long_net_bps - threshold_bps) <= margin
+        short_close = abs(cached_short_net_bps - threshold_bps) <= margin
+        if not (long_close or short_close):
             return (None, None)
 
         if (now - self._fresh_arb_cached_at) < self._fresh_arb_cache_ttl_sec:
             return (self._fresh_arb_long_net_bps, self._fresh_arb_short_net_bps)
 
         bp_conn = self.market_data_provider.get_connector("bitpreco")
-        fetch_fn = getattr(bp_conn, "fetch_fresh_vwap", None)
-        if fetch_fn is None:
-            return (None, None)
-
+        # Prefer the single-snapshot fetcher (1 REST → both VWAPs). Fall back
+        # to two singular calls only when the connector mock in tests doesn't
+        # expose the plural method.
+        fetch_pair_fn = getattr(bp_conn, "fetch_fresh_vwaps", None)
         amount = self.config.arb_order_amount
         try:
-            bp_buy_vwap = await fetch_fn(self.config.maker_trading_pair, True, amount)
-            bp_sell_vwap = await fetch_fn(self.config.maker_trading_pair, False, amount)
+            if fetch_pair_fn is not None:
+                bp_buy_vwap, bp_sell_vwap = await fetch_pair_fn(
+                    self.config.maker_trading_pair, amount,
+                )
+            else:
+                fetch_fn = getattr(bp_conn, "fetch_fresh_vwap", None)
+                if fetch_fn is None:
+                    return (None, None)
+                bp_buy_vwap = await fetch_fn(self.config.maker_trading_pair, True, amount)
+                bp_sell_vwap = await fetch_fn(self.config.maker_trading_pair, False, amount)
         except Exception as e:
             self.logger().warning(
                 f"[fresh_arb] fetch failed: {type(e).__name__}: {e}"

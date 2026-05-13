@@ -89,5 +89,48 @@ class FetchFreshVwapTest(unittest.TestCase):
         self.assertEqual(vwap, Decimal("100000"))
 
 
+class FetchFreshVwapsPluralTest(unittest.TestCase):
+    """The plural form does ONE REST snapshot and computes both sides.
+    This halves arb-gate REST traffic vs calling the singular form twice.
+    """
+
+    def _run(self, coro):
+        return asyncio.get_event_loop().run_until_complete(coro)
+
+    def test_both_sides_from_single_snapshot(self):
+        snapshot = {
+            "asks": [{"price": "100100", "amount": "0.0005", "id": "1"}],
+            "bids": [{"price": "99900", "amount": "0.0005", "id": "2"}],
+        }
+        ex = _make_exchange(snapshot)
+        buy, sell = self._run(ex.fetch_fresh_vwaps("BTC-BRL", amount=Decimal("0.0002")))
+        # buy walks asks, sell walks bids
+        self.assertEqual(buy, Decimal("100100"))
+        self.assertEqual(sell, Decimal("99900"))
+        # Crucially: only ONE REST call to /orderbook
+        self.assertEqual(ex._orderbook_ds._request_order_book_snapshot.await_count, 1)
+
+    def test_insufficient_depth_on_one_side_returns_none_for_that_side(self):
+        snapshot = {
+            "asks": [{"price": "100100", "amount": "0.0001", "id": "1"}],
+            "bids": [{"price": "99900", "amount": "0.0005", "id": "2"}],
+        }
+        ex = _make_exchange(snapshot)
+        # Ask depth is only 0.0001; bid depth is 0.0005. Request 0.0003 base.
+        buy, sell = self._run(ex.fetch_fresh_vwaps("BTC-BRL", amount=Decimal("0.0003")))
+        self.assertIsNone(buy)        # asks ran out
+        self.assertEqual(sell, Decimal("99900"))
+
+    def test_rest_failure_returns_none_none(self):
+        ex = BitprecoExchange.__new__(BitprecoExchange)
+        ex.logger = lambda: MagicMock()
+        ex._orderbook_ds = MagicMock()
+        ex._orderbook_ds._request_order_book_snapshot = AsyncMock(
+            side_effect=ConnectionError("network down"))
+        buy, sell = self._run(ex.fetch_fresh_vwaps("BTC-BRL", amount=Decimal("0.0001")))
+        self.assertIsNone(buy)
+        self.assertIsNone(sell)
+
+
 if __name__ == "__main__":
     unittest.main()
