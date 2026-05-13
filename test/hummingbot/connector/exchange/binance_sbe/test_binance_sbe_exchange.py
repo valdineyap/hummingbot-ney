@@ -108,6 +108,47 @@ class TradingRequiredCompatibilityTest(unittest.TestCase):
         )
         self.assertFalse(ex._trading_required)
 
+    def test_trading_required_with_empty_hmac_raises(self):
+        """Fail-fast: trading_required=True + empty HMAC raises ValueError
+        with an actionable message BEFORE the parent issues signed REST
+        calls (which would return an opaque HTTP 401)."""
+        with self.assertRaises(ValueError) as cm:
+            BinanceSbeExchange(
+                binance_sbe_api_key="K",
+                binance_api_key="",          # missing
+                binance_api_secret="",       # missing
+                trading_pairs=["BTC-USDT"],
+                trading_required=True,
+            )
+        msg = str(cm.exception)
+        self.assertIn("HMAC", msg)
+        self.assertIn("trading_required", msg)
+        # Mentions both credential paths (connect CLI, register helper)
+        self.assertIn("binance_sbe_register", msg)
+
+    def test_trading_required_with_partial_hmac_raises(self):
+        """One leg of HMAC present, the other empty → still fails."""
+        with self.assertRaises(ValueError):
+            BinanceSbeExchange(
+                binance_sbe_api_key="K",
+                binance_api_key="hmac-key",
+                binance_api_secret="",   # missing
+                trading_pairs=["BTC-USDT"],
+                trading_required=True,
+            )
+
+    def test_trading_required_false_allows_empty_hmac(self):
+        """trading_required=False path (used by tooling that doesn't trade,
+        e.g. tools/binance_sbe_shadow.py) does NOT need HMAC. Just SBE key."""
+        ex = BinanceSbeExchange(
+            binance_sbe_api_key="K",
+            binance_api_key="",
+            binance_api_secret="",
+            trading_pairs=["BTC-USDT"],
+            trading_required=False,
+        )
+        self.assertFalse(ex._trading_required)
+
 
 class SbeApiKeyResolutionTest(unittest.TestCase):
     """The SBE API key may come from either Hummingbot's encrypted config

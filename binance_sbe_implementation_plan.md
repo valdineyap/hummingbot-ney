@@ -82,14 +82,24 @@ Tudo em `hummingbot/connector/exchange/binance_sbe/` (novo diretório):
 ```python
 class BinanceSbeConfigMap(BaseConnectorConfigMap):
     connector: str = "binance_sbe"
-    binance_sbe_api_key: SecretStr = Field(...)          # API key string Ed25519 (header X-MBX-APIKEY)
-    # HMAC fields kept optional. In Phase 1 trading goes via REST/HTTPS+HMAC
-    # inherited from BinanceExchange — using binance_sbe as taker gives the
-    # same trading-side latency as binance. (SBE *does* support trading via
-    # a different endpoint — see Phase 3 — but that path needs Ed25519
-    # signing and is out of scope here.)
-    binance_api_key: Optional[SecretStr] = Field(default=None)
-    binance_api_secret: Optional[SecretStr] = Field(default=None)
+    binance_sbe_api_key: SecretStr = Field(...)   # API key string Ed25519 (header X-MBX-APIKEY)
+    # HMAC fields are REQUIRED (not Optional). Earlier iteration kept them
+    # Optional/None; the yaml then serialised with explicit ``null`` values,
+    # ``Security.decrypt_all()`` called ``decrypt_secret_value(attr, None)``,
+    # and the resulting TypeError poisoned decryption for OTHER connectors
+    # (binance, bitpreco) — observed in prod, fixed in commit 5f4cff316.
+    # Making both fields REQUIRED eliminates that whole class of bug.
+    #
+    # Even when this connector runs in signal-only Phase 1, the framework
+    # passes ``trading_required=True`` uniformly and the parent
+    # BinanceExchange issues signed REST calls during startup
+    # (``/api/v3/exchangeInfo``, ``/api/v3/account``, listen-key). Without
+    # valid HMAC those return HTTP 401 and the connector never reaches
+    # ``ready=True``. Reusing the same HMAC the operator already configured
+    # for the ``binance`` connector is the intended path (the helper
+    # ``tools/binance_sbe_register.py`` copies them automatically).
+    binance_api_key: SecretStr = Field(...)
+    binance_api_secret: SecretStr = Field(...)
 ```
 
 - `EXAMPLE_PAIR = "BTC-USDT"`, `DEFAULT_FEES`, `is_exchange_information_valid` re-exportados de `binance_utils`.
@@ -109,6 +119,10 @@ Função pura: `decode_frame(buf: bytes) -> list[dict]` (lista vazia se template
     {"e": "trade",
      "E": event_time_us // 1000,     # millis, compatível com BinanceOrderBook
      "E_us": event_time_us,           # micros preservados para métricas
+     "transactTime_us": transact_time_us,  # micros do momento do match na matching engine
+                                            # (delta vs E_us = latência interna Binance:
+                                            #  match → publish). Útil pra observabilidade,
+                                            #  ignorável por consumidores.
      "s": symbol,
      "t": trade_id,
      "p": price_str,                  # string decimal exata, via mantissa+exponent
@@ -161,15 +175,20 @@ Função pura: `decode_frame(buf: bytes) -> list[dict]` (lista vazia se template
 `class BinanceSbeExchange(BinanceExchange)`:
 
 - `@property name → "binance_sbe"`
-- `__init__`: aceita `binance_sbe_api_key: str = ""` (default vazio para permitir fallback), armazena, repassa para o data source na factory. Recebe HMAC (`binance_api_key`/`binance_api_secret`) como `Optional` — só usados se trading via este conector estiver habilitado.
-- **Trava explícita de boot (HMAC obrigatório quando trading_required):**
-  ```python
-  if self._trading_required and (not binance_api_key or not binance_api_secret):
-      raise ValueError(
-          "binance_sbe requires HMAC binance_api_key + binance_api_secret "
-          "when trading_required=True. For signal-only use, pass trading_required=False."
-      )
-  ```
+- `__init__`: aceita `binance_sbe_api_key: str = ""` (default vazio para permitir fallback env-var), armazena, repassa para o data source na factory. Recebe HMAC (`binance_api_key`/`binance_api_secret`) como `Optional[str]` (mesmo o ConfigMap exigindo, a assinatura do `__init__` permite tooling/teste construir sem HMAC quando `trading_required=False`).
+- **Defesa em duas camadas para HMAC:**
+  - **Primária — ConfigMap:** ambos os campos HMAC são `Field(...)` (REQUIRED via Pydantic). O caminho normal do framework não consegue instanciar com HMAC ausente — o yaml com `null` falha na decodificação. Cobre 99% dos casos.
+  - **Secundária — trava no `__init__`:** instanciações programáticas (testes, ferramentas, refactors futuros) podem burlar o ConfigMap. A trava abaixo dá erro acionável em vez de deixar o parent `BinanceExchange` emitir REST signed com strings vazias e cair com HTTP 401 opaco:
+    ```python
+    if trading_required and (not binance_api_key or not binance_api_secret):
+        raise ValueError(
+            "binance_sbe: HMAC credentials are required when "
+            "trading_required=True. ... Provide HMAC via `connect binance_sbe` "
+            "or copy them from your existing binance.yml using "
+            "tools/binance_sbe_register.py."
+        )
+    ```
+  - `trading_required=False` (tooling como `binance_sbe_shadow.py`) **não** precisa de HMAC — só do `binance_sbe_api_key`.
 - **Fallback para env var quando o kwarg vier vazio:** se Hummingbot's `Security.api_keys("binance_sbe")` não retornar nada e o framework passar `binance_sbe_api_key=""`, o construtor consulta `os.environ["BINANCE_SBE_API_KEY"]` (carregado do `.env` pelo start script). Permite deployments sem o fluxo interativo `connect binance_sbe`. Falha loud se nenhum dos dois caminhos forneceu key:
   ```python
   if not binance_sbe_api_key:

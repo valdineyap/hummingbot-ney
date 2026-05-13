@@ -98,6 +98,25 @@ class BinanceSbeExchange(BinanceExchange):
                 "(e.g. via the repo's .env file)."
             )
         self._sbe_api_key = binance_sbe_api_key
+
+        # Secondary defense for HMAC: the ConfigMap already declares both
+        # HMAC fields as REQUIRED (Pydantic ``default=...``), so the
+        # framework path can't construct this connector with missing
+        # HMAC. But the constructor can still be invoked directly (tests,
+        # programmatic instantiation, future config refactors) — in that
+        # case fail fast with an actionable message instead of letting
+        # the inherited ``BinanceExchange`` issue signed REST calls with
+        # empty credentials and surface an opaque HTTP 401 minutes later.
+        if trading_required and (not binance_api_key or not binance_api_secret):
+            raise ValueError(
+                "binance_sbe: HMAC credentials are required when "
+                "trading_required=True. The framework always passes "
+                "trading_required=True even for signal-only roles (the "
+                "parent BinanceExchange issues signed REST calls during "
+                "startup regardless). Provide HMAC via `connect binance_sbe` "
+                "or copy them from your existing binance.yml using "
+                "tools/binance_sbe_register.py."
+            )
         # Boot-time positive signal: which credential path was used and
         # whether HMAC is configured. Important diagnostic for tickets
         # like "bot started but SBE never connected" or "trading_required
