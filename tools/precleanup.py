@@ -293,6 +293,15 @@ async def bitpreco_cancel_open_orders(
 DISPATCH = {
     "bybit": bybit_cancel_open_orders,
     "binance": binance_cancel_open_orders,
+    # binance_sbe is a sibling connector that consumes the SBE market data
+    # stream but trades through the same Binance Spot REST API with the
+    # same HMAC credentials. From this tool's perspective — cancelling
+    # open orders via REST DELETE — they're identical, so we alias them
+    # to the same handler. The handler reads credentials from
+    # Security.api_keys(connector_name), which for binance_sbe also
+    # returns binance_api_key/binance_api_secret (populated by
+    # tools/binance_sbe_register.py from binance.yml).
+    "binance_sbe": binance_cancel_open_orders,
     "bitpreco": bitpreco_cancel_open_orders,
 }
 

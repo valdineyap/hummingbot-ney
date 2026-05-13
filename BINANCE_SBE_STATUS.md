@@ -9,13 +9,18 @@ Lido junto com [`binance_sbe_implementation_plan.md`](binance_sbe_implementation
 
 ## TL;DR onde estamos
 
-- **Código completo:** decoder + data source + exchange + tools + tests (66/66 passam).
+- **Código completo:** decoder + data source + exchange + tools + tests (64/64 passam).
 - **Validação shadow:** ✅ 60s smoke, ✅ 10min multipair, ✅ 2h calm — todos verdes
   com SBE p50 ~46ms à frente do JSON, 97-98% das observações.
-- **Launcher SBE isolado pronto** (`start_xemm_lead_lag_sbe.sh`) — separado do
-  launcher legado pra não comprometer outro projeto que usa o original.
-- **Próximo passo concreto:** parar o bot legado e rodar o `start_xemm_lead_lag_sbe.sh`
-  pra iniciar a observação de Phase 1.
+- **Phase 1 (signal_connector → binance_sbe):** ✅ live desde 2026-05-13 09:36Z.
+- **Phase 2 (taker_connector → binance_sbe):** ✅ live desde 2026-05-13 10:00Z.
+  Captura o ganho de SBE também nas decisões de cancel/refresh (profitability
+  check usa `_taker_result_price` que agora vem do book SBE).
+- **Shadow paralelo (60s rodando junto do bot live):** confirmou os mesmos
+  números — JSON 11.6/s, SBE 37.6/s (3.26×), p50 +43.4ms SBE-first,
+  94.5% SBE chegou antes, 0% top-of-book divergente. Ganho ativo em produção.
+- **Próximo:** observação ≥7 dias incluindo o reconnect proativo de ~23h
+  (única coisa que ainda não foi exercitada em prod).
 
 ---
 
