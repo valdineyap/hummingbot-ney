@@ -6,19 +6,26 @@ exports ``KEYS``, ``EXAMPLE_PAIR``, and ``DEFAULT_FEES``. By keeping this
 module thin and reusing the JSON connector's fee schema and helpers, we
 avoid duplicating any business logic.
 
-Credentials model:
+Credentials model (Phase-1 / signal-only):
   - ``binance_sbe_api_key`` (REQUIRED, secure): the Ed25519 API key STRING
     registered in the Binance portal. Goes verbatim into the
     ``X-MBX-APIKEY`` header on the SBE WebSocket. No PEM, no signing —
     public market data only.
-  - ``binance_api_key`` / ``binance_api_secret`` (optional, HMAC): only
-    needed when this connector is used as a *trading* connector (taker
-    role). For signal-only use (the recommended Phase-1 rollout) these
-    can be omitted. BinanceSbeExchange validates their presence when
-    ``trading_required=True``.
-"""
-from typing import Optional
 
+  - HMAC fields (``binance_api_key`` / ``binance_api_secret``) are
+    INTENTIONALLY OMITTED from this ConfigMap. They were here in an
+    earlier iteration as ``Optional[SecretStr] = None`` but that broke
+    ``Security.decrypt_all()`` across ALL connector configs: when the
+    yaml was written with ``null`` for those fields, the traversal in
+    ``_decrypt_all_internal_secrets`` called
+    ``decrypt_secret_value(attr, None)`` and raised TypeError, poisoning
+    decryption for unrelated connectors (binance, bitpreco). For Phase 2
+    (this connector as ``taker_connector``, no latency gain — see plan)
+    re-add the fields and ensure the yaml never serialises ``null`` for
+    SecretStr — for instance by writing two separate ConfigMap variants
+    (signal-only vs trading) or by using a custom serialiser that drops
+    None fields.
+"""
 from pydantic import ConfigDict, Field, SecretStr
 
 from hummingbot.client.config.config_data_types import BaseConnectorConfigMap
@@ -48,29 +55,6 @@ class BinanceSbeConfigMap(BaseConnectorConfigMap):
             "is_secure": True,
             "is_connect_key": True,
             "prompt_on_new": True,
-        }
-    )
-
-    # HMAC keys for trading. Optional at the schema level so the connector
-    # can be used as signal_connector without trading credentials. The
-    # exchange class raises ValueError if trading_required=True and these
-    # are missing — fail-loud at boot instead of silently at first order.
-    binance_api_key: Optional[SecretStr] = Field(
-        default=None,
-        json_schema_extra={
-            "prompt": lambda cm: "Enter your Binance HMAC API key (only if using binance_sbe as taker)",
-            "is_secure": True,
-            "is_connect_key": True,
-            "prompt_on_new": False,
-        }
-    )
-    binance_api_secret: Optional[SecretStr] = Field(
-        default=None,
-        json_schema_extra={
-            "prompt": lambda cm: "Enter your Binance HMAC API secret (only if using binance_sbe as taker)",
-            "is_secure": True,
-            "is_connect_key": True,
-            "prompt_on_new": False,
         }
     )
 

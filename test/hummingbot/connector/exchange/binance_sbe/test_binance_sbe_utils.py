@@ -54,14 +54,20 @@ class ConfigMapShapeTest(unittest.TestCase):
         )
         self.assertEqual(cm.binance_sbe_api_key.get_secret_value(), "my-key")
 
-    def test_hmac_fields_optional_default_none(self):
-        # Phase 1 deployment uses binance_sbe as signal_connector only,
-        # so the HMAC fields must not be required at the schema level.
-        cm = binance_sbe_utils.BinanceSbeConfigMap.model_construct(
-            binance_sbe_api_key=SecretStr("k"),
-        )
-        self.assertIsNone(cm.binance_api_key)
-        self.assertIsNone(cm.binance_api_secret)
+    def test_configmap_has_only_sbe_key_no_hmac_fields(self):
+        # The ConfigMap intentionally omits HMAC fields. Earlier
+        # iterations had them as ``Optional[SecretStr] = None`` but
+        # that broke Security.decrypt_all() across all connectors when
+        # the resulting yaml serialised them as ``null``. See the
+        # docstring of binance_sbe_utils.BinanceSbeConfigMap for the
+        # full history; Phase 2 (taker role) will need a different
+        # mechanism if/when it lands.
+        fields = binance_sbe_utils.BinanceSbeConfigMap.model_fields
+        self.assertIn("binance_sbe_api_key", fields)
+        self.assertNotIn("binance_api_key", fields,
+                         "binance_api_key must NOT be on the ConfigMap — null serialisation breaks decrypt_all")
+        self.assertNotIn("binance_api_secret", fields,
+                         "binance_api_secret must NOT be on the ConfigMap — null serialisation breaks decrypt_all")
 
     def test_example_pair_present(self):
         self.assertTrue(binance_sbe_utils.EXAMPLE_PAIR)

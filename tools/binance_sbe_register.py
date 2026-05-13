@@ -90,11 +90,13 @@ def main():
         Security.decrypt_all()
 
     # Build the ConfigMap and wrap in the adapter that save_to_yml expects.
+    # IMPORTANT: pass ONLY the SBE API key. The ConfigMap intentionally
+    # has no other fields (Phase 1 is signal-only). Adding more fields
+    # with None values would cause Security.decrypt_all to crash with a
+    # TypeError on the null SecretStr — see the docstring of
+    # ``binance_sbe_utils.BinanceSbeConfigMap`` for the full history.
     cm = BinanceSbeConfigMap.model_construct(
         binance_sbe_api_key=SecretStr(sbe_key),
-        # HMAC fields stay empty — signal-only role for Phase 1 cutover.
-        binance_api_key=None,
-        binance_api_secret=None,
     )
     adapter = ClientConfigAdapter(cm)
     Security.update_secure_config(adapter)
