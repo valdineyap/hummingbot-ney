@@ -22,6 +22,19 @@ exclude = '''
 requires = ["setuptools", "wheel", "numpy>=2.2.6", "cython>=3.0.12"]
 build-backend = "setuptools.build_meta"
 
+[tool.ruff]
+line-length = 120
+target-version = "py313"
+# Ruff doesn't process .pyx/.pxd (covered by the legacy flake8 toolchain only).
+extend-exclude = ["*.pyx", "*.pxd"]
+
+[tool.ruff.lint]
+# Mirror .flake8 (E251, E501, E702, W504, W503).
+# W503/W504 aren't implemented in ruff (PEP 8 strict), so they're omitted.
+ignore = ["E251", "E501", "E702"]
+# pycodestyle (E,W) + pyflakes (F) = same surface as flake8 default.
+select = ["E", "W", "F"]
+
 [tool.isort]
 line_length = 120
 multi_line_output = 3
