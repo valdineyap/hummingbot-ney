@@ -47,6 +47,14 @@ class XEMMLeadLagExecutor(XEMMExecutor):
         # order_id here so process_order_completed_event can detect and hedge
         # the fill when the event finally lands.
         self._ghost_maker_order_ids: set = set()
+        # Lead-lag signal snapshot taken at the last maker placement. Used
+        # by ``get_custom_info`` to surface the value to the controller's
+        # TradeLedger, which then persists it on the kind=trade record.
+        # Downstream analysis (P&L by lead_mode) joins on these fields.
+        # Refreshed on every placement; reflects the placement that was
+        # live at the moment of the fill (last-write-wins).
+        self._lead_mode_at_placement: Optional[str] = None
+        self._lead_bps_at_placement: Optional[Decimal] = None
 
     @classmethod
     def logger(cls) -> HummingbotLogger:
@@ -97,6 +105,27 @@ class XEMMLeadLagExecutor(XEMMExecutor):
                 "are the source of truth for real balance issues)."
             )
             self.stop()
+
+    def get_custom_info(self) -> dict:
+        """Extend base custom_info with lead-lag snapshot at placement.
+
+        Adds two fields:
+          * ``lead_mode_at_placement`` — "favours" | "neutral" | "opposes",
+            reflecting how the lead-lag signal classified the maker side
+            at the moment of the LAST placement. Last-write-wins across
+            replaces in a single executor cycle.
+          * ``lead_bps_at_placement`` — the raw signed bps value of the
+            lead signal at that placement.
+
+        Surfaced via custom_info so the controller's TradeLedger picks them
+        up at executor close and writes them onto the ``kind=trade`` record
+        in ``trades.jsonl``. Downstream analysis can then bucket P&L by
+        ``lead_mode_at_placement`` to measure whether the signal adds edge.
+        """
+        info = super().get_custom_info()
+        info["lead_mode_at_placement"] = self._lead_mode_at_placement
+        info["lead_bps_at_placement"] = self._lead_bps_at_placement
+        return info
 
     async def control_shutdown_process(self):
         """
@@ -665,6 +694,9 @@ class XEMMLeadLagExecutor(XEMMExecutor):
             price=price,
         )
         self.maker_order = TrackedOrder(order_id=order_id)
+        # Snapshot lead state for downstream attribution (see __init__ doc).
+        self._lead_mode_at_placement = lead_mode
+        self._lead_bps_at_placement = lead_bps
         self.logger().info(
             f"Created maker order (LIMIT_MAKER) {order_id} "
             f"side={self.maker_order_side.name} price={price} mode={book_mode} "

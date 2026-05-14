@@ -657,6 +657,15 @@ class TradeLedger:
                 "fill_to_hedge_latency_ms": ci.get("fill_to_hedge_latency_ms"),
                 "taker_expected_price": self._to_jsonable(taker_expected),
                 "slippage_bps": slippage_bps,
+                # Lead-lag attribution (2026-05-14): record the signal
+                # state at the placement that produced this fill so off-
+                # line analysis can bucket P&L by ``lead_mode_at_placement``
+                # and answer "does the lead-aware delta add edge?".
+                # Surfaced by XEMMLeadLagExecutor.get_custom_info.
+                "lead_mode_at_placement": ci.get("lead_mode_at_placement"),
+                "lead_bps_at_placement": self._to_jsonable(
+                    ci.get("lead_bps_at_placement")
+                ),
             }
             self._append_jsonl(record)
             self._write_state(record)
