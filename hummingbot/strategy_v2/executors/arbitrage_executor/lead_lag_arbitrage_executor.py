@@ -17,11 +17,12 @@ This subclass adds:
    slippage. Closes the executor with `CloseType.UNWOUND` (success) or
    `CloseType.UNWIND_ABORTED` (gate triggered).
 """
+import asyncio
 import logging
 from decimal import Decimal
 from typing import Optional, Union
 
-from hummingbot.core.data_type.common import OrderType, TradeType
+from hummingbot.core.data_type.common import OrderType, PriceType, TradeType
 from hummingbot.core.event.events import (
     BuyOrderCreatedEvent,
     MarketOrderFailureEvent,
@@ -62,6 +63,270 @@ class LeadLagArbitrageExecutor(ArbitrageExecutor):
         )
         self.config: LeadLagArbitrageExecutorConfig = config
         self._unwind_attempted: bool = False
+        # Tracks which legs (if any) were placed as aggressive LIMITs so the
+        # watchdog only fires on those — MARKET legs don't need timeout
+        # supervision (they're synchronously matched server-side).
+        self._aggressive_limit_buy_active: bool = False
+        self._aggressive_limit_sell_active: bool = False
+
+    # ------------------------------------------------------------------ #
+    # Leg ordering (parallel / maker_first / taker_first)                  #
+    # ------------------------------------------------------------------ #
+    async def execute_arbitrage(self):
+        """Override base to support configurable leg ordering.
+
+        Modes (role-based, exchange-agnostic):
+          - ``parallel`` (default): place both legs back-to-back without
+            awaiting between them. The REST round-trips overlap on the
+            event loop — minimal exposure window between spawn and both
+            legs landing on their respective exchanges.
+          - ``maker_first``: dispatch the leg on the maker connector
+            first, wait for its REST to ACK (exchange_order_id assigned),
+            then dispatch the taker leg.
+          - ``taker_first``: symmetric — taker leg first.
+
+        Maker/taker identification comes from ``config.maker_connector_name``
+        (passed by the controller). If absent and a non-parallel mode is
+        requested, the executor falls back to parallel with a warning.
+
+        Unknown modes also fall back to parallel with a warning.
+        """
+        from hummingbot.strategy_v2.runnable_base import RunnableStatus
+        self._status = RunnableStatus.SHUTTING_DOWN
+        mode = getattr(self.config, "arb_leg_execution_order", "parallel")
+
+        if mode == "parallel":
+            self.place_buy_arbitrage_order()
+            self.place_sell_arbitrage_order()
+            return
+
+        maker_name = getattr(self.config, "maker_connector_name", None)
+        if maker_name is None:
+            self.logger().warning(
+                f"[leg_ordering] mode={mode!r} but maker_connector_name "
+                f"not set on config — falling back to parallel"
+            )
+            self.place_buy_arbitrage_order()
+            self.place_sell_arbitrage_order()
+            return
+
+        # Sequential modes — determine which leg is "first" based on
+        # whether the buying or selling leg is on the maker connector.
+        buying_is_maker = self.buying_market.connector_name == maker_name
+        if mode == "maker_first":
+            buy_is_first = buying_is_maker
+        elif mode == "taker_first":
+            buy_is_first = not buying_is_maker
+        else:
+            self.logger().warning(
+                f"[leg_ordering] unknown mode {mode!r} — falling back to "
+                f"parallel"
+            )
+            self.place_buy_arbitrage_order()
+            self.place_sell_arbitrage_order()
+            return
+
+        if buy_is_first:
+            self.place_buy_arbitrage_order()
+            await self._wait_for_order_ack(self.buy_order)
+            self.place_sell_arbitrage_order()
+        else:
+            self.place_sell_arbitrage_order()
+            await self._wait_for_order_ack(self.sell_order)
+            self.place_buy_arbitrage_order()
+
+    async def _wait_for_order_ack(
+        self,
+        tracked_order_wrapper,
+        max_wait_sec: float = 5.0,
+        poll_interval_sec: float = 0.05,
+    ) -> bool:
+        """Wait until the order has been acknowledged by the exchange
+        (i.e., ``exchange_order_id`` is assigned on the tracker). This is
+        the moment ``_place_order`` REST returned successfully. Does NOT
+        wait for fill — that would take arbitrarily long for non-crossing
+        LIMITs and conflict with the AGGRESSIVE_LIMIT timeout watchdog.
+
+        On timeout (max_wait_sec elapsed), logs a warning and returns
+        False — the caller proceeds to the next leg anyway, treating
+        the timeout as a placement failure that the partial-leg
+        ``UNWIND`` path will handle if the order eventually lands.
+        """
+        max_iterations = int(max_wait_sec / poll_interval_sec)
+        for _ in range(max_iterations):
+            order = tracked_order_wrapper.order
+            if order is not None and order.exchange_order_id is not None:
+                return True
+            await asyncio.sleep(poll_interval_sec)
+        self.logger().warning(
+            f"[leg_ordering] timeout {max_wait_sec}s waiting for ACK on "
+            f"order_id={tracked_order_wrapper.order_id} — placing next leg "
+            f"anyway (partial-leg failure path will handle inconsistency)"
+        )
+        return False
+
+    # ------------------------------------------------------------------ #
+    # Order placement — aggressive LIMIT for BitPreco                     #
+    # ------------------------------------------------------------------ #
+    def _should_use_aggressive_limit(self, market) -> bool:
+        """The aggressive-LIMIT path triggers only for the MAKER leg when
+        explicitly enabled in config. The taker leg (typically deep and
+        fast on its own exchange) keeps the classical MARKET path.
+
+        Maker identity comes from ``config.maker_connector_name``. If not
+        set, the feature is silently disabled (treat as MARKET).
+        """
+        if getattr(self.config, "arb_maker_leg_type", "MARKET") != "AGGRESSIVE_LIMIT":
+            return False
+        maker_name = getattr(self.config, "maker_connector_name", None)
+        if maker_name is None:
+            return False
+        return market.connector_name == maker_name
+
+    def _aggressive_limit_price(self, market, side: TradeType) -> Decimal:
+        """Compute a marketable LIMIT price.
+
+          BUY  → best_ask × (1 + margin_pct)   (crosses upward into asks)
+          SELL → best_bid × (1 − margin_pct)   (crosses downward into bids)
+
+        The margin (default 0.5%) is well beyond typical book movement in
+        the timeout window, so under normal conditions the LIMIT fills
+        fully on placement (like a MARKET) but with bounded slippage:
+        BitPreco will not match worse than this limit price.
+        """
+        connector = self.connectors[market.connector_name]
+        margin = self.config.arb_aggressive_limit_margin_pct
+        if side == TradeType.BUY:
+            best_ask = connector.get_price_by_type(
+                market.trading_pair, PriceType.BestAsk
+            )
+            return best_ask * (Decimal("1") + margin)
+        else:
+            best_bid = connector.get_price_by_type(
+                market.trading_pair, PriceType.BestBid
+            )
+            return best_bid * (Decimal("1") - margin)
+
+    def place_buy_arbitrage_order(self):
+        if not self._should_use_aggressive_limit(self.buying_market):
+            super().place_buy_arbitrage_order()
+            return
+        price = self._aggressive_limit_price(self.buying_market, TradeType.BUY)
+        self.buy_order.order_id = self.place_order(
+            connector_name=self.buying_market.connector_name,
+            trading_pair=self.buying_market.trading_pair,
+            order_type=OrderType.LIMIT,
+            side=TradeType.BUY,
+            amount=self.order_amount,
+            price=price,
+        )
+        self._aggressive_limit_buy_active = True
+        self.logger().info(
+            f"[aggressive_limit] placed BUY LIMIT on "
+            f"{self.buying_market.connector_name} amount={self.order_amount} "
+            f"price={price} (margin={self.config.arb_aggressive_limit_margin_pct})"
+        )
+        safe_ensure_future(self._aggressive_limit_watchdog(is_buy_leg=True))
+
+    def place_sell_arbitrage_order(self):
+        if not self._should_use_aggressive_limit(self.selling_market):
+            super().place_sell_arbitrage_order()
+            return
+        price = self._aggressive_limit_price(self.selling_market, TradeType.SELL)
+        self.sell_order.order_id = self.place_order(
+            connector_name=self.selling_market.connector_name,
+            trading_pair=self.selling_market.trading_pair,
+            order_type=OrderType.LIMIT,
+            side=TradeType.SELL,
+            amount=self.order_amount,
+            price=price,
+        )
+        self._aggressive_limit_sell_active = True
+        self.logger().info(
+            f"[aggressive_limit] placed SELL LIMIT on "
+            f"{self.selling_market.connector_name} amount={self.order_amount} "
+            f"price={price} (margin={self.config.arb_aggressive_limit_margin_pct})"
+        )
+        safe_ensure_future(self._aggressive_limit_watchdog(is_buy_leg=False))
+
+    async def _aggressive_limit_watchdog(self, is_buy_leg: bool):
+        """Force-cancel an aggressive LIMIT if it doesn't fully fill within
+        ``arb_aggressive_limit_timeout_sec``. After cancel, the cancel-side
+        late_fill_recovery in the BitPreco connector emits any partial fill,
+        and this method computes the resulting imbalance and triggers the
+        existing ``_unwind_position`` path on the residual.
+
+        Scenarios after timeout:
+          - Fully filled in window  → noop (graceful exit)
+          - Partially filled        → cancel + unwind the unhedged portion
+          - Not filled at all       → cancel + unwind the entire opposite leg
+        """
+        timeout = self.config.arb_aggressive_limit_timeout_sec
+        await asyncio.sleep(timeout)
+
+        leg_order = self.buy_order if is_buy_leg else self.sell_order
+        market = self.buying_market if is_buy_leg else self.selling_market
+
+        # Fully filled before timeout → nothing to do
+        if leg_order.order is not None and leg_order.order.is_filled:
+            return
+        # Order object not even registered yet (rare race) → bail
+        if leg_order.order_id is None:
+            return
+
+        self.logger().warning(
+            f"[aggressive_limit_timeout] {market.connector_name} leg "
+            f"{leg_order.order_id} not fully filled in {timeout}s — "
+            f"forcing cancel + unwind residue"
+        )
+        try:
+            self._strategy.cancel(
+                connector_name=market.connector_name,
+                trading_pair=market.trading_pair,
+                order_id=leg_order.order_id,
+            )
+        except Exception as e:
+            self.logger().error(
+                f"[aggressive_limit_timeout] cancel raised: "
+                f"{type(e).__name__}: {e} — proceeding to unwind check anyway"
+            )
+
+        # Give the cancel + late_fill_recovery path a moment to update the
+        # tracker's executed_amount before we compute the imbalance.
+        await asyncio.sleep(0.5)
+
+        buy_filled = (
+            self.buy_order.executed_amount_base
+            if self.buy_order.order is not None else Decimal("0")
+        )
+        sell_filled = (
+            self.sell_order.executed_amount_base
+            if self.sell_order.order is not None else Decimal("0")
+        )
+
+        # Imbalance: positive → excess long (BUY > SELL filled).
+        imbalance = buy_filled - sell_filled
+        if abs(imbalance) <= Decimal("0"):
+            # Both legs exactly aligned (rare but possible) — nothing to unwind
+            return
+
+        if self._unwind_attempted:
+            # Handler already on the way from process_order_failed_event
+            return
+        self._unwind_attempted = True
+
+        executed_side = TradeType.BUY if imbalance > Decimal("0") else TradeType.SELL
+        residue = abs(imbalance)
+        self.logger().warning(
+            f"[aggressive_limit_timeout] partial fill on aggressive LIMIT. "
+            f"buy_filled={buy_filled} sell_filled={sell_filled} "
+            f"residue={residue} side_to_unwind={executed_side.name} — "
+            f"calling _unwind_position"
+        )
+        await self._unwind_position(
+            executed_side=executed_side,
+            executed_amount=residue,
+        )
 
     # ------------------------------------------------------------------ #
     # Failure handling                                                     #

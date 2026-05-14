@@ -227,6 +227,23 @@ arb_capital_strategy: "skip_if_insufficient"   # ou "cancel_xemm_to_free"
 arb_max_unwind_slippage_bps: "50"      # 50 bps máximo aceitável
 arb_unwind_strategy: "abort_and_alert" # ou "force_unwind"
 
+# Maker-leg execution mode for arb spawn (role-based — works regardless
+# of which exchange is currently the maker).
+#   "MARKET"           — classical MARKET (matching engine ~600-1000ms)
+#   "AGGRESSIVE_LIMIT" — LIMIT priced best ± `arb_aggressive_limit_margin_pct`
+#                        (bounded slippage; same matching outcome when book
+#                         is deep). Cancel + unwind on partial / no-fill.
+arb_maker_leg_type: "AGGRESSIVE_LIMIT"
+arb_aggressive_limit_margin_pct: "0.005"   # 0.5% = 50 bps margem ao melhor preço
+arb_aggressive_limit_timeout_sec: 3.0      # cancela após 3s sem fill total
+
+# Leg execution ordering for arb spawn (role-based, exchange-agnostic):
+#   "parallel"     — ambas as pernas placeadas concorrentemente (default,
+#                     menor janela de exposure)
+#   "maker_first"  — perna do maker primeiro, aguarda ACK, depois taker
+#   "taker_first"  — perna do taker primeiro, aguarda ACK, depois maker
+arb_leg_execution_order: "parallel"
+
 # Circuit breakers extras
 arb_failure_pause_sec: 180.0            # 3 min após falha DANGEROUS (UNWIND_ABORTED)
 arb_max_failures_per_day: 10            # 10 falhas DANGEROUS → desliga pelo dia

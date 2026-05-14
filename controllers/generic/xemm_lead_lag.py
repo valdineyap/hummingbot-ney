@@ -204,6 +204,19 @@ class XEMMLeadLagConfig(ControllerConfigBase):
     arb_max_unwind_slippage_bps: Decimal = Field(default=Decimal("50"))
     arb_unwind_strategy: str = Field(default="abort_and_alert")  # or "force_unwind"
 
+    # Maker-leg execution mode for arb. See LeadLagArbitrageExecutorConfig
+    # for full rationale. "AGGRESSIVE_LIMIT" places a LIMIT priced best ±
+    # `arb_aggressive_limit_margin_pct` (bounded slippage) instead of MARKET.
+    # Role-based (not exchange-specific) so swapping connectors stays valid.
+    arb_maker_leg_type: str = Field(default="MARKET")  # or "AGGRESSIVE_LIMIT"
+    arb_aggressive_limit_margin_pct: Decimal = Field(default=Decimal("0.005"))
+    arb_aggressive_limit_timeout_sec: float = Field(default=3.0)
+
+    # Leg ordering: "parallel" (default), "maker_first", "taker_first".
+    # Role-based — works regardless of which exchange is maker / taker.
+    # See LeadLagArbitrageExecutorConfig for full semantics.
+    arb_leg_execution_order: str = Field(default="parallel")
+
     # Circuit breakers
     arb_failure_pause_sec: float = Field(default=1800.0)            # 30 min after failure
     arb_max_failures_per_day: int = Field(default=3)
@@ -3681,6 +3694,11 @@ class XEMMLeadLagController(ControllerBase):
             min_profitability=self.config.arb_min_profitability,
             arb_max_unwind_slippage_bps=self.config.arb_max_unwind_slippage_bps,
             arb_unwind_strategy=self.config.arb_unwind_strategy,
+            arb_maker_leg_type=self.config.arb_maker_leg_type,
+            arb_aggressive_limit_margin_pct=self.config.arb_aggressive_limit_margin_pct,
+            arb_aggressive_limit_timeout_sec=self.config.arb_aggressive_limit_timeout_sec,
+            arb_leg_execution_order=self.config.arb_leg_execution_order,
+            maker_connector_name=self.config.maker_connector,
         )
         self.logger().info(
             f"Spawning arb executor side={side} edge={edge_bps:.2f}bps "

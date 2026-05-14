@@ -452,7 +452,214 @@ class BitprecoExchange(ExchangePyBase):
         if len(self._place_order_submit_times) > 200:
             oldest_key = next(iter(self._place_order_submit_times))
             self._place_order_submit_times.pop(oldest_key, None)
+
+        # Two synchronous-fill paths after place_order REST response:
+        #
+        #   ORDER_FULLY_EXECUTED  → emit fill immediately. Terminal state
+        #                           on BitPreco's side; no more fills will
+        #                           land. Single TradeUpdate suffices.
+        #
+        #   ORDER_PARTIALLY_EXECUTED → DO NOT emit the partial yet. Trigger
+        #                              an immediate cancel so further fills
+        #                              cannot land at our aggressive limit,
+        #                              then let the cancel-side
+        #                              late_fill_recovery emit ONE
+        #                              TradeUpdate with the FINAL
+        #                              exec_amount (which may be larger
+        #                              than what the placement response
+        #                              showed — BitPreco can fill more
+        #                              between placement and cancel
+        #                              arrival). Single emission avoids
+        #                              the framework's dedup-by-trade_id
+        #                              dropping later fills.
+        #
+        # Both paths are scheduled as tasks so place_order returns
+        # immediately — the framework needs to register the order in
+        # in_flight_orders before the recovery task runs.
+        msg_cod = response.get("message_cod") if isinstance(response, dict) else None
+        if msg_cod == "ORDER_FULLY_EXECUTED":
+            asyncio.create_task(
+                self._emit_synchronous_fill(o_id, order_id, msg_cod)
+            )
+        elif msg_cod == "ORDER_PARTIALLY_EXECUTED":
+            asyncio.create_task(
+                self._cancel_partial_and_emit_final(o_id, order_id)
+            )
         return (o_id, transact_time)
+
+    async def _emit_synchronous_fill(
+        self, exchange_order_id: str, client_order_id: str, msg_cod: str
+    ) -> None:
+        """Fetch trade(s) for an order whose placement response signalled
+        a FULL synchronous fill (``ORDER_FULLY_EXECUTED``), and feed them
+        through the order tracker so the framework emits
+        ``OrderFilledEvent`` without waiting for the next status poll.
+
+        Only called for the terminal-state case. ``ORDER_PARTIALLY_EXECUTED``
+        takes the cancel-first path (``_cancel_partial_and_emit_final``)
+        to avoid the dedup-by-trade_id problem when later fills land.
+
+        Robust against the tracker-registration race: ``_place_order``
+        returns the oid, and the framework needs a moment to register it
+        in ``in_flight_orders``. Retry briefly before giving up.
+        """
+        tracked_order = None
+        for _ in range(6):  # up to ~600ms total
+            tracker = getattr(self, "_order_tracker", None)
+            if tracker is not None:
+                tracked_order = tracker.fetch_order(
+                    client_order_id=client_order_id
+                )
+                if tracked_order is not None:
+                    break
+            await asyncio.sleep(0.1)
+
+        if tracked_order is None:
+            self.logger().warning(
+                f"[sync_fill_recovery] tracker never registered "
+                f"client_order_id={client_order_id} (exchange_order_id="
+                f"{exchange_order_id}) within 600ms — periodic poll is "
+                f"the last resort for the fill emission"
+            )
+            return
+        if tracked_order.exchange_order_id is None:
+            tracked_order.update_exchange_order_id(exchange_order_id)
+
+        await self._emit_fills_with_retry(
+            tracked_order=tracked_order,
+            context=f"sync_fill_recovery msg_cod={msg_cod}",
+        )
+
+    async def _emit_fills_with_retry(
+        self,
+        tracked_order: InFlightOrder,
+        context: str,
+        max_attempts: int = 3,
+        backoff_sec: float = 0.2,
+    ) -> int:
+        """Fetch trades via ``_all_trade_updates_for_order`` and push them
+        through the order tracker, retrying on empty response.
+
+        Used both by:
+          - The cancel-side ``late_fill_recovery`` (when cancel response
+            indicates a fill happened that the tracker doesn't know yet).
+          - The placement-side ``sync_partial_cancel`` (when place_order
+            returned ``ORDER_PARTIALLY_EXECUTED`` and we cancelled to
+            settle the final state).
+
+        The retry handles BitPreco's executed_orders indexing race: the
+        cancel/placement response may confirm a fill before the
+        ``executed_orders`` endpoint has indexed it. First fetch returns
+        empty → backoff → retry. Typical resolution within 1-2 retries.
+
+        Returns total TradeUpdate count emitted (0 means nothing was
+        found across all attempts — periodic status poll is last resort).
+        """
+        tracker = getattr(self, "_order_tracker", None)
+        if tracker is None:
+            # Test fixture path (BitprecoExchange.__new__ bypass).
+            self.logger().debug(
+                f"[{context}] no _order_tracker available for "
+                f"exchange_order_id={tracked_order.exchange_order_id}; "
+                f"skipping emission"
+            )
+            return 0
+
+        total = 0
+        for attempt in range(1, max_attempts + 1):
+            try:
+                trade_updates = await self._all_trade_updates_for_order(
+                    order=tracked_order
+                )
+            except Exception as e:
+                self.logger().warning(
+                    f"[{context}] _all_trade_updates_for_order raised on "
+                    f"attempt {attempt}/{max_attempts}: "
+                    f"{type(e).__name__}: {e}"
+                )
+                return total
+
+            if trade_updates:
+                for tu in trade_updates:
+                    tracker.process_trade_update(tu)
+                total += len(trade_updates)
+                self.logger().info(
+                    f"[{context}] emitted {len(trade_updates)} TradeUpdate(s) "
+                    f"for exchange_order_id={tracked_order.exchange_order_id} "
+                    f"(attempt {attempt}/{max_attempts})"
+                )
+                return total
+
+            # Empty response — BitPreco may not have indexed yet. Backoff.
+            if attempt < max_attempts:
+                await asyncio.sleep(backoff_sec)
+
+        self.logger().warning(
+            f"[{context}] no TradeUpdate emitted for "
+            f"exchange_order_id={tracked_order.exchange_order_id} after "
+            f"{max_attempts} attempts — periodic poll / orphan_check is "
+            f"the last resort"
+        )
+        return total
+
+    async def _cancel_partial_and_emit_final(
+        self,
+        exchange_order_id: str,
+        client_order_id: str,
+    ) -> None:
+        """Triggered when ``_place_order`` returns ``ORDER_PARTIALLY_EXECUTED``.
+
+        Cancel the order immediately so further fills cannot land, then let
+        the cancel-side ``late_fill_recovery`` emit ONE TradeUpdate with
+        the final ``exec_amount`` (which may be larger than the partial in
+        the placement response — BitPreco can fill more between our
+        placement response and our cancel arrival).
+
+        Robust against two races:
+          (a) Tracker registration lag — the framework registers the order
+              in ``in_flight_orders`` AFTER ``_place_order`` returns, but
+              before our scheduled task runs. Retry the lookup briefly.
+          (b) BitPreco indexing lag — handled inside ``_place_cancel`` via
+              ``_emit_fills_with_retry``.
+        """
+        # (a) Wait for the framework to register the order
+        tracked_order = None
+        for _ in range(6):  # up to ~600ms total
+            tracker = getattr(self, "_order_tracker", None)
+            if tracker is not None:
+                tracked_order = tracker.fetch_order(client_order_id=client_order_id)
+                if tracked_order is not None:
+                    break
+            await asyncio.sleep(0.1)
+
+        if tracked_order is None:
+            self.logger().warning(
+                f"[sync_partial_cancel] tracker never registered "
+                f"client_order_id={client_order_id} (exchange_order_id="
+                f"{exchange_order_id}) within 600ms — periodic poll / "
+                f"orphan_check is the last resort for any fill"
+            )
+            return
+
+        if tracked_order.exchange_order_id is None:
+            tracked_order.update_exchange_order_id(exchange_order_id)
+
+        self.logger().info(
+            f"[sync_partial_cancel] place_order returned "
+            f"ORDER_PARTIALLY_EXECUTED for exchange_order_id="
+            f"{exchange_order_id} — issuing immediate cancel to settle "
+            f"final state (no more fills possible after cancel)"
+        )
+        try:
+            await self._place_cancel(client_order_id, tracked_order)
+            # ``_place_cancel`` internally calls ``_emit_fills_with_retry`` via
+            # the GONE_CODES path — final exec_amount is now in the tracker.
+        except Exception as e:
+            self.logger().warning(
+                f"[sync_partial_cancel] cancel raised for "
+                f"{exchange_order_id}: {type(e).__name__}: {e} — "
+                f"watchdog / periodic poll will recover"
+            )
 
     async def _place_cancel(self, order_id: str, tracked_order: InFlightOrder):
         # Robust cancel — confirm the cancel actually happened, retry on
@@ -609,42 +816,10 @@ class BitprecoExchange(ExchangePyBase):
                             break
 
                 if needs_fill_emission:
-                    tracker = getattr(self, "_order_tracker", None)
-                    if tracker is None:
-                        # Test fixture path (BitprecoExchange.__new__ bypass)
-                        # — skip emission, log so it's visible in test output.
-                        self.logger().debug(
-                            f"[late_fill_recovery] no _order_tracker available "
-                            f"for {exchange_order_id} ({code}); skipping emission"
-                        )
-                    else:
-                        try:
-                            trade_updates = await self._all_trade_updates_for_order(
-                                order=tracked_order
-                            )
-                            for tu in trade_updates:
-                                tracker.process_trade_update(tu)
-                            if trade_updates:
-                                self.logger().info(
-                                    f"[late_fill_recovery] cancel of "
-                                    f"{exchange_order_id} returned {code} → "
-                                    f"emitted {len(trade_updates)} TradeUpdate(s) "
-                                    f"immediately (bypassed periodic status poll)"
-                                )
-                            else:
-                                self.logger().warning(
-                                    f"[late_fill_recovery] cancel of "
-                                    f"{exchange_order_id} returned {code} but "
-                                    f"executed_orders REST returned no matching "
-                                    f"trade — orphan_check/reconcile may still "
-                                    f"pick it up later"
-                                )
-                        except Exception as e:
-                            self.logger().warning(
-                                f"[late_fill_recovery] failed for "
-                                f"{exchange_order_id} ({code}): "
-                                f"{type(e).__name__}: {e}"
-                            )
+                    await self._emit_fills_with_retry(
+                        tracked_order=tracked_order,
+                        context=f"late_fill_recovery code={code}",
+                    )
 
                 self.logger().info(
                     f"BitPreco cancel confirmed for exchange_order_id={exchange_order_id} "
