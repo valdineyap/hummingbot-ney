@@ -249,6 +249,13 @@ class XEMMLeadLagConfig(ControllerConfigBase):
     # Consecutive closed executors with net_pnl_quote < 0. Catches adverse-selection
     # clusters or signal inversion before total loss reaches daily limit.
     max_consecutive_losing_fills: int = Field(default=5)
+    # Minimum |net_pnl| (BRL) a losing fill must have to advance the streak.
+    # Below this, the loss is treated as noise (Binance taker fee dominating a
+    # near-zero gross PnL) — neither advances nor resets the counter. Wins
+    # (net_pnl >= 0) always reset. Without this threshold the streak gate
+    # killed the bot 3× in 2026-05-13 from sequences of ~R$0.01-R$0.06 losses
+    # whose total was <R$0.30 — well under the daily loss limit.
+    min_loss_per_fill_quote_to_count: Decimal = Field(default=Decimal("0.10"))
     # Rolling 1h burn rate: kill when sum(net_pnl) over last 3600s <= -limit.
     # Detects slow bleeds that would not trip daily_loss until hours later.
     max_hourly_burn_quote: Decimal = Field(default=Decimal("50"))
@@ -2668,10 +2675,16 @@ class XEMMLeadLagController(ControllerBase):
                     self._session_pnl_total += net_pnl
                     if self._session_pnl_total > self._session_pnl_peak:
                         self._session_pnl_peak = self._session_pnl_total
-                    if net_pnl < Decimal("0"):
-                        self._consecutive_losing_fills += 1
-                    else:
+                    # Losing-streak counter with noise-floor: only fills
+                    # whose |net_pnl| exceeds `min_loss_per_fill_quote_to_count`
+                    # advance the streak. Sub-threshold losses (Binance taker
+                    # fee dominating a near-zero gross capture) are treated
+                    # as noise — neither advance nor reset.
+                    if net_pnl >= Decimal("0"):
                         self._consecutive_losing_fills = 0
+                    elif abs(net_pnl) >= self.config.min_loss_per_fill_quote_to_count:
+                        self._consecutive_losing_fills += 1
+                    # else: noise loss, no change
                     self._hourly_pnl_history.append((time.time(), net_pnl))
                     # Per-executor-type accounting for arb circuit breakers.
                     # Arb executors close once; XEMM executors also close once.

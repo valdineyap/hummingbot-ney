@@ -1423,6 +1423,84 @@ class TestArbDangerousFailure(_ArbBaseTest):
         self.assertEqual(self.controller._arb_realized_loss_today, Decimal("0.10"))
 
 
+class TestLosingStreakNoiseFloor(_ArbBaseTest):
+    """The losing-streak counter only advances on losses whose magnitude
+    exceeds ``min_loss_per_fill_quote_to_count``. Below the noise floor
+    (typical: Binance taker fee dominating a near-zero gross capture),
+    the loss is treated as neutral noise — neither advances nor resets
+    the counter. Wins always reset.
+    """
+
+    def _make_xemm_closed_executor(self, executor_id: str, net_pnl: Decimal):
+        ex = MagicMock()
+        ex.id = executor_id
+        ex.is_done = True
+        ex.close_type = None
+        ex.net_pnl_quote = net_pnl
+        ex.cum_fees_quote = Decimal("0.024")
+        ex.filled_amount_quote = Decimal("80")
+        ex.custom_info = {}
+        ex.config = MagicMock()
+        ex.config.type = "xemm_executor"  # NOT arb — so we test the MM path
+        ex.config.id = executor_id
+        ex.timestamp = self.market_data_provider.time.return_value - 5.0
+        return ex
+
+    async def _drive_with_executor(self, ex):
+        self.controller.executors_info = [ex]
+        self.controller._last_fingerprint = None
+        self.controller._last_full_update = 0.0
+        from datetime import datetime as _dt
+        now_ts = self.market_data_provider.time.return_value
+        self.controller._arb_last_reset_day = _dt.utcfromtimestamp(now_ts).strftime("%Y-%m-%d")
+        self.controller._daily_pnl_last_reset_day = self.controller._arb_last_reset_day
+        await self.controller.update_processed_data()
+
+    async def test_noise_loss_below_threshold_does_not_advance(self):
+        """net_pnl = -R$ 0.05 with threshold R$ 0.10 → counter unchanged."""
+        self.controller.config.min_loss_per_fill_quote_to_count = Decimal("0.10")
+        self.controller._consecutive_losing_fills = 2
+        ex = self._make_xemm_closed_executor("X-NOISE", Decimal("-0.05"))
+        await self._drive_with_executor(ex)
+        # Counter NOT advanced (noise loss)
+        self.assertEqual(self.controller._consecutive_losing_fills, 2)
+
+    async def test_real_loss_above_threshold_advances(self):
+        """net_pnl = -R$ 0.50 with threshold R$ 0.10 → counter ++."""
+        self.controller.config.min_loss_per_fill_quote_to_count = Decimal("0.10")
+        self.controller._consecutive_losing_fills = 2
+        ex = self._make_xemm_closed_executor("X-REAL", Decimal("-0.50"))
+        await self._drive_with_executor(ex)
+        self.assertEqual(self.controller._consecutive_losing_fills, 3)
+
+    async def test_win_resets_streak_regardless_of_threshold(self):
+        """Any positive net_pnl resets the counter to 0."""
+        self.controller.config.min_loss_per_fill_quote_to_count = Decimal("0.10")
+        self.controller._consecutive_losing_fills = 4
+        ex = self._make_xemm_closed_executor("X-WIN", Decimal("0.05"))
+        await self._drive_with_executor(ex)
+        self.assertEqual(self.controller._consecutive_losing_fills, 0)
+
+    async def test_zero_pnl_resets_streak(self):
+        """net_pnl == 0 is treated as break-even → reset."""
+        self.controller.config.min_loss_per_fill_quote_to_count = Decimal("0.10")
+        self.controller._consecutive_losing_fills = 3
+        ex = self._make_xemm_closed_executor("X-BE", Decimal("0"))
+        # Need filled_quote/fees non-zero so did_trade=True
+        ex.filled_amount_quote = Decimal("80")
+        ex.cum_fees_quote = Decimal("0.024")
+        await self._drive_with_executor(ex)
+        self.assertEqual(self.controller._consecutive_losing_fills, 0)
+
+    async def test_loss_exactly_at_threshold_advances(self):
+        """Boundary: |net_pnl| == threshold → counts (>=)."""
+        self.controller.config.min_loss_per_fill_quote_to_count = Decimal("0.10")
+        self.controller._consecutive_losing_fills = 0
+        ex = self._make_xemm_closed_executor("X-BOUNDARY", Decimal("-0.10"))
+        await self._drive_with_executor(ex)
+        self.assertEqual(self.controller._consecutive_losing_fills, 1)
+
+
 # ===================================================================== #
 # Group H — Inventory audit & boot-paused mode                          #
 # ===================================================================== #

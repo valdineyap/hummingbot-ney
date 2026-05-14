@@ -2,6 +2,7 @@ import asyncio
 import copy
 import datetime
 import time
+import zoneinfo
 from decimal import Decimal, InvalidOperation
 from typing import Any, Dict, List, Optional, Tuple
 
@@ -918,18 +919,17 @@ class BitprecoExchange(ExchangePyBase):
                     # Q2 instrumentation: separate "BitPreco-side fill time" from
                     # "our detection time".
                     #
-                    # BitPreco returns ``time_stamp`` as a UTC string. The
-                    # ``timestamp`` variable computed earlier in this function
-                    # uses ``datetime.strptime(...).timestamp()`` which treats
-                    # the parsed datetime as LOCAL time — on a UTC-3 host that
-                    # yielded a +3h offset, making the metric useless (observed
-                    # 2026-05-13: bp_fill_to_detection=10.8M ms ≈ 3h). Re-parse
-                    # with explicit UTC tzinfo for the diff so the result is
-                    # the real detection lag in milliseconds.
-                    bp_fill_epoch_utc = datetime.datetime.strptime(
+                    # BitPreco returns ``time_stamp`` as a BRT (UTC-3) string
+                    # — empirically verified 2026-05-13 when an earlier "fix"
+                    # that assumed UTC still produced ~10.8M ms offsets
+                    # (= 3h), proving BitPreco's clock-of-record is São Paulo
+                    # local time, not UTC. Tag with the correct zone before
+                    # converting to epoch so the diff to ``time.time()``
+                    # (always UTC) is the real detection lag.
+                    bp_fill_epoch = datetime.datetime.strptime(
                         executed_order.get("time_stamp"), "%Y-%m-%d %H:%M:%S"
-                    ).replace(tzinfo=datetime.timezone.utc).timestamp()
-                    bp_to_detection_ms = (time.time() - bp_fill_epoch_utc) * 1000
+                    ).replace(tzinfo=zoneinfo.ZoneInfo("America/Sao_Paulo")).timestamp()
+                    bp_to_detection_ms = (time.time() - bp_fill_epoch) * 1000
                     if submit_ts is not None:
                         e2e_ms = (time.time() - submit_ts) * 1000
                         self.logger().info(
