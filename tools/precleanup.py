@@ -18,7 +18,7 @@ exchange via plain `aiohttp` — no connector lifecycle, no WS sync, no waiting.
 Usage
 -----
     python tools/precleanup.py \\
-        --controller-config conf/controllers/xemm_lead_lag_btc_brl.yml \\
+        --controller-config conf/controllers/xemm_lead_lag_btc_brl_sbe.yml \\
         --password "$PASS"
 
 Exit codes
@@ -415,7 +415,7 @@ def main():
         "--controller-config",
         required=True,
         type=Path,
-        help="Path to the controller YAML (e.g. conf/controllers/xemm_lead_lag_btc_brl.yml)",
+        help="Path to the controller YAML (e.g. conf/controllers/xemm_lead_lag_btc_brl_sbe.yml)",
     )
     parser.add_argument("--password", required=True, help="Hummingbot config password")
     args = parser.parse_args()

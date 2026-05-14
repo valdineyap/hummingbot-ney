@@ -1,6 +1,6 @@
 # XEMM Lead-Lag controller — BTC-BRL  (EXAMPLE — copy to conf/controllers/)
 #
-# To use: copy this file to `conf/controllers/xemm_lead_lag_btc_brl.yml`
+# To use: copy this file to `conf/controllers/xemm_lead_lag_btc_brl_sbe.yml`
 # (the conf/ directory is gitignored — it's where runtime configs live).
 #
 # Maker: Bybit BTC-BRL  |  Taker (hedge): Binance BTC-BRL

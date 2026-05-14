@@ -1,25 +1,22 @@
 #!/bin/bash
 # ============================================================
-# Start script — XEMM Lead-Lag (BTC-BRL)
+# DEPRECATED — XEMM Lead-Lag (BTC-BRL) legacy launcher
 # ============================================================
-# Usage:
-#   ./start_xemm_lead_lag.sh <password>
-#   ./start_xemm_lead_lag.sh Senha123
+# Production is now `start_xemm_lead_lag_sbe.sh`, which reads
+# `conf/controllers/xemm_lead_lag_btc_brl_sbe.yml`.
 #
-# NOTE: Log is auto-named by hummingbot based on the config file:
-#   logs/logs_conf_xemm_lead_lag_shadow.log
+# The non-SBE controller YAML (`xemm_lead_lag_btc_brl.yml`) was
+# deleted 2026-05-14 after we discovered config drift between the
+# two: edits to the non-SBE file were silently invisible to the
+# running SBE bot, which caused the AGGRESSIVE_LIMIT feature to
+# never engage in production despite being committed and
+# "configured". See commit history for the consolidation.
 #
-# Monitor:
-#   tail -f logs/logs_conf_xemm_lead_lag_shadow.log | grep -E "Created maker|Cancel|ERROR|CRITICAL"
-#
-# Kill switch (graceful pause):
-#   touch /tmp/xemm_lead_lag_pause
-#
-# Matching command from working runs (kept as reference):
-#   conda run -n hummingbot python bin/hummingbot_quickstart.py --headless \
-#     --v2 conf_xemm_lead_lag_shadow.yml \
-#     --config-password <pass> \
-#     2>&1 | tee -a logs/logs_conf_xemm_lead_lag_shadow.log &
+# This script remains for reference / shadow-mode revival. If you
+# need to run it, first restore (or copy) the SBE YAML to the
+# `--controller-config` path below, AND adjust connector names
+# back to non-SBE (this script uses `conf_xemm_lead_lag_shadow.yml`
+# which expects `binance` rather than `binance_sbe`).
 # ============================================================
 
 set -e

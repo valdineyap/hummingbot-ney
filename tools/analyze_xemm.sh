@@ -18,7 +18,7 @@ cd "$REPO_ROOT"
 
 CSV_DIR="logs/xemm_lead_lag"
 LOG_FILE="logs/logs_conf_xemm_lead_lag_shadow.log"
-CONFIG="conf/controllers/xemm_lead_lag_btc_brl.yml"
+CONFIG="conf/controllers/xemm_lead_lag_btc_brl_sbe.yml"
 TMPDIR_BASE="${TMPDIR:-/tmp}"
 WORK="$TMPDIR_BASE/xemm_analyze_$$"
 mkdir -p "$WORK"
