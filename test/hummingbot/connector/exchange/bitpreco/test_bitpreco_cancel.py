@@ -220,8 +220,10 @@ class LateFillRecoveryTest(unittest.TestCase):
         self.assertTrue(result)
         ex._order_tracker.process_trade_update.assert_called_once_with(fake_trade)
 
-    def test_order_canceled_with_partial_fill_emits_trade(self):
-        """ORDER_CANCELED + exec_amount > 0 → emit the partial fill."""
+    def test_order_canceled_with_partial_fill_legacy_payload_falls_back_to_rest(self):
+        """Legacy BitPreco payload (only ``exec_amount`` flat, no ``cost``)
+        ⇒ helper can't compute avg_price ⇒ caller falls back to
+        ``_emit_fills_with_retry`` which queries ``executed_orders``."""
         fake_trade = MagicMock(name="TradeUpdate")
         ex = self._make_exchange_with_tracker([fake_trade])
         ex._api_request = AsyncMock(return_value={
@@ -234,6 +236,33 @@ class LateFillRecoveryTest(unittest.TestCase):
         result = self._run(ex._place_cancel("SBCBL_test_cancel", order))
         self.assertTrue(result)
         ex._order_tracker.process_trade_update.assert_called_once_with(fake_trade)
+
+    def test_order_canceled_with_full_payload_emits_directly_no_rest(self):
+        """New BitPreco payload (exec_amount + cost + fee + status flat)
+        ⇒ helper emits directly from response ⇒ NO ``executed_orders``
+        call. This is the fast path that eliminates the ~3s gap between
+        cancel ack and periodic-poll fill detection."""
+        ex = self._make_exchange_with_tracker([])  # no REST trades returned
+        ex._api_request = AsyncMock(return_value={
+            "id": "2055000206", "market": "BTC-BRL", "type": "SELL",
+            "status": "PARTIAL", "amount": 0.0002, "price": 400148.99,
+            "exec_amount": 0.00005, "cost": 20.0075, "fee": 0.04,
+            "percent_fee": "0.2", "limited": "1", "programmed": "0",
+            "canceled": 1, "time_stamp": "2026-05-14 11:07:15",
+            "tag": None, "obs": None,
+            "success": True, "message_cod": "ORDER_CANCELED",
+        })
+        order = _make_tracked_order(exchange_order_id="2055000206")
+
+        result = self._run(ex._place_cancel("SBCBL_test_cancel", order))
+        self.assertTrue(result)
+        # Direct emission happened — exactly once
+        ex._order_tracker.process_trade_update.assert_called_once()
+        trade_update = ex._order_tracker.process_trade_update.call_args[0][0]
+        self.assertEqual(trade_update.fill_base_amount, Decimal("0.00005"))
+        self.assertEqual(trade_update.fill_price, Decimal("400150"))  # 20.0075/0.00005
+        # And crucially: NO fallback REST call to executed_orders
+        ex._all_trade_updates_for_order.assert_not_called()
 
     def test_clean_order_canceled_does_not_emit_trade(self):
         """ORDER_CANCELED with NO partial fill field → no trade fetch."""

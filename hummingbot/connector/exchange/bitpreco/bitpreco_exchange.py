@@ -422,6 +422,8 @@ class BitprecoExchange(ExchangePyBase):
                 f"BitPreco rejected {data['cmd']} order (amount={amount_str} price={price_str}): "
                 f"{msg} | response={response}"
             )
+
+            self._reconcile_balance_on_rejection(msg, response)
             raise IOError(f"BitPreco rejected order: {msg}")
 
         # On success the canonical key is 'order_id' but be tolerant of 'id'.
@@ -588,6 +590,9 @@ class BitprecoExchange(ExchangePyBase):
                     f"for exchange_order_id={tracked_order.exchange_order_id} "
                     f"(attempt {attempt}/{max_attempts})"
                 )
+                # Force fresh balance read — see _post_fill_balance_refresh
+                # docstring for rationale (closes the 5s stale-cache window).
+                self._post_fill_balance_refresh()
                 return total
 
             # Empty response — BitPreco may not have indexed yet. Backoff.
@@ -601,6 +606,135 @@ class BitprecoExchange(ExchangePyBase):
             f"the last resort"
         )
         return total
+
+    def _try_emit_fill_from_cancel_response(
+        self,
+        tracked_order: InFlightOrder,
+        response: Any,
+        exchange_order_id: str,
+        code: Optional[str],
+    ) -> bool:
+        """Emit a single ``TradeUpdate`` synchronously from a cancel response.
+
+        Since 2026-05-14 BitPreco includes the order block fields flat in
+        the cancel response::
+
+            {
+              "id": "2062452569", "market": "BTC-BRL", "type": "SELL",
+              "status": "EMPTY" | "PARTIAL" | "FILLED",
+              "amount": <requested>, "price": <limit price>,
+              "exec_amount": <aggregate base filled>,
+              "cost": <aggregate quote spent/received>,
+              "fee": <aggregate BRL fee>, "percent_fee": "<%>",
+              "time_stamp": "YYYY-MM-DD HH:MM:SS",
+              ..., "success": true, "message_cod": "ORDER_CANCELED"
+            }
+
+        ``exec_amount > 0`` means the order matched (partially or fully)
+        before the cancel landed. BitPreco aggregates multi-fill partials
+        server-side, so ``cost / exec_amount`` is the volume-weighted
+        average fill price — sufficient for downstream hedge sizing and
+        PnL accounting.
+
+        The synthetic trade_id reuses ``client_order_id`` (matching the
+        existing pattern in ``_all_trade_updates_for_order``). The framework's
+        ``ClientOrderTracker`` dedups by ``(order, trade_id)``, so if a
+        periodic poll later re-emits the same fill via ``executed_orders``
+        it is silently skipped — no double-counting.
+
+        Returns:
+            True if the response was authoritative — either a fill was
+            emitted (``exec_amount > 0``), or a clean cancel was confirmed
+            (``exec_amount == 0``). In both cases the caller should skip
+            the ``executed_orders`` REST fallback.
+            False if the response lacked the expected fields (old BitPreco
+            payload shape, or unparseable ``exec_amount``, or ``cost``
+            missing on a partial). Caller may fall back to
+            ``_emit_fills_with_retry`` for codes in ``GONE_BY_FILL_CODES``.
+        """
+        if not isinstance(response, dict):
+            return False
+
+        exec_amount_raw = response.get("exec_amount")
+        if exec_amount_raw is None:
+            return False
+
+        try:
+            exec_amount = Decimal(str(exec_amount_raw))
+        except (InvalidOperation, ValueError, TypeError):
+            self.logger().warning(
+                f"[cancel_fill_sync] exchange_order_id={exchange_order_id} "
+                f"unparseable exec_amount={exec_amount_raw!r} — falling back"
+            )
+            return False
+
+        if exec_amount <= 0:
+            # Clean cancel confirmed by response (status=EMPTY typical).
+            # No fill to emit; caller proceeds to log + return True.
+            return True
+
+        cost_raw = response.get("cost", 0)
+        fee_raw = response.get("fee", 0)
+        status = response.get("status")
+
+        try:
+            cost = Decimal(str(cost_raw))
+        except (InvalidOperation, ValueError, TypeError):
+            cost = Decimal(0)
+        try:
+            fee_amount = Decimal(str(fee_raw))
+        except (InvalidOperation, ValueError, TypeError):
+            fee_amount = Decimal(0)
+
+        if cost <= 0:
+            # exec_amount > 0 but cost missing: cannot compute avg price.
+            # Fall back to executed_orders path so caller can hit REST.
+            self.logger().warning(
+                f"[cancel_fill_sync] exchange_order_id={exchange_order_id} "
+                f"exec_amount={exec_amount} but cost={cost_raw!r} — falling "
+                f"back to executed_orders REST"
+            )
+            return False
+
+        avg_fill_price = cost / exec_amount
+
+        # Use connector clock for fill_timestamp. BitPreco's ``time_stamp``
+        # is in BRT (America/Sao_Paulo) and the existing executed_orders
+        # parser doesn't handle the offset cleanly. Since the cancel ack
+        # we just received reflects a fill from seconds ago, ``current_timestamp``
+        # is accurate within ~1s and avoids timezone parsing pitfalls.
+        fill_ts = self.current_timestamp
+
+        fee = TradeFeeBase.new_spot_fee(
+            fee_schema=self.trade_fee_schema(),
+            trade_type=tracked_order.trade_type,
+            percent_token="BRL",
+            flat_fees=[TokenAmount(amount=fee_amount, token="BRL")],
+        )
+
+        trade_update = TradeUpdate(
+            trade_id=tracked_order.client_order_id,
+            client_order_id=tracked_order.client_order_id,
+            exchange_order_id=exchange_order_id,
+            trading_pair=tracked_order.trading_pair,
+            fee=fee,
+            fill_base_amount=exec_amount,
+            fill_quote_amount=cost,
+            fill_price=avg_fill_price,
+            fill_timestamp=fill_ts,
+        )
+        self._order_tracker.process_trade_update(trade_update)
+        # Force fresh balance read — see _post_fill_balance_refresh
+        # docstring for rationale (closes the 5s stale-cache window).
+        self._post_fill_balance_refresh()
+
+        self.logger().warning(
+            f"[cancel_fill_sync] {tracked_order.client_order_id} emitted "
+            f"directly from cancel response (code={code}): "
+            f"exec_amount={exec_amount} cost={cost} avg_price={avg_fill_price} "
+            f"fee={fee_amount} status={status}"
+        )
+        return True
 
     async def _cancel_partial_and_emit_final(
         self,
@@ -777,9 +911,8 @@ class BitprecoExchange(ExchangePyBase):
                 #
                 #   (1) ``CANT_CANCEL_FILLED_ORDER`` / ``ORDER_FILLED`` — the
                 #       order fully filled before the cancel landed.
-                #   (2) ``ORDER_CANCELED`` with a non-zero partial fill field
-                #       (response carries ``exec_amount`` / ``filled`` > 0)
-                #       — partial fill before cancel landed.
+                #   (2) ``ORDER_CANCELED`` with ``exec_amount > 0`` in the
+                #       response payload — partial fill before cancel landed.
                 #
                 # In both cases the framework removes the order from
                 # ``in_flight_orders`` shortly after we return True, and the
@@ -789,37 +922,58 @@ class BitprecoExchange(ExchangePyBase):
                 # corrects it via a MARKET on the same exchange (paying the
                 # spread instead of cross-exchange hedging on Binance).
                 #
-                # Recovery path: fetch the trade(s) NOW via the same REST
-                # endpoint the periodic poll would use, and feed them through
-                # ``_order_tracker.process_trade_update`` so the executor
-                # sees ``OrderFilledEvent`` in real time. Cost: one extra
-                # REST call to ``cmd=executed_orders`` only on the race path
-                # (zero on the happy ORDER_CANCELED case with no partial).
-                needs_fill_emission = code in GONE_BY_FILL_CODES
-                if code == "ORDER_CANCELED" and isinstance(response, dict):
-                    for field in ("exec_amount", "executed_amount", "executed",
-                                  "filled", "filled_amount", "matched_amount"):
-                        raw = response.get(field)
-                        if raw is None:
-                            continue
-                        try:
-                            val = Decimal(str(raw))
-                        except (InvalidOperation, ValueError, TypeError):
-                            continue
-                        if val > 0:
-                            needs_fill_emission = True
-                            self.logger().warning(
-                                f"[cancel_partial_fill] exchange_order_id={exchange_order_id} "
-                                f"cancelled with {field}={val} — partial fill before cancel. "
-                                f"Full response: {response}"
-                            )
-                            break
+                # FAST PATH (since 2026-05-14): BitPreco now includes the
+                # order block fields (exec_amount, cost, fee, status,
+                # time_stamp, price) flat in the cancel response. When
+                # ``exec_amount > 0`` we can emit a single TradeUpdate
+                # directly from this payload — BitPreco aggregates multi-
+                # fill partials server-side, so ``cost / exec_amount`` is
+                # the volume-weighted average fill price (sufficient for
+                # hedge sizing and PnL). No round-trip to ``executed_orders``
+                # needed, eliminating the ~3s gap previously observed
+                # between cancel ack and periodic-poll fill detection
+                # (the ``seq=6`` ghost-fill scenario, 2026-05-14 11:07Z).
+                #
+                # FALLBACK: for ``CANT_CANCEL_FILLED_ORDER`` / ``ORDER_FILLED``
+                # where the response payload may not carry fill aggregates
+                # (older BitPreco code path), fall back to the original
+                # ``_emit_fills_with_retry`` which queries ``executed_orders``
+                # with retry-and-backoff.
+                emitted_from_response = self._try_emit_fill_from_cancel_response(
+                    tracked_order=tracked_order,
+                    response=response,
+                    exchange_order_id=exchange_order_id,
+                    code=code,
+                )
 
-                if needs_fill_emission:
-                    await self._emit_fills_with_retry(
-                        tracked_order=tracked_order,
-                        context=f"late_fill_recovery code={code}",
-                    )
+                # Fall back to executed_orders REST when the synchronous emit
+                # path couldn't act authoritatively AND we have reason to
+                # suspect a fill exists:
+                #   - code in GONE_BY_FILL_CODES (always implies a fill);
+                #   - or ORDER_CANCELED with a non-zero ``exec_amount`` in the
+                #     response that the helper couldn't process (e.g. partial
+                #     reported without ``cost``, or old payload variants with
+                #     legacy field names like ``filled`` / ``executed``).
+                if not emitted_from_response:
+                    has_fill_signal = code in GONE_BY_FILL_CODES
+                    if not has_fill_signal and isinstance(response, dict):
+                        for legacy_field in ("exec_amount", "executed_amount",
+                                             "executed", "filled",
+                                             "filled_amount", "matched_amount"):
+                            raw = response.get(legacy_field)
+                            if raw is None:
+                                continue
+                            try:
+                                if Decimal(str(raw)) > 0:
+                                    has_fill_signal = True
+                                    break
+                            except (InvalidOperation, ValueError, TypeError):
+                                continue
+                    if has_fill_signal:
+                        await self._emit_fills_with_retry(
+                            tracked_order=tracked_order,
+                            context=f"late_fill_recovery_fallback code={code}",
+                        )
 
                 self.logger().info(
                     f"BitPreco cancel confirmed for exchange_order_id={exchange_order_id} "
@@ -1362,6 +1516,120 @@ class BitprecoExchange(ExchangePyBase):
             trading_pair=tracked_order.trading_pair,
             update_timestamp=update_timestamp,
             new_state=new_state,
+        )
+
+    def _post_fill_balance_refresh(self) -> None:
+        """Schedule a background balance refresh after a fill is emitted.
+
+        Why: BitPreco's ``_account_available_balances`` cache is normally
+        refreshed by a 5s periodic poll. A fill we just emitted reduces
+        the underlying available balance (e.g. SELL fill reduces BTC
+        available), but the cache won't reflect that for up to 5s. During
+        that window any new placement attempt sees a stale-optimistic
+        balance — exactly the 2026-05-14 12:03Z scenario that produced
+        8 ``NOT_ENOUGH_USER_BALANCE`` rejections in 8 seconds.
+
+        Debouncing strategy (two-flag): at most ONE refresh is in flight
+        at any moment; at most ONE follow-up refresh is queued. Fills
+        arriving DURING an in-flight REST may not be visible to the
+        server-side balance read (depends on commit ordering); the queued
+        trailing refresh guarantees we eventually pick them up.
+
+        This is best-effort and non-blocking. The fill emission itself
+        is unaffected by failures here.
+        """
+        if getattr(self, "_balance_refresh_inflight", False):
+            # A refresh is already running. Queue at most one trailing
+            # refresh so fills arriving during this window are picked up
+            # on the next pass.
+            self._balance_refresh_queued = True
+            return
+        self._balance_refresh_inflight = True
+        self._balance_refresh_queued = False
+        asyncio.create_task(self._do_post_fill_balance_refresh())
+
+    async def _do_post_fill_balance_refresh(self) -> None:
+        """Internal: runs the refresh REST and handles trailing-edge
+        re-trigger when fills arrived during the in-flight window."""
+        try:
+            await self._update_all_balances(_trigger="post_fill")
+        except Exception as e:
+            self.logger().warning(
+                f"[balance_refresh_post_fill] update failed (non-fatal, "
+                f"periodic poll will catch up in ≤5s): "
+                f"{type(e).__name__}: {e}"
+            )
+        finally:
+            self._balance_refresh_inflight = False
+            if getattr(self, "_balance_refresh_queued", False):
+                self._balance_refresh_queued = False
+                # Trailing refresh: a fill landed during the previous
+                # refresh window and may not have been visible. Issue
+                # another pass. Re-entry through the same helper keeps
+                # the debounce state coherent.
+                self._post_fill_balance_refresh()
+
+    def _reconcile_balance_on_rejection(self, msg: Optional[str], response: dict) -> None:
+        """Reconcile the local balance cache when an order is rejected.
+
+        Only ``NOT_ENOUGH_USER_BALANCE`` triggers reconciliation — that's
+        the rejection code that carries authoritative balance data from
+        the exchange itself, e.g.::
+
+            {"success": false, "message_cod": "NOT_ENOUGH_USER_BALANCE",
+             "currency": "BTC", "requested": 0.0002, "max": 6.056e-05}
+
+        Two-pronged update to break the retry-loop pattern observed at
+        2026-05-14 12:03Z (8 rejections in 8 seconds because
+        ``validate_sufficient_balance`` only runs ``on_start`` and the
+        periodic 5s balance poll had an 11.4s stale window after a fill):
+
+          (a) Update the local cache IMMEDIATELY with ``max`` (sync, zero
+              round-trip) so the NEXT placement / revalidation sees the
+              real value.
+          (b) Schedule a full ``_update_all_balances`` REST refresh in
+              background so any *other* stale assets (e.g. locked by
+              other in-flight orders) are also brought current — the
+              ``max`` field alone covers only the rejected currency.
+
+        ``_account_balances`` (total) vs ``_account_available_balances``
+        (free) — total can legitimately exceed available when funds are
+        locked in other orders, so we only bump total UP to ``max`` when
+        the cached total is *below* ``max`` (inconsistency repair); we
+        never inflate total downward to ``max``.
+        """
+        if msg != "NOT_ENOUGH_USER_BALANCE":
+            return
+
+        currency = response.get("currency")
+        max_raw = response.get("max")
+        if currency and max_raw is not None:
+            try:
+                max_val = Decimal(str(max_raw))
+                self._account_available_balances[currency] = max_val
+                # Total must be >= available (locked funds may push it up).
+                # If currency is unseen, bootstrap total = max_val.
+                # If cached total is below max_val, repair the inconsistency.
+                # Never inflate total downward — locked-elsewhere amounts
+                # may legitimately justify a higher total than ``max``.
+                if currency not in self._account_balances or \
+                        self._account_balances[currency] < max_val:
+                    self._account_balances[currency] = max_val
+                self.logger().warning(
+                    f"[balance_reconcile_sync] {currency} available cache "
+                    f"updated from rejection: max={max_val} "
+                    f"(was likely stale post-fill)"
+                )
+            except (InvalidOperation, ValueError, TypeError):
+                self.logger().warning(
+                    f"[balance_reconcile_sync] unparseable max={max_raw!r} "
+                    f"for currency={currency} — full refresh only"
+                )
+
+        # Background full refresh — non-blocking. Best-effort: if it fails,
+        # the local update above already broke the immediate retry loop.
+        asyncio.create_task(
+            self._update_all_balances(_trigger="balance_rejection")
         )
 
     async def _update_balances(self, _trigger: str = "unknown"):

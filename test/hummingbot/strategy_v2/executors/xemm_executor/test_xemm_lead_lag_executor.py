@@ -65,6 +65,13 @@ class TestXEMMLeadLagExecutor(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest
         self.strategy = self._create_mock_strategy()
         self.config = _make_config()
         self.executor = XEMMLeadLagExecutor(self.strategy, self.config, update_interval=0.5)
+        # Per-placement balance revalidation (Opção 3a, 2026-05-14) added a
+        # ``validate_sufficient_balance()`` call at the top of
+        # ``create_maker_order``. These tests exercise price-calculation
+        # paths and don't care about balance plumbing; mock the gate to a
+        # no-op so they don't trip on unstubbed budget machinery. The gate
+        # itself is covered by ``test_xemm_revalidate_balance.py``.
+        self.executor.validate_sufficient_balance = AsyncMock()
         self.set_loggers(loggers=[self.executor.logger()])
 
     @staticmethod
@@ -503,6 +510,8 @@ class TestXEMMLeadLagExecutor(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest
         self, mock_adjust, mock_get_rules,
     ):
         """maker_order_candidate inside validate_sufficient_balance must be LIMIT_MAKER."""
+        # Undo setUp's instance-level patch so we exercise the real method.
+        del self.executor.validate_sufficient_balance
         mock_get_rules.return_value = _make_rules()
         captured = []
 
@@ -530,6 +539,8 @@ class TestXEMMLeadLagExecutor(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest
     async def test_validate_sufficient_balance_marks_insufficient(
         self, mock_adjust, mock_get_rules,
     ):
+        # Undo setUp's instance-level patch so we exercise the real method.
+        del self.executor.validate_sufficient_balance
         mock_get_rules.return_value = _make_rules()
         zero_candidate = OrderCandidate(
             trading_pair="BTC-BRL",

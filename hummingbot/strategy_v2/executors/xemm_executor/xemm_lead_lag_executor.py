@@ -467,6 +467,29 @@ class XEMMLeadLagExecutor(XEMMExecutor):
         placement_profitability_buffer) to create hysteresis and avoid
         immediately re-triggering the cancel floor on the next tick.
         """
+        # Re-validate balance BEFORE each placement (Opção 3a, 2026-05-14).
+        # The framework only calls validate_sufficient_balance() in
+        # on_start, so once the executor is running, balance drops are
+        # invisible until placement is rejected by the exchange. That
+        # produced the 8 NOT_ENOUGH_USER_BALANCE rejections in 8s seen
+        # at 12:03Z. The connector-side reconciliation (#1 + #2) now
+        # keeps the cache fresh; this gate prevents wasting a REST call
+        # when the cache already knows we're short.
+        #
+        # validate_sufficient_balance() reads from the local cache only
+        # (~microseconds, no REST). On insufficiency it sets
+        # close_type=INSUFFICIENT_BALANCE and calls self.stop(), which
+        # transitions status to SHUTTING_DOWN — we short-circuit then
+        # so the control loop doesn't push us further.
+        #
+        # We deliberately skip ONLY for SHUTTING_DOWN / TERMINATED, NOT
+        # for "anything other than RUNNING", because unit tests
+        # construct the executor without calling on_start (status stays
+        # at NOT_STARTED) and exercise create_maker_order directly.
+        await self.validate_sufficient_balance()
+        if self.status in (RunnableStatus.SHUTTING_DOWN, RunnableStatus.TERMINATED):
+            return
+
         bound_price = None
         used_fallback = False
         book_mode = "fallback"
