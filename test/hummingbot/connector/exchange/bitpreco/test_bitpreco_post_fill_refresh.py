@@ -30,15 +30,28 @@ def _make_exchange() -> BitprecoExchange:
 
 class PostFillBalanceRefreshTest(unittest.TestCase):
 
+    def setUp(self):
+        # Each test gets a fresh event loop. Avoids contamination from
+        # IsolatedAsyncioTestCase tests run earlier in the suite (which
+        # leave ``asyncio.get_event_loop()`` returning nothing on Python
+        # 3.10+ — that path was deprecated and is unreliable cross-suite).
+        self._loop = asyncio.new_event_loop()
+        asyncio.set_event_loop(self._loop)
+
+    def tearDown(self):
+        try:
+            self._loop.close()
+        finally:
+            asyncio.set_event_loop(None)
+
     def _drain(self):
-        """Drain all pending tasks on the running loop."""
-        loop = asyncio.get_event_loop()
-        pending = [t for t in asyncio.all_tasks(loop) if not t.done()]
+        """Drain all pending tasks on the test's loop."""
+        pending = [t for t in asyncio.all_tasks(self._loop) if not t.done()]
         if pending:
-            loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
+            self._loop.run_until_complete(asyncio.gather(*pending, return_exceptions=True))
 
     def _run(self, coro):
-        return asyncio.get_event_loop().run_until_complete(coro)
+        return self._loop.run_until_complete(coro)
 
     # ------------------------------------------------------------------
     # Single fill → exactly one REST refresh

@@ -11,7 +11,10 @@ from bidict import bidict
 from hummingbot.connector.client_order_tracker import ClientOrderTracker
 from hummingbot.connector.exchange.bitpreco import bitpreco_constants as CONSTANTS, bitpreco_web_utils as web_utils
 from hummingbot.connector.exchange.bitpreco.bitpreco_api_order_book_data_source import BitprecoAPIOrderBookDataSource
-from hummingbot.connector.exchange.bitpreco.bitpreco_api_user_stream_data_source import BitprecoAPIUserStreamDataSource
+from hummingbot.connector.exchange.bitpreco.bitpreco_api_user_stream_data_source import (
+    BitprecoAPIUserStreamDataSource,
+    normalize_phoenix_message,
+)
 from hummingbot.connector.exchange.bitpreco.bitpreco_auth import BitprecoAuth
 from hummingbot.connector.exchange_py_base import ExchangePyBase
 from hummingbot.connector.trading_rule import TradingRule
@@ -1722,13 +1725,56 @@ class BitprecoExchange(ExchangePyBase):
         self._in_flight_orders_snapshot_timestamp = self.current_timestamp
 
     async def _user_stream_event_listener(self):
-        async for event_message in self._iter_user_event_queue():
+        async for raw_message in self._iter_user_event_queue():
+            # Normalize Phoenix v1 (object) ↔ v2 (array) wire formats into
+            # a uniform dict. After the 2026-05-14 migration to ``?vsn=2.0.0``
+            # the server sends arrays ``[join_ref, ref, topic, event, payload]``;
+            # before that it sent objects. Helper tolerates both so a server-
+            # side toggle wouldn't crash us.
+            event_message = normalize_phoenix_message(raw_message)
+            if event_message is None:
+                self.logger().warning(
+                    f"[ws_event_seen] dropping unparseable WS message: "
+                    f"{str(raw_message)[:200]}"
+                )
+                continue
             # Q1 instrumentation: log every event TYPE received from WS
             # (not the payload — would flood). Currently only `flash` is acted
             # on; if BitPreco's WS emits fill-specific events we'd be missing
             # them silently. Throttled to 1 log per type per 60s, plus a
             # one-shot "first seen" log per unknown type.
             evt_type = event_message.get("event", "<no-event>")
+            # ---- Phoenix heartbeat reply matcher (2026-05-14) ----
+            # A phx_reply on topic="phoenix" is an ACK for one of our
+            # phx_heartbeat sends. Match by ``ref`` to compute RTT and
+            # detect when the heartbeat fix is actually working
+            # (= server is still alive and pushing). Done BEFORE the
+            # generic ws_event_seen log so the heartbeat noise stays
+            # in its own [phx_hb_reply] log line.
+            if (evt_type == "phx_reply"
+                    and event_message.get("topic") == "phoenix"):
+                ref = event_message.get("ref")
+                ds = self._user_stream_tracker.data_source if hasattr(
+                    self, "_user_stream_tracker"
+                ) and self._user_stream_tracker is not None else None
+                rtt_ms = None
+                if ds is not None and hasattr(ds, "record_phx_heartbeat_reply"):
+                    try:
+                        rtt_ms = ds.record_phx_heartbeat_reply(ref)
+                    except Exception as e:
+                        self.logger().warning(
+                            f"[phx_hb_reply] record_phx_heartbeat_reply "
+                            f"raised: {type(e).__name__}: {e}"
+                        )
+                self.logger().info(
+                    f"[phx_hb_reply] ref={ref} "
+                    f"rtt_ms={f'{rtt_ms:.0f}' if rtt_ms is not None else 'unmatched'} "
+                    f"payload={event_message.get('payload')}"
+                )
+                # Don't run the generic event-seen path for heartbeat
+                # replies — they'd dominate the counts.
+                continue
+
             if not hasattr(self, "_ws_event_seen_counts"):
                 self._ws_event_seen_counts: Dict[str, int] = {}
                 self._ws_event_last_log_ts: Dict[str, float] = {}
@@ -1760,13 +1806,34 @@ class BitprecoExchange(ExchangePyBase):
                 # did this WS flash arrive? Identifies whether the lag is on
                 # BitPreco's WS push or on our own poll path below.
                 flash_t = time.time()
+                # Phoenix v2 flash payload (confirmed via web client capture):
+                #   {"payload": <obj|null>, "persist": <bool>,
+                #    "type": "<ORDER_FULLY_EXECUTED|ORDER_PARTIALLY_EXECUTED|"
+                #            "ORDER_CANCELED|BUY_ORDER_CREATED|"
+                #            "SELL_ORDER_CREATED|...>",
+                #    "user_id": "<id>"}
+                flash_payload = event_message.get("payload") or {}
+                flash_type = (
+                    flash_payload.get("type") if isinstance(flash_payload, dict)
+                    else None
+                )
+                flash_user = (
+                    flash_payload.get("user_id") if isinstance(flash_payload, dict)
+                    else None
+                )
                 if self._place_order_submit_times:
                     most_recent = max(self._place_order_submit_times.values())
                     ws_lag_ms = (flash_t - most_recent) * 1000
                     self.logger().info(
                         f"[bp_timing] WS flash arrived {ws_lag_ms:.0f}ms after "
-                        f"most recent place_order "
+                        f"most recent place_order type={flash_type!r} "
+                        f"user_id={flash_user!r} "
                         f"(pending_orders={len(self._place_order_submit_times)})"
+                    )
+                else:
+                    self.logger().info(
+                        f"[bp_timing] WS flash arrived (no recent order to "
+                        f"correlate) type={flash_type!r} user_id={flash_user!r}"
                     )
                 await self._update_all_balances(_trigger="ws_flash")
                 # === FOLLOW-UP REQUIRED — see DEVELOPMENT_STATUS.md ===

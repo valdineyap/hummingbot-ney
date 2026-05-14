@@ -102,8 +102,22 @@ RAW_REQUESTS = "RAW_REQUESTS"
 PING_PATH_URL = f"{_PUBLIC_HOST}/btc-brl/ticker"
 ALL_CURRENCY_TICKER_PATH_URL = f"{_PUBLIC_HOST}/all-brl/ticker"
 
-WSS_ORDERBOOK_URL = "wss://bp-channels.gigalixirapp.com/orderbook/socket/websocket"
-WSS_NOTIFICATIONS_URL = "wss://bp-channels.gigalixirapp.com/notifications/socket/websocket"
+# Phoenix protocol v2 (array wire format). Confirmed via live capture of the
+# BitPreco web client (2026-05-14) — connects with ``?vsn=2.0.0`` and uses
+# array-encoded messages ``[join_ref, ref, topic, event, payload]``. Without
+# the vsn query param the server defaults to legacy v1 (object format),
+# which the broadcaster pipeline doesn't push events on — exactly the
+# "channel joined, zero pushes" symptom observed for hours. See
+# bitpreco_api_user_stream_data_source.py for the wire format details.
+WS_PHOENIX_VSN = "2.0.0"
+WSS_ORDERBOOK_URL = (
+    "wss://bp-channels.gigalixirapp.com/orderbook/socket/websocket"
+    f"?vsn={WS_PHOENIX_VSN}"
+)
+WSS_NOTIFICATIONS_URL = (
+    "wss://bp-channels.gigalixirapp.com/notifications/socket/websocket"
+    f"?vsn={WS_PHOENIX_VSN}"
+)
 WS_ORDERBOOK_TOPIC = "orderbook"
 WS_NOTIFICATIONS_TOPIC = "notifications"
 
