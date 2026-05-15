@@ -183,14 +183,28 @@ class BitprecoRedisUserStream(UserStreamTrackerDataSource):
     async def _consume_loop(self, pubsub: Any, output: asyncio.Queue) -> None:
         sweep_interval = max(30.0, CONSTANTS.REDIS_ORPHAN_BUFFER_TTL_SEC / 2)
         self._last_sweep_ts = time.time()
+        # Liveness ping: when this data source runs it counts as
+        # "subscribed and reachable" — the framework's readiness gate
+        # checks ``last_recv_time`` and would mark us stale during
+        # quiet stretches (the ``update:<id>`` channel is silent
+        # whenever the bot has no order activity, e.g. before the
+        # first quote refresh after start). Unlike Phoenix WS, Redis
+        # pub/sub has no application-level heartbeat. Treat every
+        # successful ``get_message`` round-trip (even a timeout
+        # return) as proof the connection is alive.
+        self._last_recv_ts = time.time()
         while True:
             msg = await pubsub.get_message(
                 ignore_subscribe_messages=True,
                 timeout=1.0,
             )
             now = time.time()
+            # See note above — advance even on timeout. If the socket
+            # were dead, get_message would raise, not return None.
+            self._last_recv_ts = now
             if msg is not None:
-                self._last_recv_ts = now
+                self._counts["messages_received_real"] = (
+                    self._counts.get("messages_received_real", 0) + 1)
                 self._handle_message(msg, recv_ts=now, output=output)
             # Periodic housekeeping (cheap; runs once per second of
             # idle time at most).
