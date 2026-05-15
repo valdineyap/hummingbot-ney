@@ -1278,7 +1278,17 @@ class XEMMLeadLagController(ControllerBase):
             "market": market,
             "auth_token": f"{secret}{api_key}",
         }
-        timeout = aiohttp.ClientTimeout(total=10)
+        # 5s timeout (was 10s). The watchdog threshold is 10s — when a
+        # 10s orphan_check timeout coincided exactly with the watchdog
+        # threshold, a single network hiccup at 2026-05-15 02:14:43Z
+        # killed the bot (EVENT_LOOP_LAG_10s) even though the orphan_check
+        # itself was just doing its job (the await held tick() blocked
+        # for the timeout duration). Halving the timeout breaks the
+        # coincidence — orphan_check can still fail (no downside, the
+        # next cycle retries), but a network hiccup no longer trips the
+        # kill switch. Real orphan_check responses are <1s in steady
+        # state, so 5s is generous.
+        timeout = aiohttp.ClientTimeout(total=5)
         try:
             async with aiohttp.ClientSession(timeout=timeout) as session:
                 async with session.post(url, json=body) as resp:
