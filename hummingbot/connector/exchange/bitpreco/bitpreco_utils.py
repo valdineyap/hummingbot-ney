@@ -60,6 +60,13 @@ class BitprecoConfigMap(BaseConnectorConfigMap):
                 "Run the BitPreco Redis pub/sub observer in shadow mode "
                 "alongside the legacy path? (no impact on trading) (yes/no)"
             ),
+            # Despite the name, `is_connect_key` is what makes the
+            # framework pass the field through `conn_init_parameters`
+            # into the connector's __init__. Without it, the kwarg
+            # never reaches BitprecoExchange and shadow mode defaults
+            # to False even when the YAML sets it. Discovered when
+            # the first Phase 1A live restart silently did nothing.
+            "is_connect_key": True,
             "prompt_on_new": False,
         }
     )
