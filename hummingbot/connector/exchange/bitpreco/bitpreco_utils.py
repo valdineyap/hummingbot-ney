@@ -70,6 +70,34 @@ class BitprecoConfigMap(BaseConnectorConfigMap):
             "prompt_on_new": False,
         }
     )
+    # Phase 2 toggle. Selects which backend drives the connector:
+    #
+    #   "legacy" (default): Phoenix WS + REST poll for both
+    #     user-stream and orderbook (current state). Safe; no
+    #     dependency on the Redis env vars even when present.
+    #
+    #   "redis": Redis pub/sub is the primary source for both
+    #     user-stream events and orderbook snapshots. REST remains
+    #     the authoritative fallback and reconciliation source. The
+    #     ``_get_poll_interval`` override stays put — defense in
+    #     depth if Redis ever goes quiet.
+    #
+    # Flipping to "redis" requires BITPRECO_REDIS_* env vars at boot;
+    # absent vars raise at connector construction rather than
+    # silently fall back to legacy. The shadow-mode field above
+    # stays useful independently for offline Redis-vs-legacy
+    # comparison after promotion.
+    bitpreco_data_backend: str = Field(
+        default="legacy",
+        json_schema_extra={
+            "prompt": lambda cm: (
+                "Which data backend should drive BitPreco "
+                "(user-stream + orderbook)? (legacy/redis)"
+            ),
+            "is_connect_key": True,
+            "prompt_on_new": False,
+        }
+    )
     model_config = ConfigDict(title="bitpreco")
 
 

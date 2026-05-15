@@ -77,12 +77,28 @@ class BitprecoExchange(ExchangePyBase):
                  trading_required: bool = True,
                  domain: str = CONSTANTS.DEFAULT_DOMAIN,
                  bitpreco_redis_shadow_mode: bool = False,
+                 bitpreco_data_backend: str = "legacy",
                  ):
         self.api_key = bitpreco_api_key
         self.secret_key = bitpreco_api_secret
         self._domain = domain
         self._trading_pairs = trading_pairs
         self._trading_required = trading_required
+        # Phase 2: which backend drives user-stream + orderbook.
+        backend = (bitpreco_data_backend or "legacy").lower().strip()
+        if backend not in {"legacy", "redis"}:
+            raise ValueError(
+                f"bitpreco_data_backend must be 'legacy' or 'redis', "
+                f"got {bitpreco_data_backend!r}"
+            )
+        self._data_backend: str = backend
+        # Lazy: built on first call in _create_*_data_source. Reused
+        # by both user-stream and orderbook factories so they share
+        # the same config snapshot.
+        self._redis_factory = None  # type: ignore[var-annotated]
+        # force_balance_refresh deduplication: a single in-flight task
+        # serves N concurrent callers.
+        self._balance_refresh_in_flight: Optional[asyncio.Task] = None
         # Phase 1A: Redis shadow observers run in parallel with the
         # legacy Phoenix/REST path, comparing what each backend sees
         # and emitting metrics. Disabled by default; only flipping the
@@ -222,6 +238,179 @@ class BitprecoExchange(ExchangePyBase):
             setattr(self, attr, None)
         self._redis_shadow_us_observer = None
         self._redis_shadow_ob_observer = None
+
+    # ------------------------------------------------------------------
+    # Phase 2: Redis backend factory + REST fallback API
+    # ------------------------------------------------------------------
+
+    @property
+    def data_backend(self) -> str:
+        """``"legacy"`` (Phoenix+REST) or ``"redis"`` (pub/sub)."""
+        return self._data_backend
+
+    def _get_redis_factory(self):
+        """Lazy build of the Redis connection factory. Cached so the
+        user-stream and orderbook data sources share one config
+        snapshot."""
+        if self._redis_factory is not None:
+            return self._redis_factory
+        from hummingbot.connector.exchange.bitpreco.bitpreco_redis_client import (
+            RedisBackendConfig,
+            RedisConnectionFactory,
+        )
+        cfg = RedisBackendConfig.from_env()
+        self._redis_factory = RedisConnectionFactory(cfg)
+        return self._redis_factory
+
+    async def force_balance_refresh(self) -> None:
+        """Bypass any cache layer and fetch balance from REST now.
+
+        Coalesced via a single in-flight task: if a refresh is
+        already running, concurrent callers await the same task
+        rather than spawn N redundant REST calls. Phase 2 design
+        decision (see plan): order events Redis trigger this; balance
+        snapshots in the Redis payload do NOT mutate authoritative
+        balance — REST is authoritative.
+        """
+        existing = self._balance_refresh_in_flight
+        if existing is not None and not existing.done():
+            await existing
+            return
+        task = asyncio.create_task(
+            self._update_balances(_trigger="force_balance_refresh"))
+        self._balance_refresh_in_flight = task
+        try:
+            await task
+        finally:
+            self._balance_refresh_in_flight = None
+
+    def _on_redis_reconnect_catchup(self):
+        """Callback the Redis user-stream invokes after (re)connecting.
+
+        Pub/sub has no replay — events published while we were
+        disconnected are lost. We respond with two REST sweeps:
+
+        1. ``_update_order_status()`` to re-check every in-flight order
+        2. ``force_balance_refresh()`` for accurate balance
+
+        Both are scheduled rather than awaited so the data source's
+        consume loop isn't blocked.
+        """
+        loop = asyncio.get_event_loop()
+        try:
+            loop.create_task(self._update_order_status())
+        except Exception:
+            self.logger().exception("[redis_us] catch-up: _update_order_status failed to schedule")
+        try:
+            loop.create_task(self.force_balance_refresh())
+        except Exception:
+            self.logger().exception("[redis_us] catch-up: force_balance_refresh failed to schedule")
+
+    def _replay_redis_orphans_if_any(self, exchange_order_id: str) -> None:
+        """Best-effort orphan replay for a newly-mapped exchange_order_id.
+
+        Only meaningful when ``data_backend=redis``; on legacy it's a
+        no-op. Never raises — orphan-replay failure must not
+        interfere with place_order. Uses ``getattr`` so test-style
+        bare-instance constructions (``__new__`` without ``__init__``)
+        keep working.
+        """
+        if getattr(self, "_data_backend", "legacy") != "redis":
+            return
+        tracker = getattr(self, "_user_stream_tracker", None)
+        if tracker is None:
+            return
+        ds = getattr(tracker, "data_source", None)
+        if ds is None or not hasattr(ds, "replay_orphans"):
+            return
+        try:
+            drained = ds.replay_orphans(str(exchange_order_id))
+        except Exception:
+            self.logger().exception(
+                "[redis_us] replay_orphans raised for xid=%s", exchange_order_id)
+            return
+        if drained:
+            self.logger().info(
+                "[redis_us] replayed %d orphan event(s) for xid=%s",
+                len(drained), exchange_order_id,
+            )
+
+    async def _handle_redis_envelope(self, envelope) -> None:
+        """Act on a normalised Redis EventEnvelope.
+
+        Conservative Phase 2 v1 behaviour: every terminal event
+        (FULLY/PARTIALLY_EXECUTED, CANCELED) immediately triggers:
+
+          1. ``_update_order_status()`` — REST is authoritative on
+             order state transitions in this PR; Redis is the
+             low-latency TRIGGER. Saves ~3 s of REST poll wait per
+             event and unlocks ghost-purge prevention.
+          2. ``force_balance_refresh()`` when the event actually
+             moves balance (FULLY/PARTIAL execution, or CANCELED of
+             an order that already had exec_amount > 0).
+
+        CREATED events are mostly informational here — the connector
+        learned the exchange_order_id from the place_order REST
+        response itself. The state-machine guard in the data source
+        already filtered duplicates and stale events upstream.
+
+        A future PR can promote this to optimistic emission (build
+        OrderUpdate/TradeUpdate directly from the envelope and call
+        order_tracker.process_*) to skip the REST round-trip
+        entirely. PR 3a is conservative on purpose — REST stays
+        authoritative.
+        """
+        from hummingbot.connector.exchange.bitpreco.bitpreco_event_envelope import (
+            EventType,
+        )
+        et = envelope.event_type
+        order = envelope.order
+        xid = order.exchange_order_id if order is not None else "?"
+
+        terminal = et in (
+            EventType.ORDER_FULLY_EXECUTED,
+            EventType.ORDER_PARTIALLY_EXECUTED,
+            EventType.ORDER_CANCELED,
+        )
+        if not terminal:
+            # CREATED events: nothing to do — connector already
+            # registered the order via place_order's REST response.
+            return
+
+        # Trigger the same REST sweep the legacy `flash` handler
+        # uses. Done concurrently with the balance refresh.
+        try:
+            asyncio.create_task(self._update_order_status())
+        except Exception:
+            self.logger().exception(
+                "[redis_us] xid=%s: _update_order_status failed to schedule", xid)
+
+        # Balance moves only on actual execution. A CANCEL of a
+        # never-partially-filled order doesn't move balance — skip
+        # the refresh to avoid wasted REST calls.
+        exec_amount = order.exec_amount if order is not None else None
+        balance_moved = (
+            et == EventType.ORDER_FULLY_EXECUTED
+            or et == EventType.ORDER_PARTIALLY_EXECUTED
+            or (et == EventType.ORDER_CANCELED
+                and exec_amount is not None
+                and exec_amount > 0)
+        )
+        if balance_moved:
+            try:
+                asyncio.create_task(self.force_balance_refresh())
+            except Exception:
+                self.logger().exception(
+                    "[redis_us] xid=%s: force_balance_refresh failed to schedule",
+                    xid)
+
+        # Concise breadcrumb. Useful when correlating against the
+        # `[redis_shadow]` analyser output in production.
+        self.logger().info(
+            "[redis_us] handle xid=%s type=%s balance_refresh=%s "
+            "exec_amount=%s",
+            xid, et.value, balance_moved, exec_amount,
+        )
 
     @property
     def name(self) -> str:
@@ -614,6 +803,10 @@ class BitprecoExchange(ExchangePyBase):
             asyncio.create_task(
                 self._cancel_partial_and_emit_final(o_id, order_id)
             )
+        # Phase 2: drain any Redis events that arrived for this xid
+        # while place_order was still in flight (race between the
+        # REST response and the Redis publish). No-op on legacy.
+        self._replay_redis_orphans_if_any(o_id)
         return (o_id, transact_time)
 
     async def _emit_synchronous_fill(
@@ -1410,6 +1603,19 @@ class BitprecoExchange(ExchangePyBase):
         return trade_updates
 
     def _create_order_book_data_source(self) -> BitprecoAPIOrderBookDataSource:
+        # Phase 2 factory: Redis backend swaps the data source. Both
+        # variants put snapshots on the same _message_queue slot, so
+        # downstream code is identical.
+        if self._data_backend == "redis":
+            from hummingbot.connector.exchange.bitpreco.bitpreco_redis_order_book_data_source import (
+                BitprecoRedisOrderBookDataSource,
+            )
+            return BitprecoRedisOrderBookDataSource(
+                trading_pairs=self._trading_pairs,
+                connector=self,
+                factory=self._get_redis_factory(),
+                api_factory=self._web_assistants_factory,
+            )
         return BitprecoAPIOrderBookDataSource(trading_pairs=self._trading_pairs, connector=self)
 
     @staticmethod
@@ -1850,6 +2056,22 @@ class BitprecoExchange(ExchangePyBase):
 
     async def _user_stream_event_listener(self):
         async for raw_message in self._iter_user_event_queue():
+            # ---- Phase 2: Redis path produces EventEnvelope ----
+            # When data_backend=redis, the user-stream data source
+            # pushes typed EventEnvelope objects to the queue. Route
+            # them to the Redis-specific handler and skip the rest of
+            # the Phoenix flow. Legacy code below stays exactly as it
+            # was so flipping the flag is the ONLY thing that changes.
+            from hummingbot.connector.exchange.bitpreco.bitpreco_event_envelope import (
+                EventEnvelope,
+            )
+            if isinstance(raw_message, EventEnvelope):
+                try:
+                    await self._handle_redis_envelope(raw_message)
+                except Exception:
+                    self.logger().exception(
+                        "[redis_us] envelope handler raised — continuing")
+                continue
             # Normalize Phoenix v1 (object) ↔ v2 (array) wire formats into
             # a uniform dict. After the 2026-05-14 migration to ``?vsn=2.0.0``
             # the server sends arrays ``[join_ref, ref, topic, event, payload]``;
@@ -1984,6 +2206,17 @@ class BitprecoExchange(ExchangePyBase):
                 await self._update_order_status()
 
     def _create_user_stream_data_source(self) -> UserStreamTrackerDataSource:
+        # Phase 2 factory. Redis variant pushes EventEnvelope to the
+        # user-stream queue; the listener dispatches on
+        # isinstance(msg, EventEnvelope) for the Redis path.
+        if self._data_backend == "redis":
+            from hummingbot.connector.exchange.bitpreco.bitpreco_redis_user_stream import (
+                BitprecoRedisUserStream,
+            )
+            return BitprecoRedisUserStream(
+                connector=self,
+                factory=self._get_redis_factory(),
+            )
         return BitprecoAPIUserStreamDataSource(
             auth=self._auth,
             trading_pairs=self._trading_pairs,
