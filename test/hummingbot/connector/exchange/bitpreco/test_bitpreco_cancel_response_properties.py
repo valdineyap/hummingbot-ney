@@ -18,7 +18,6 @@ Invariants checked:
 """
 
 from decimal import Decimal
-from unittest.mock import MagicMock
 
 from hypothesis import given, settings
 from hypothesis import strategies as st

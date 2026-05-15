@@ -10,10 +10,9 @@ These tests exercise ``_try_emit_fill_from_cancel_response`` in
 isolation (the helper called from ``_place_cancel``).
 """
 
-import asyncio
 import unittest
 from decimal import Decimal
-from unittest.mock import AsyncMock, MagicMock
+from unittest.mock import MagicMock
 
 from hummingbot.connector.exchange.bitpreco.bitpreco_exchange import BitprecoExchange
 from hummingbot.core.data_type.common import OrderType, TradeType

@@ -125,6 +125,54 @@ WS_HEARTBEAT_TIME_INTERVAL = 30
 
 ONE_MINUTE = 60
 
+# ----------------------------------------------------------------------------
+# Redis pub/sub backend constants (Phase 1A shadow mode + Phase 2 primary)
+# ----------------------------------------------------------------------------
+# BitPreco's internal bots use Redis pub/sub instead of Phoenix WS. The
+# connector subscribes to two channels: `update:<idBPBot>` for order +
+# balance events, and `orderbook:<market>` for live book snapshots.
+#
+# All durations are seconds. Tunable from the connector config layer in
+# later phases; for now they're constants tuned against the Phase 0
+# capture (`docs/BITPRECO_REDIS_GAINS.md`).
+
+# Connection
+REDIS_CONNECT_TIMEOUT_SEC = 10
+REDIS_SOCKET_TIMEOUT_SEC = 10
+REDIS_HEALTH_CHECK_INTERVAL_SEC = 30
+
+# Channel name prefixes (joined with `:<key>`)
+REDIS_UPDATE_CHANNEL_PREFIX = "update"
+REDIS_ORDERBOOK_CHANNEL_PREFIX = "orderbook"
+
+# Orderbook silence watchdog: snapshots arrive ~1.4 Hz (p99 1.78 s).
+# 15 s of silence is anomalous and triggers REST fallback in Phase 2.
+REDIS_ORDERBOOK_SILENCE_THRESHOLD_SEC = 15
+REDIS_ORDERBOOK_RECOVERY_STABLE_SEC = 30
+
+# Sanity poll cadence for open_orders (Phase 2; user-stream Redis path).
+REDIS_OPEN_ORDERS_SANITY_INTERVAL_SEC = 30
+
+# Low-frequency drift-detection reconciliation (Phase 2).
+REDIS_RECONCILE_INTERVAL_SEC = 300
+
+# Orphan event buffer: holds Redis events for an exchange_order_id that
+# the connector hasn't mapped yet (race between place_order REST return
+# and Redis event publish).
+REDIS_ORPHAN_BUFFER_TTL_SEC = 120
+
+# Force balance refresh retry policy when REST response looks stale
+# (no expected change reflected). Phase 2.
+REDIS_BALANCE_REFRESH_RETRY_DELAYS_SEC = (0.3, 1.0)
+
+# Per-order timestamp cache used by the ordering guard.
+REDIS_STATE_CACHE_TTL_SEC = 3600
+
+# BitPreco serves all timestamps in America/Sao_Paulo (BRT, UTC-3),
+# regardless of host location. Production parser MUST normalise to UTC
+# before comparing against time.time(). See FINDINGS.md.
+BITPRECO_TZ_OFFSET_SEC = -3 * 3600
+
 CMD_BUY = "buy"
 CMD_SELL = "sell"
 CMD_CANCEL_ORDER = "order_cancel"

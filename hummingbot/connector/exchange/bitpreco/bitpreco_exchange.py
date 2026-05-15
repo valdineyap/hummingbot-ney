@@ -23,6 +23,7 @@ from hummingbot.core.data_type.common import OrderType, TradeType
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState, OrderUpdate, TradeUpdate
 from hummingbot.core.data_type.trade_fee import DeductedFromReturnsTradeFee, TokenAmount, TradeFeeBase
 from hummingbot.core.data_type.user_stream_tracker_data_source import UserStreamTrackerDataSource
+from hummingbot.core.utils.async_utils import safe_ensure_future
 from hummingbot.core.utils.estimate_fee import build_trade_fee
 from hummingbot.core.web_assistant.connections.data_types import RESTMethod
 from hummingbot.core.web_assistant.web_assistants_factory import WebAssistantsFactory
@@ -75,12 +76,25 @@ class BitprecoExchange(ExchangePyBase):
                  trading_pairs: Optional[List[str]] = None,
                  trading_required: bool = True,
                  domain: str = CONSTANTS.DEFAULT_DOMAIN,
+                 bitpreco_redis_shadow_mode: bool = False,
                  ):
         self.api_key = bitpreco_api_key
         self.secret_key = bitpreco_api_secret
         self._domain = domain
         self._trading_pairs = trading_pairs
         self._trading_required = trading_required
+        # Phase 1A: Redis shadow observers run in parallel with the
+        # legacy Phoenix/REST path, comparing what each backend sees
+        # and emitting metrics. Disabled by default; only flipping the
+        # connector config field on AND having BITPRECO_REDIS_* env
+        # vars set will spawn them. See
+        # docs/BITPRECO_REDIS_GAINS.md for the motivation.
+        self._redis_shadow_enabled: bool = bool(bitpreco_redis_shadow_mode)
+        self._redis_shadow_us_task: Optional[asyncio.Task] = None
+        self._redis_shadow_ob_task: Optional[asyncio.Task] = None
+        # Held on the instance so tests can inspect counters/state.
+        self._redis_shadow_us_observer = None  # type: ignore[var-annotated]
+        self._redis_shadow_ob_observer = None  # type: ignore[var-annotated]
         super().__init__(balance_asset_limit, rate_limits_share_pct)
         self._throttler = AsyncThrottler(CONSTANTS.RATE_LIMITS)
         self._api_factory = web_utils.build_api_factory(
@@ -108,6 +122,106 @@ class BitprecoExchange(ExchangePyBase):
         # before trusting the cached balance for drift detection.
         # Initial 0.0 means "never refreshed yet"; treat as max-stale.
         self._last_balance_update_ts: float = 0.0
+
+    # ------------------------------------------------------------------
+    # Phase 1A: Redis shadow observer lifecycle
+    # ------------------------------------------------------------------
+    async def start_network(self):
+        """Bring up the connector AND, if enabled, the Redis shadow
+        observers in parallel.
+
+        Shadow observers never push to the order tracker / message
+        queues. They run in their own asyncio tasks and emit
+        ``[redis_shadow]`` / ``[redis_shadow_ob]`` log lines.
+        """
+        await super().start_network()
+        if not self._redis_shadow_enabled:
+            return
+        self._spawn_redis_shadow_observers()
+
+    async def stop_network(self):
+        # Tear down our shadow tasks BEFORE parent's stop_network so
+        # that any in-flight Redis socket can drain cleanly without
+        # the framework also racing to cancel them.
+        await self._cancel_redis_shadow_observers()
+        await super().stop_network()
+
+    def _spawn_redis_shadow_observers(self) -> None:
+        """Build the Redis connection factory and spawn both shadow
+        observers. Any setup error (missing env vars, redis-py not
+        installed) logs WARN and silently disables — never raises.
+
+        Imports are local so a connector running in legacy mode
+        doesn't pay the import cost or require redis-py at all.
+        """
+        try:
+            from hummingbot.connector.exchange.bitpreco.bitpreco_redis_client import (
+                RedisBackendConfig,
+                RedisConfigError,
+                RedisConnectionFactory,
+            )
+            from hummingbot.connector.exchange.bitpreco.bitpreco_redis_order_book_shadow import (
+                BitprecoRedisOrderBookShadow,
+            )
+            from hummingbot.connector.exchange.bitpreco.bitpreco_redis_user_stream_shadow import (
+                BitprecoRedisUserStreamShadow,
+            )
+        except Exception as exc:
+            self.logger().warning(
+                "[redis_shadow] could not import Redis backend modules "
+                "(redis-py missing?): %s — shadow mode disabled", exc)
+            return
+
+        try:
+            redis_cfg = RedisBackendConfig.from_env()
+        except RedisConfigError as exc:
+            self.logger().warning(
+                "[redis_shadow] %s — shadow mode disabled", exc)
+            return
+        except Exception as exc:
+            self.logger().warning(
+                "[redis_shadow] unexpected error loading Redis config: %s "
+                "— shadow mode disabled", exc)
+            return
+
+        factory = RedisConnectionFactory(redis_cfg)
+
+        us_observer = BitprecoRedisUserStreamShadow(connector=self, factory=factory)
+        self._redis_shadow_us_observer = us_observer
+        self._redis_shadow_us_task = safe_ensure_future(us_observer.run())
+
+        if self._trading_pairs:
+            ob_observer = BitprecoRedisOrderBookShadow(
+                connector=self,
+                factory=factory,
+                trading_pairs=self._trading_pairs,
+            )
+            self._redis_shadow_ob_observer = ob_observer
+            self._redis_shadow_ob_task = safe_ensure_future(ob_observer.run())
+            ob_pairs_msg = f"orderbook channels: {self._trading_pairs}"
+        else:
+            ob_pairs_msg = "orderbook shadow skipped (no trading_pairs)"
+
+        self.logger().info(
+            "[redis_shadow] enabled — host=%s:%s user_id=%s tls=%s "
+            "update_channel=%s | %s",
+            redis_cfg.host, redis_cfg.port, redis_cfg.user_id, redis_cfg.tls,
+            redis_cfg.update_channel, ob_pairs_msg,
+        )
+
+    async def _cancel_redis_shadow_observers(self) -> None:
+        for attr in ("_redis_shadow_us_task", "_redis_shadow_ob_task"):
+            task = getattr(self, attr, None)
+            if task is None or task.done():
+                continue
+            task.cancel()
+            try:
+                await task
+            except (asyncio.CancelledError, Exception):
+                pass
+            setattr(self, attr, None)
+        self._redis_shadow_us_observer = None
+        self._redis_shadow_ob_observer = None
 
     @property
     def name(self) -> str:

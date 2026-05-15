@@ -12,7 +12,7 @@ logic so it doesn't need a running BitPreco endpoint.
 import asyncio
 import unittest
 from decimal import Decimal
-from unittest.mock import AsyncMock, MagicMock, patch
+from unittest.mock import AsyncMock, MagicMock
 
 from hummingbot.connector.exchange.bitpreco.bitpreco_exchange import BitprecoExchange
 from hummingbot.core.data_type.in_flight_order import InFlightOrder, OrderState

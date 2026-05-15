@@ -44,6 +44,25 @@ class BitprecoConfigMap(BaseConnectorConfigMap):
             "prompt_on_new": True,
         }
     )
+    # Phase 1A toggle. When True, the connector spawns the
+    # BitprecoRedisUserStreamShadow + BitprecoRedisOrderBookShadow
+    # tasks alongside the legacy Phoenix/REST path. The shadow
+    # observers consume Redis pub/sub, exercise the production
+    # parser/state-machine pipeline and emit [redis_shadow*]
+    # metrics, but do NOT mutate bot state. Default off so existing
+    # deployments are unchanged. Requires BITPRECO_REDIS_* + BITPRECO_USER_ID
+    # env vars (see .env.example); missing env vars → shadow mode
+    # disables itself with a single WARN at startup.
+    bitpreco_redis_shadow_mode: bool = Field(
+        default=False,
+        json_schema_extra={
+            "prompt": lambda cm: (
+                "Run the BitPreco Redis pub/sub observer in shadow mode "
+                "alongside the legacy path? (no impact on trading) (yes/no)"
+            ),
+            "prompt_on_new": False,
+        }
+    )
     model_config = ConfigDict(title="bitpreco")
 
 
