@@ -33,22 +33,32 @@ s_decimal_NaN = Decimal("nan")
 
 
 class BitprecoExchange(ExchangePyBase):
-    # ----- Polling cadence (Task 2.3) -----
-    # BitPreco's WS user-stream drops frequently (we measured ~46 disconnects
-    # in 80min on a single session). When the framework decides WS is healthy
-    # it polls every ``LONG_POLL_INTERVAL``; with the 120s default a fill that
-    # the WS misses can sit unhedged for two minutes before the connector
-    # notices. We tighten both intervals — the 100 req/s rate limit makes
-    # this trivially affordable at our order volume.
+    # ----- Polling cadence -----
+    # BitPreco's WS user-stream has been observed to be EFFECTIVELY DEAD
+    # for fill detection: across 6h51m of distributed sessions (May 14-15
+    # 2026) we received 2 ``flash`` events versus ~500 expected order
+    # events (creates + cancels + fills). The Phoenix v2 protocol works
+    # technically — heartbeats are acked with status:ok — but the
+    # server-side broadcaster doesn't push trade-event notifications for
+    # API users. Behaviour appears to be by design (push pipeline targets
+    # browser sessions on market.bitypreco.com, not API key holders).
+    #
+    # Consequence: WS cannot be trusted as a "channel is healthy" hint
+    # to relax polling cadence. We override ``_get_poll_interval`` to
+    # ALWAYS use ``SHORT_POLL_INTERVAL`` regardless of WS state — the
+    # framework's default logic backs off to LONG_POLL when WS messages
+    # arrive recently, but for us "recent WS message" only means
+    # heartbeat replies which carry zero useful information about fills.
+    #
+    # The WS connection itself is kept alive for:
+    #   1. The reconnect catch-up REST poll (recovers any state changes
+    #      missed during disconnect windows).
+    #   2. The ~0.5% of flash events that do leak through.
+    #   3. Future-proofing in case BitPreco enables push for API users.
+    # But behaviourally the bot is REST-poll-driven, full stop.
     SHORT_POLL_INTERVAL = 3.0
-    # Tightened from 30s → 5s on 2026-05-13 after observing detection lag
-    # of 146s on a maker fill (incident 12:33). BitPreco's user-stream WS
-    # drops frequently (~70-90s), and when an executor stops cancel-cycling
-    # an order (because profitability stabilises), the fill is invisible to
-    # us until either ``orphan_check`` notices the tracker/exchange mismatch
-    # OR the long-poll fires. 5s caps the worst-case detection lag at the
-    # cost of ~6× REST traffic in quiet periods (still trivial vs the
-    # 100 req/s rate limit).
+    # LONG_POLL_INTERVAL is kept for compatibility with the parent class
+    # but is effectively unused — see _get_poll_interval override below.
     LONG_POLL_INTERVAL = 5.0
     # Minimum gap between two ``_update_order_status`` calls. Below this the
     # connector skips the call and waits — a guard against frantic polling
@@ -1867,6 +1877,25 @@ class BitprecoExchange(ExchangePyBase):
             api_factory=self._web_assistants_factory,
             domain=self.domain,
         )
+
+    def _get_poll_interval(self, timestamp: float) -> float:
+        """Override base: ALWAYS use ``SHORT_POLL_INTERVAL``.
+
+        The parent class' logic backs off from polling when WS messages
+        arrived recently (``last_user_stream_message_time``), on the
+        assumption that an active WS reduces the need for REST polls.
+        That assumption is false for BitPreco — see the class-level
+        polling-cadence comment block. The WS pushes heartbeat replies
+        every 30s (which DO refresh ``last_recv_time``) but no actual
+        trade events, so the framework would otherwise wrongly think
+        "WS is healthy → relax polling".
+
+        By always returning ``SHORT_POLL_INTERVAL`` we make the polling
+        cadence depend ONLY on our configured value, not on WS state.
+        REST poll becomes the deterministic, sole source of truth for
+        fill / order-status detection.
+        """
+        return self.SHORT_POLL_INTERVAL
 
     async def _initialize_trading_pair_symbol_map(self):
 
