@@ -335,81 +335,176 @@ class BitprecoExchange(ExchangePyBase):
                 len(drained), exchange_order_id,
             )
 
+    def _lookup_tracked_by_xid(self, exchange_order_id: str):
+        """Find an in-flight order by its exchange (BitPreco numeric)
+        id. Returns the :class:`InFlightOrder` or ``None``.
+
+        Used by the optimistic Redis path — the envelope carries the
+        xid, but the order tracker is keyed by ``client_order_id``.
+        """
+        tracker = getattr(self, "_order_tracker", None)
+        if tracker is None:
+            return None
+        try:
+            for in_flight in tracker.active_orders.values():
+                if in_flight.exchange_order_id == str(exchange_order_id):
+                    return in_flight
+        except Exception:
+            return None
+        return None
+
     async def _handle_redis_envelope(self, envelope) -> None:
-        """Act on a normalised Redis EventEnvelope.
+        """Optimistic dispatch for Redis user-stream envelopes.
 
-        Conservative Phase 2 v1 behaviour: every terminal event
-        (FULLY/PARTIALLY_EXECUTED, CANCELED) immediately triggers:
+        PR 3b — the bot mutates order state directly from the Redis
+        payload rather than triggering a full REST sweep on every
+        event. Mapping per ``message_cod``:
 
-          1. ``_update_order_status()`` — REST is authoritative on
-             order state transitions in this PR; Redis is the
-             low-latency TRIGGER. Saves ~3 s of REST poll wait per
-             event and unlocks ghost-purge prevention.
-          2. ``force_balance_refresh()`` when the event actually
-             moves balance (FULLY/PARTIAL execution, or CANCELED of
-             an order that already had exec_amount > 0).
+        - ``BUY_ORDER_CREATED`` / ``SELL_ORDER_CREATED``: no-op.
+          ``place_order``'s REST response already registered the
+          order in the tracker (and our ``_replay_redis_orphans_if_any``
+          drained any envelopes that raced ahead of it).
 
-        CREATED events are mostly informational here — the connector
-        learned the exchange_order_id from the place_order REST
-        response itself. The state-machine guard in the data source
-        already filtered duplicates and stale events upstream.
+        - ``ORDER_CANCELED`` with ``exec_amount == 0``: emit
+          ``OrderUpdate(new_state=CANCELED)`` directly into the
+          order tracker. **No REST call.** This is the bulk of the
+          win — overnight 841 of 845 terminals were pure cancels
+          (Phase 1A measurement) — and the cancel-side latency drops
+          from ~300 ms (REST round-trip) to <1 ms.
 
-        A future PR can promote this to optimistic emission (build
-        OrderUpdate/TradeUpdate directly from the envelope and call
-        order_tracker.process_*) to skip the REST round-trip
-        entirely. PR 3a is conservative on purpose — REST stays
-        authoritative.
+        - ``ORDER_FULLY_EXECUTED``: schedule ``_emit_synchronous_fill``,
+          which fetches the trade list for **this single xid** (real
+          ``trade_id`` + ``fee`` required by the framework) and
+          emits ``OrderFilledEvent`` via the order tracker. Cheaper
+          than the legacy ``_update_order_status`` sweep (one order
+          instead of every in-flight). Also fires
+          ``force_balance_refresh``.
+
+        - ``ORDER_PARTIALLY_EXECUTED`` (rare with our 0.0002 size):
+          reuse ``_cancel_partial_and_emit_final``, which cancels
+          the remainder and emits one final ``TradeUpdate`` with
+          the actual ``exec_amount``. Also fires
+          ``force_balance_refresh``.
+
+        - ``ORDER_CANCELED`` with ``exec_amount > 0`` (partial fill
+          then cancel): same as PARTIAL — go through
+          ``_cancel_partial_and_emit_final`` so we capture the
+          partial fill before transitioning to CANCELED.
+
+        Fallback paths
+        --------------
+        If the connector isn't tracking the xid (rare race: orphan
+        replay didn't fire, or the order belongs to another session),
+        we still schedule a one-shot REST poll so we don't lose the
+        event silently. Idempotency is provided by the order tracker
+        — ``process_order_update`` is a no-op when the incoming state
+        matches the current state.
+
+        Safety
+        ------
+        REST poll continues on its own cadence (``SHORT_POLL_INTERVAL
+        = 3 s``) as defense-in-depth. If anything in this optimistic
+        path goes wrong, REST converges within 3 s anyway.
         """
         from hummingbot.connector.exchange.bitpreco.bitpreco_event_envelope import (
             EventType,
         )
         et = envelope.event_type
         order = envelope.order
-        xid = order.exchange_order_id if order is not None else "?"
+        if order is None:
+            return
+        xid = order.exchange_order_id
 
-        terminal = et in (
-            EventType.ORDER_FULLY_EXECUTED,
-            EventType.ORDER_PARTIALLY_EXECUTED,
-            EventType.ORDER_CANCELED,
-        )
-        if not terminal:
-            # CREATED events: nothing to do — connector already
-            # registered the order via place_order's REST response.
+        # CREATED is a pure no-op — the place_order REST response
+        # already registered the order in the tracker.
+        if et in (EventType.BUY_ORDER_CREATED, EventType.SELL_ORDER_CREATED):
             return
 
-        # Trigger the same REST sweep the legacy `flash` handler
-        # uses. Done concurrently with the balance refresh.
-        try:
-            asyncio.create_task(self._update_order_status())
-        except Exception:
-            self.logger().exception(
-                "[redis_us] xid=%s: _update_order_status failed to schedule", xid)
+        tracked = self._lookup_tracked_by_xid(xid)
+        if tracked is None:
+            # No in-flight order matches. Could be an old order from
+            # a previous bot session, or an orphan that wasn't
+            # replayed yet (very unlikely given the
+            # _replay_redis_orphans_if_any hook). Fall back to a
+            # REST sweep so we don't silently lose state.
+            self.logger().info(
+                "[redis_us] handle xid=%s type=%s tracked=None — "
+                "scheduling REST sweep", xid, et.value,
+            )
+            try:
+                asyncio.create_task(self._update_order_status())
+            except Exception:
+                self.logger().exception(
+                    "[redis_us] xid=%s: _update_order_status failed to schedule",
+                    xid)
+            return
 
-        # Balance moves only on actual execution. A CANCEL of a
-        # never-partially-filled order doesn't move balance — skip
-        # the refresh to avoid wasted REST calls.
-        exec_amount = order.exec_amount if order is not None else None
-        balance_moved = (
-            et == EventType.ORDER_FULLY_EXECUTED
-            or et == EventType.ORDER_PARTIALLY_EXECUTED
-            or (et == EventType.ORDER_CANCELED
-                and exec_amount is not None
-                and exec_amount > 0)
-        )
-        if balance_moved:
+        cid = tracked.client_order_id
+        exec_amount = order.exec_amount
+
+        # ORDER_CANCELED with no fills — the optimisation. Build the
+        # OrderUpdate locally and feed the tracker. Zero REST calls.
+        if (et == EventType.ORDER_CANCELED
+                and (exec_amount is None or exec_amount == 0)):
+            update = OrderUpdate(
+                client_order_id=cid,
+                exchange_order_id=str(xid),
+                trading_pair=tracked.trading_pair,
+                update_timestamp=time.time(),
+                new_state=OrderState.CANCELED,
+            )
+            try:
+                self._order_tracker.process_order_update(update)
+            except Exception:
+                self.logger().exception(
+                    "[redis_us] xid=%s: process_order_update raised", xid)
+            self.logger().info(
+                "[redis_us] handle xid=%s type=%s path=optimistic_cancel",
+                xid, et.value,
+            )
+            return
+
+        # Fill paths — schedule the existing emission helpers. These
+        # do a single-order REST trade-fetch (needed for real
+        # trade_id and fee) plus emit the OrderFilledEvent.
+        if et == EventType.ORDER_FULLY_EXECUTED:
+            try:
+                asyncio.create_task(
+                    self._emit_synchronous_fill(
+                        str(xid), cid, "ORDER_FULLY_EXECUTED"))
+            except Exception:
+                self.logger().exception(
+                    "[redis_us] xid=%s: _emit_synchronous_fill failed to schedule",
+                    xid)
             try:
                 asyncio.create_task(self.force_balance_refresh())
             except Exception:
                 self.logger().exception(
                     "[redis_us] xid=%s: force_balance_refresh failed to schedule",
                     xid)
+            self.logger().info(
+                "[redis_us] handle xid=%s type=%s path=sync_fill exec=%s",
+                xid, et.value, exec_amount,
+            )
+            return
 
-        # Concise breadcrumb. Useful when correlating against the
-        # `[redis_shadow]` analyser output in production.
+        # PARTIAL (rare) or CANCELED-with-fills: cancel-and-emit-final
+        # captures the partial exec_amount before terminal CANCELED.
+        try:
+            asyncio.create_task(
+                self._cancel_partial_and_emit_final(str(xid), cid))
+        except Exception:
+            self.logger().exception(
+                "[redis_us] xid=%s: _cancel_partial_and_emit_final failed",
+                xid)
+        try:
+            asyncio.create_task(self.force_balance_refresh())
+        except Exception:
+            self.logger().exception(
+                "[redis_us] xid=%s: force_balance_refresh failed to schedule", xid)
         self.logger().info(
-            "[redis_us] handle xid=%s type=%s balance_refresh=%s "
-            "exec_amount=%s",
-            xid, et.value, balance_moved, exec_amount,
+            "[redis_us] handle xid=%s type=%s path=partial_and_emit exec=%s",
+            xid, et.value, exec_amount,
         )
 
     @property
