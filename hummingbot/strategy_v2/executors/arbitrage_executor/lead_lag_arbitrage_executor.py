@@ -444,7 +444,10 @@ class LeadLagArbitrageExecutor(ArbitrageExecutor):
                 order_type=OrderType.MARKET,
                 side=inverse_side,
                 amount=executed_amount,
-                price=Decimal("1"),  # MARKET ignores
+                # price=0 triggers exchange_py_base to look up current mid for
+                # the min-notional check (otherwise a placeholder like 1 makes
+                # notional=1*amount and trips min_notional_size on small qtys).
+                price=Decimal("0"),
             )
             self.logger().info(
                 f"Unwind MARKET {inverse_side.name} {executed_amount} on "

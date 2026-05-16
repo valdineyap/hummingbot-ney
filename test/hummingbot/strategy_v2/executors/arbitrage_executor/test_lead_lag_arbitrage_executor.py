@@ -142,6 +142,23 @@ class TestLeadLagArbitrageExecutor(IsolatedAsyncioWrapperTestCase, LoggerMixinFo
                     )
         self.assertEqual(mock_place.call_args.kwargs["side"], TradeType.BUY)
 
+    async def test_unwind_passes_zero_price_for_min_notional_lookup(self):
+        """Regression: ``price=Decimal("1")`` made exchange_py_base compute
+        notional=1*amount, tripping ``min_notional_size`` on small qtys
+        (observed in prod: 0.0002 BTC unwind rejected because 1*0.0002=0.0002
+        < 10 BRL). Passing ``price=Decimal("0")`` triggers the upstream branch
+        that uses live mid for the notional check."""
+        with patch.object(self.executor, "_estimate_unwind_slippage",
+                          new=AsyncMock(return_value=Decimal("10"))):
+            with patch.object(self.executor, "place_order", return_value="OID-PX") as mock_place:
+                with patch.object(self.executor, "stop"):
+                    await self.executor._unwind_position(
+                        executed_side=TradeType.BUY,
+                        executed_amount=Decimal("0.0002"),
+                    )
+        self.assertEqual(mock_place.call_args.kwargs["price"], Decimal("0"))
+        self.assertEqual(mock_place.call_args.kwargs["order_type"], OrderType.MARKET)
+
     async def test_unwind_aborts_if_slippage_estimation_fails(self):
         """If we can't estimate slippage on either leg, abort safely."""
         with patch.object(self.executor, "_estimate_unwind_slippage",
