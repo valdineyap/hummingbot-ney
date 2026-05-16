@@ -25,7 +25,7 @@ from test.isolated_asyncio_wrapper_test_case import IsolatedAsyncioWrapperTestCa
 from test.logger_mixin_for_test import LoggerMixinForTest
 from unittest.mock import AsyncMock, MagicMock, patch
 
-from hummingbot.core.data_type.common import PriceType, TradeType
+from hummingbot.core.data_type.common import OrderType, PriceType, TradeType
 from hummingbot.data_feed.market_data_provider import MarketDataProvider
 from hummingbot.strategy_v2.executors.xemm_executor.data_types import XEMMExecutorConfig, XEMMLeadLagExecutorConfig
 from hummingbot.strategy_v2.models.executor_actions import (
@@ -2601,3 +2601,200 @@ class TestFreshArbRefresh(_ArbBaseTest):
         pd = self.controller.processed_data
         self.assertIn("arb_fresh_used", pd)
         self.assertTrue(pd["arb_fresh_used"])
+
+
+# ===================================================================== #
+# Group J — Orphan-fill hedge dispatch (replaces ghost_controller)       #
+# ===================================================================== #
+class _OrphanHedgeBaseTest(_BaseControllerTest):
+    """Shared helpers: build OrderFilled events + mock taker connector."""
+
+    def _fill_event(self, order_id: str, side: TradeType = TradeType.SELL,
+                    amount: Decimal = Decimal("0.0002")):
+        ev = MagicMock()
+        ev.order_id = order_id
+        ev.amount = amount
+        ev.trade_type = side
+        ev.price = Decimal("400000")
+        return ev
+
+    def _mock_taker_connector(self, buy_id="HEDGE-BUY-1", sell_id="HEDGE-SELL-1"):
+        taker = MagicMock()
+        taker.buy = MagicMock(return_value=buy_id)
+        taker.sell = MagicMock(return_value=sell_id)
+        self.market_data_provider.get_connector = MagicMock(return_value=taker)
+        return taker
+
+    def _install_executors_info(self, infos=None):
+        """Inject a list of ExecutorInfo-shaped mocks into the controller."""
+        self.controller.executors_info = list(infos or [])
+
+    def _make_info(self, maker_order_id: Optional[str], is_done: bool = False):
+        info = MagicMock()
+        info.is_done = is_done
+        info.custom_info = {"maker_order_id": maker_order_id} if maker_order_id is not None else {}
+        return info
+
+
+class TestFindLiveExecutorOwningMaker(_OrphanHedgeBaseTest):
+
+    def test_returns_executor_when_live_owns_maker_order(self):
+        live = self._make_info("MAKER-1", is_done=False)
+        self._install_executors_info([live])
+        result = self.controller._find_live_executor_owning_maker("MAKER-1")
+        self.assertIs(result, live)
+
+    def test_skips_terminated_executor_even_if_id_matches(self):
+        dead = self._make_info("MAKER-DEAD", is_done=True)
+        self._install_executors_info([dead])
+        self.assertIsNone(
+            self.controller._find_live_executor_owning_maker("MAKER-DEAD")
+        )
+
+    def test_returns_none_when_no_executor_owns_order(self):
+        live = self._make_info("MAKER-OTHER")
+        self._install_executors_info([live])
+        self.assertIsNone(
+            self.controller._find_live_executor_owning_maker("MAKER-NOT-FOUND")
+        )
+
+    def test_returns_none_for_empty_or_missing_order_id(self):
+        self._install_executors_info([self._make_info("MAKER-X")])
+        self.assertIsNone(self.controller._find_live_executor_owning_maker(None))
+        self.assertIsNone(self.controller._find_live_executor_owning_maker(""))
+
+    def test_returns_none_when_executors_info_empty(self):
+        """Empty list (fresh controller, no executors yet) → None."""
+        self._install_executors_info([])
+        self.assertIsNone(
+            self.controller._find_live_executor_owning_maker("MAKER-1")
+        )
+
+    def test_returns_none_when_executors_info_is_none(self):
+        """Defensive: executors_info=None must not raise."""
+        self.controller.executors_info = None
+        self.assertIsNone(
+            self.controller._find_live_executor_owning_maker("MAKER-1")
+        )
+
+    def test_skips_executor_with_no_maker_order(self):
+        no_maker = self._make_info(maker_order_id=None)
+        self._install_executors_info([no_maker])
+        self.assertIsNone(
+            self.controller._find_live_executor_owning_maker("MAKER-1")
+        )
+
+
+class TestOrphanHedgeDispatch(_OrphanHedgeBaseTest):
+
+    def test_dispatches_buy_when_maker_sell_orphan(self):
+        """SELL maker fill with no live owner → MARKET BUY on taker."""
+        self._install_executors_info([])  # no live executors
+        taker = self._mock_taker_connector()
+        event = self._fill_event("ORPHAN-1", side=TradeType.SELL,
+                                 amount=Decimal("0.0002"))
+        self.controller._maybe_dispatch_orphan_hedge(event, "bybit")
+        taker.buy.assert_called_once()
+        args = taker.buy.call_args.args
+        self.assertEqual(args[0], "BTC-BRL")        # pair
+        self.assertEqual(args[1], Decimal("0.0002"))  # amount
+        self.assertEqual(args[2], OrderType.MARKET)   # order_type
+        taker.sell.assert_not_called()
+
+    def test_dispatches_sell_when_maker_buy_orphan(self):
+        """BUY maker fill with no live owner → MARKET SELL on taker."""
+        self._install_executors_info([])
+        taker = self._mock_taker_connector()
+        event = self._fill_event("ORPHAN-2", side=TradeType.BUY,
+                                 amount=Decimal("0.0003"))
+        self.controller._maybe_dispatch_orphan_hedge(event, "bybit")
+        taker.sell.assert_called_once()
+        args = taker.sell.call_args.args
+        self.assertEqual(args[1], Decimal("0.0003"))
+        taker.buy.assert_not_called()
+
+    def test_skips_when_live_executor_owns_order(self):
+        """Live owner exists → trust executor, skip dispatch."""
+        live = self._make_info("OWNED-1")
+        self._install_executors_info([live])
+        taker = self._mock_taker_connector()
+        event = self._fill_event("OWNED-1", side=TradeType.SELL)
+        self.controller._maybe_dispatch_orphan_hedge(event, "bybit")
+        taker.buy.assert_not_called()
+        taker.sell.assert_not_called()
+
+    def test_skips_when_event_has_no_order_id(self):
+        self._install_executors_info([])
+        taker = self._mock_taker_connector()
+        event = MagicMock()
+        event.order_id = None
+        self.controller._maybe_dispatch_orphan_hedge(event, "bybit")
+        taker.buy.assert_not_called()
+
+    def test_skips_when_amount_is_zero(self):
+        self._install_executors_info([])
+        taker = self._mock_taker_connector()
+        event = self._fill_event("ZERO-AMT", side=TradeType.SELL,
+                                 amount=Decimal("0"))
+        self.controller._maybe_dispatch_orphan_hedge(event, "bybit")
+        taker.buy.assert_not_called()
+
+    def test_skips_when_trade_type_is_unknown(self):
+        self._install_executors_info([])
+        taker = self._mock_taker_connector()
+        event = MagicMock()
+        event.order_id = "WEIRD-1"
+        event.amount = Decimal("0.0002")
+        event.trade_type = "GIBBERISH"  # not a TradeType
+        self.controller._maybe_dispatch_orphan_hedge(event, "bybit")
+        taker.buy.assert_not_called()
+        taker.sell.assert_not_called()
+
+    def test_logs_error_and_returns_if_taker_connector_unresolvable(self):
+        self._install_executors_info([])
+        self.market_data_provider.get_connector = MagicMock(
+            side_effect=RuntimeError("no such connector")
+        )
+        event = self._fill_event("UNRESOLVABLE-1", side=TradeType.SELL)
+        # Should NOT raise — orphan_hedge is best-effort, audit is fallback.
+        self.controller._maybe_dispatch_orphan_hedge(event, "bybit")
+
+    def test_handles_taker_place_order_exception(self):
+        self._install_executors_info([])
+        taker = self._mock_taker_connector()
+        taker.buy = MagicMock(side_effect=RuntimeError("BP rate limit"))
+        self.market_data_provider.get_connector = MagicMock(return_value=taker)
+        event = self._fill_event("RATE-LIMITED", side=TradeType.SELL)
+        # Should NOT raise.
+        self.controller._maybe_dispatch_orphan_hedge(event, "bybit")
+
+
+class TestOrphanHedgeIncidentRegression(_OrphanHedgeBaseTest):
+    """Replays the 2026-05-16 07:13:21Z scenario shape.
+
+    Cancel-gate killed the executor BEFORE its place→fill→hedge cycle
+    completed. The fill landed 30 s later on a dead executor; with
+    inventory_audit at 10s polling, a 7 s gap of unhedged exposure
+    accumulated R$0.089 of book-drift slippage. This test pins the new
+    invariant: a maker-side fill arriving in this shape produces an
+    immediate MARKET hedge on the taker (cross-exchange), independent
+    of audit cadence.
+    """
+
+    def test_fill_after_executor_terminated_triggers_immediate_hedge(self):
+        dead_owner = self._make_info(
+            "SBCBL651ea10811f1ba", is_done=True
+        )
+        self._install_executors_info([dead_owner])
+        taker = self._mock_taker_connector(buy_id="BBN_HEDGE_BUY_42")
+        event = self._fill_event(
+            "SBCBL651ea10811f1ba",
+            side=TradeType.SELL,
+            amount=Decimal("0.0002"),
+        )
+        self.controller._maybe_dispatch_orphan_hedge(event, "bybit")
+        # MARKET BUY on taker for full maker amount
+        taker.buy.assert_called_once()
+        self.assertEqual(taker.buy.call_args.args[1], Decimal("0.0002"))
+        self.assertEqual(taker.buy.call_args.args[2], OrderType.MARKET)
+

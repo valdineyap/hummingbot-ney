@@ -120,15 +120,20 @@ class XEMMLeadLagExecutor(XEMMExecutor):
             self.stop()
 
     def get_custom_info(self) -> dict:
-        """Extend base custom_info with lead-lag snapshot at placement.
+        """Extend base custom_info with lead-lag snapshot + maker order id.
 
-        Adds two fields:
+        Adds:
           * ``lead_mode_at_placement`` — "favours" | "neutral" | "opposes",
             reflecting how the lead-lag signal classified the maker side
             at the moment of the LAST placement. Last-write-wins across
             replaces in a single executor cycle.
           * ``lead_bps_at_placement`` — the raw signed bps value of the
             lead signal at that placement.
+          * ``maker_order_id`` — current maker ``client_order_id`` (or
+            None). Consumed by the controller's orphan-fill listener
+            (``_find_live_executor_owning_maker``) to decide whether a
+            maker fill has a live owner that will hedge, or whether the
+            controller should dispatch a fallback MARKET on the taker.
 
         Surfaced via custom_info so the controller's TradeLedger picks them
         up at executor close and writes them onto the ``kind=trade`` record
@@ -138,6 +143,9 @@ class XEMMLeadLagExecutor(XEMMExecutor):
         info = super().get_custom_info()
         info["lead_mode_at_placement"] = self._lead_mode_at_placement
         info["lead_bps_at_placement"] = self._lead_bps_at_placement
+        info["maker_order_id"] = (
+            self.maker_order.order_id if self.maker_order is not None else None
+        )
         return info
 
     async def control_shutdown_process(self):

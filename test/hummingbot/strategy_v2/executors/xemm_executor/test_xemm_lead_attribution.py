@@ -17,13 +17,11 @@ propagate. ``create_maker_order``'s price-calculation path has its own
 test file; we don't re-test it.
 """
 
-import asyncio
 import json
 import os
 import tempfile
 import unittest
 from decimal import Decimal
-from unittest.mock import MagicMock
 
 from hummingbot.strategy_v2.executors.xemm_executor.xemm_lead_lag_executor import (
     XEMMLeadLagExecutor,
@@ -36,6 +34,8 @@ def _make_executor() -> XEMMLeadLagExecutor:
     ex._hedged_maker_order_ids = set()
     ex._lead_mode_at_placement = None
     ex._lead_bps_at_placement = None
+    # Read by get_custom_info to surface maker_order_id to the controller.
+    ex.maker_order = None
     return ex
 
 
@@ -87,6 +87,22 @@ class GetCustomInfoSurfacesLeadTest(unittest.TestCase):
         info = ex.get_custom_info()
         self.assertEqual(info["lead_mode_at_placement"], "favours")
         self.assertEqual(info["lead_bps_at_placement"], Decimal("5.43"))
+
+    def test_maker_order_id_surfaced_when_set(self):
+        """``maker_order_id`` in custom_info lets the controller find the
+        live executor that owns a maker fill (orphan-hedge detection)."""
+        ex = _make_executor()
+        maker = type("Tracked", (), {"order_id": "MAKER-XYZ"})()
+        ex.maker_order = maker
+        self._patch_super_custom_info(ex, {})
+        info = ex.get_custom_info()
+        self.assertEqual(info["maker_order_id"], "MAKER-XYZ")
+
+    def test_maker_order_id_is_none_when_unset(self):
+        ex = _make_executor()  # maker_order = None
+        self._patch_super_custom_info(ex, {})
+        info = ex.get_custom_info()
+        self.assertIsNone(info["maker_order_id"])
 
     def test_lead_fields_are_last_write_wins(self):
         """If a single executor places twice (cancel + replace), the snapshot

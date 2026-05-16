@@ -978,6 +978,22 @@ class XEMMLeadLagController(ControllerBase):
                         self.logger().warning(
                             f"[trade_ledger] record_raw_fill failed: {type(e).__name__}: {e}"
                         )
+                # Orphan-fill detection: maker-side fill with NO live
+                # executor owner. Replaces inventory_audit as the primary
+                # fallback path (audit polls every 10s; this fires within
+                # ms). See 2026-05-16 07:13:21 incident: cancel-gate killed
+                # the executor 30s before fill landed, audit only caught
+                # the drift 7s later, MARKET unwind cost R$0.089 to book
+                # drift in between. The controller-level listener fires
+                # synchronously on every maker fill so the hedge dispatch
+                # depends on nothing but Hummingbot's event fan-out.
+                if _src == self.config.maker_connector:
+                    try:
+                        self._maybe_dispatch_orphan_hedge(event, _src)
+                    except Exception as e:
+                        self.logger().warning(
+                            f"[orphan_hedge] handler raised: {type(e).__name__}: {e}"
+                        )
             forwarder = SourceInfoEventForwarder(_on_fill)
             conn.add_listener(MarketEvent.OrderFilled, forwarder)
             self._ledger_fill_forwarders[conn_name] = forwarder
@@ -1605,6 +1621,140 @@ class XEMMLeadLagController(ControllerBase):
             return Decimal(str(value)) if value is not None else Decimal("0")
         except Exception:
             return Decimal("0")
+
+    # ------------------------------------------------------------------ #
+    # Orphan-fill hedge dispatch                                         #
+    # ------------------------------------------------------------------ #
+    # Decouples fill→hedge from the executor lifecycle. The XEMM executor
+    # owns the normal cycle (place maker → wait fill → place taker), but
+    # if the executor is terminated before its ``process_order_completed_event``
+    # handler can fire (cancel gate, audit barrier, crash, etc), a maker
+    # fill arrives with nobody on call to hedge it. Before this code, the
+    # only path that caught such fills was the periodic ``inventory_audit``
+    # — 10s polling cadence, ~7s avg latency.
+    #
+    # Mechanics: ``_on_fill`` runs synchronously on every OrderFilled event
+    # from any connector. For maker-side fills, we look up the live
+    # executor that owns the maker order_id. If found and not terminated,
+    # we trust it to hedge (its handler runs immediately after ours, same
+    # event fan-out). If no live owner exists, we dispatch the MARKET
+    # taker hedge here directly — same direction and amount the executor
+    # would have placed.
+    #
+    # Dispatch is unconditionally on the taker connector (no
+    # ``_choose_rebalance_exchange`` here): an orphan maker fill is a
+    # broken XEMM cycle, and the structural answer is the cross-exchange
+    # hedge that completes it. Audit's exchange-choice heuristic is for
+    # generic drift reconciliation, a different concern.
+
+    def _find_live_executor_owning_maker(self, order_id: Optional[str]):
+        """Return the live executor info whose maker_order has this id.
+
+        "Live" = ``info.is_done`` is False. A live executor will receive
+        the same OrderFilled event in the same dispatch fan-out (its
+        listener is registered after the controller's) and place the
+        taker hedge on its own. We skip orphan dispatch when one exists.
+
+        Uses ``self.executors_info`` (snapshot refreshed per-tick by
+        ``StrategyV2Base.update_executors_info``). The ``maker_order_id``
+        is surfaced via ``XEMMLeadLagExecutor.get_custom_info`` into the
+        snapshot's ``custom_info`` dict. Controllers don't have a direct
+        reference to the orchestrator's live executor map, so the snapshot
+        is the supported public API.
+
+        Returns None if no live executor owns this order_id — caller
+        should dispatch the orphan hedge.
+
+        Staleness note: the snapshot lags real state by up to one tick
+        (~1s). For maker LIMIT_MAKER orders, resting on the book takes
+        at least one tick before any fill can land, so staleness is not
+        a problem in practice. For the cancel-replace race window (executor
+        already moved to a new maker order before the old one's fill
+        arrives), neither this nor the live-orchestrator approach helps
+        cleanly — inventory_audit remains the 10s catch-all.
+        """
+        if not order_id:
+            return None
+        for info in (self.executors_info or []):
+            try:
+                if info.is_done:
+                    continue
+                ci = getattr(info, "custom_info", None) or {}
+                if ci.get("maker_order_id") == order_id:
+                    return info
+            except Exception:
+                continue
+        return None
+
+    def _maybe_dispatch_orphan_hedge(self, event, source_connector: str) -> None:
+        """Fire a MARKET taker hedge if this maker fill has no live owner.
+
+        Called from ``_on_fill`` synchronously when an OrderFilled event
+        fires on the maker connector. Returns silently when:
+          * a live executor owns the order_id (it will hedge),
+          * the event payload is malformed (no order_id / non-positive amount),
+          * the taker connector cannot be resolved (logs ERROR; audit
+            remains as a slower fallback).
+        """
+        order_id = getattr(event, "order_id", None)
+        if not order_id:
+            return
+        if self._find_live_executor_owning_maker(order_id) is not None:
+            return  # alive executor will hedge in its own listener
+
+        # No live owner. Dispatch the cross-exchange MARKET hedge.
+        try:
+            amount = Decimal(str(getattr(event, "amount", 0)))
+        except Exception:
+            amount = Decimal("0")
+        if amount <= 0:
+            return
+
+        # Determine hedge side: maker fill side → opposite for taker.
+        maker_side = getattr(event, "trade_type", None)
+        if maker_side == TradeType.SELL:
+            hedge_side = TradeType.BUY
+        elif maker_side == TradeType.BUY:
+            hedge_side = TradeType.SELL
+        else:
+            self.logger().warning(
+                f"[orphan_hedge] {order_id}: unrecognised trade_type "
+                f"{maker_side!r} — skipping; inventory_audit will reconcile."
+            )
+            return
+
+        try:
+            taker_conn = self.market_data_provider.get_connector(
+                self.config.taker_connector
+            )
+        except Exception as e:
+            self.logger().error(
+                f"[orphan_hedge] {order_id}: cannot resolve taker connector "
+                f"{self.config.taker_connector}: {type(e).__name__}: {e}. "
+                f"inventory_audit will reconcile (worse PnL)."
+            )
+            return
+
+        pair = self.config.taker_trading_pair
+        try:
+            if hedge_side == TradeType.BUY:
+                hedge_id = taker_conn.buy(pair, amount, OrderType.MARKET, Decimal("0"))
+            else:
+                hedge_id = taker_conn.sell(pair, amount, OrderType.MARKET, Decimal("0"))
+            self.logger().warning(
+                f"[orphan_hedge] {order_id}: no live executor owned this maker "
+                f"fill on {source_connector} ({maker_side.name if hasattr(maker_side, 'name') else maker_side} "
+                f"{amount}) → MARKET {hedge_side.name} {hedge_id} on "
+                f"{self.config.taker_connector}/{pair}"
+            )
+            # Audit-suppression window is already set by _on_fill via
+            # _last_fill_time = time.time() above; no need to re-touch.
+        except Exception as e:
+            self.logger().error(
+                f"[orphan_hedge] {order_id}: failed to place taker hedge "
+                f"({hedge_side.name} {amount} on {self.config.taker_connector}): "
+                f"{type(e).__name__}: {e}. inventory_audit will reconcile."
+            )
 
     # ------------------------------------------------------------------ #
     # Inventory audit (state-based reconciliation)                       #
