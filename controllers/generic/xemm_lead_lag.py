@@ -1626,12 +1626,30 @@ class XEMMLeadLagController(ControllerBase):
     # Orphan-fill hedge dispatch                                         #
     # ------------------------------------------------------------------ #
     # Decouples fill→hedge from the executor lifecycle. The XEMM executor
-    # owns the normal cycle (place maker → wait fill → place taker), but
-    # if the executor is terminated before its ``process_order_completed_event``
-    # handler can fire (cancel gate, audit barrier, crash, etc), a maker
-    # fill arrives with nobody on call to hedge it. Before this code, the
-    # only path that caught such fills was the periodic ``inventory_audit``
-    # — 10s polling cadence, ~7s avg latency.
+    # owns the normal cycle (place maker → wait fill → place taker). In
+    # the normal path, fill data arrives synchronously with the order
+    # event (and, for cancels, synchronously with the cancel REST response
+    # via ``_try_emit_fill_from_cancel_response`` in the BitPreco
+    # connector) — so a live executor that still has its event listeners
+    # registered will hedge correctly without any controller-level help.
+    #
+    # This mechanism handles the cases where the executor is NOT around
+    # to receive the fill event:
+    #
+    #   1. ``early_stop`` tore the executor down (status=TERMINATED,
+    #      listeners unregistered) before the cancel REST returned with
+    #      ``exec_amount > 0`` or ``CANT_CANCEL_FILLED_ORDER``. The
+    #      executor scheduled the cancel and called ``stop()`` immediately;
+    #      by the time the connector emits OrderFilled+OrderCompleted,
+    #      the executor's listeners are gone.
+    #   2. Bot crash/restart with a maker order still on the book — fills
+    #      arrive in a process that has no live executor for that id.
+    #   3. Defense in depth for any future bug that prevents the normal
+    #      executor.process_order_completed_event path from firing.
+    #
+    # Prior to this code, the only fallback for cases 1-3 was the periodic
+    # ``inventory_audit`` (10s polling cadence, ~7s avg latency). See the
+    # 2026-05-16 07:13:21Z incident.
     #
     # Mechanics: ``_on_fill`` runs synchronously on every OrderFilled event
     # from any connector. For maker-side fills, we look up the live
@@ -1665,13 +1683,24 @@ class XEMMLeadLagController(ControllerBase):
         Returns None if no live executor owns this order_id — caller
         should dispatch the orphan hedge.
 
-        Staleness note: the snapshot lags real state by up to one tick
-        (~1s). For maker LIMIT_MAKER orders, resting on the book takes
-        at least one tick before any fill can land, so staleness is not
-        a problem in practice. For the cancel-replace race window (executor
-        already moved to a new maker order before the old one's fill
-        arrives), neither this nor the live-orchestrator approach helps
-        cleanly — inventory_audit remains the 10s catch-all.
+        Snapshot freshness: ``executors_info`` lags real state by up to
+        one tick (~1s). This isn't a correctness concern for the cases
+        this mechanism targets:
+
+          * In the normal cancel-replace flow, the cancel REST response
+            carries the fill data synchronously (see
+            ``BitprecoExchange._try_emit_fill_from_cancel_response``);
+            the executor is still alive with ``maker_order=X`` when its
+            own listener fires, hedges, then transitions to
+            SHUTTING_DOWN. The replacement Y is only placed in a later
+            tick. Snapshot staleness is irrelevant — the executor's
+            in-process state handles the fill before any new order is
+            placed.
+
+          * The orphan cases (executor terminated, crash recovery) are
+            unambiguous from any snapshot age: the executor either
+            exists with matching maker_order_id (rare during teardown)
+            or it doesn't.
         """
         if not order_id:
             return None
