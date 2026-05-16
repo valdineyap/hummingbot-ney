@@ -553,6 +553,64 @@ class TestXEMMExecutor(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest):
         self.executor.early_stop()
         self.assertEqual(self.executor._status, RunnableStatus.TERMINATED)
 
+    def test_early_stop_cancels_pending_create_order(self):
+        """Regression: cancel-gate firing in the race window between
+        ``place_order`` return and ``BuyOrderCreated`` event must still
+        cancel the order.
+
+        Before 2026-05-16, ``early_stop`` only cancelled when
+        ``maker_order.order`` was set AND ``is_open``. During the 50–100 ms
+        race window after ``place_order`` returns the client_order_id but
+        before the connector emits the Created event, ``maker_order.order``
+        is None — the cancel was silently skipped and the order stayed on
+        the exchange book. Live incident at 07:13:21Z saw a gate fire 58 ms
+        after place, order filled 30 s later as an orphan, rebalance
+        panic-unwound at adverse price (loss R$0.089 per occurrence)."""
+        self.executor._status = RunnableStatus.RUNNING
+        # Simulate the race: order_id known, but underlying InFlightOrder
+        # not yet assigned (BuyOrderCreatedEvent hasn't fired).
+        tracked = TrackedOrder(order_id="OID-PENDING-1")
+        # Explicitly leave tracked._order = None
+        self.executor.maker_order = tracked
+        self.executor.early_stop()
+        # Cancel MUST have been dispatched despite order=None.
+        self.executor._strategy.cancel.assert_called_once_with(
+            self.executor.maker_connector,
+            self.executor.maker_trading_pair,
+            "OID-PENDING-1",
+        )
+        self.assertEqual(self.executor._status, RunnableStatus.TERMINATED)
+        self.assertEqual(self.executor.close_type, CloseType.EARLY_STOP)
+
+    def test_early_stop_skips_cancel_for_done_order(self):
+        """Already-done orders (FILLED / CANCELED / FAILED) should not
+        trigger a redundant cancel REST."""
+        self.executor._status = RunnableStatus.RUNNING
+        tracked = TrackedOrder(order_id="OID-DONE-1")
+        done_order = MagicMock(spec=InFlightOrder)
+        done_order.is_done = True
+        done_order.is_open = False
+        tracked.order = done_order
+        self.executor.maker_order = tracked
+        self.executor.early_stop()
+        self.executor._strategy.cancel.assert_not_called()
+        self.assertEqual(self.executor._status, RunnableStatus.TERMINATED)
+
+    def test_early_stop_no_maker_order_is_noop_cancel(self):
+        """No maker_order at all — no cancel attempt, just terminate."""
+        self.executor._status = RunnableStatus.RUNNING
+        self.executor.maker_order = None
+        self.executor.early_stop()
+        self.executor._strategy.cancel.assert_not_called()
+        self.assertEqual(self.executor._status, RunnableStatus.TERMINATED)
+
+    def test_early_stop_keep_position_sets_position_hold(self):
+        """``keep_position=True`` → CloseType.POSITION_HOLD."""
+        self.executor._status = RunnableStatus.RUNNING
+        self.executor.maker_order = None
+        self.executor.early_stop(keep_position=True)
+        self.assertEqual(self.executor.close_type, CloseType.POSITION_HOLD)
+
     def test_get_cum_fees_quote_not_executed(self):
         self.assertEqual(self.executor.get_cum_fees_quote(), Decimal('0'))
 

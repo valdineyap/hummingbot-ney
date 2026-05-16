@@ -570,9 +570,38 @@ class XEMMExecutor(ExecutorBase):
         }
 
     def early_stop(self, keep_position: bool = False):
-        if self.maker_order and self.maker_order.order and self.maker_order.order.is_open:
-            self.logger().info(f"Cancelling maker order {self.maker_order.order_id}.")
-            self._strategy.cancel(self.maker_connector, self.maker_trading_pair, self.maker_order.order_id)
+        # Cancel maker order whenever we have an order_id, regardless of
+        # whether the BuyOrderCreated/SellOrderCreated event has been
+        # observed yet. The previous gate (``self.maker_order.order`` set
+        # AND ``is_open``) missed the race window between ``place_order``
+        # returning the client_order_id synchronously and the Created event
+        # firing after the REST POST returns (~50–100 ms on BitPreco). A
+        # cancel-gate (LEAD_SIGNAL_STRONG / EVENT_LOOP_LAG / barrier) that
+        # fired in this window would skip the cancel and leave the maker
+        # alive on the exchange book — see 2026-05-16 07:13:21Z incident:
+        # gate fired 58 ms after place, order remained on book and filled
+        # 30 s later as an orphan, rebalance panic-unwound via MARKET on
+        # the same exchange at adverse price (loss = R$0.089 per orphan,
+        # 5 occurrences across 2 sessions).
+        #
+        # ``ExchangePyBase._execute_cancel`` awaits ``get_exchange_order_id()``
+        # before issuing the cancel REST, so calling cancel before the
+        # place REST has returned is safe — the cancel queues until the
+        # exchange_order_id is known. This mirrors the unconditional cancel
+        # pattern already used in ``control_update_maker_order``.
+        if self.maker_order and self.maker_order.order_id:
+            already_done = (
+                self.maker_order.order is not None
+                and self.maker_order.order.is_done
+            )
+            if not already_done:
+                state = "pending_create" if self.maker_order.order is None else "tracked"
+                self.logger().info(
+                    f"Cancelling maker order {self.maker_order.order_id} (state={state})."
+                )
+                self._strategy.cancel(
+                    self.maker_connector, self.maker_trading_pair, self.maker_order.order_id
+                )
         self.close_type = CloseType.POSITION_HOLD if keep_position else CloseType.EARLY_STOP
         self.stop()
 
