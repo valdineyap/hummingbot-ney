@@ -567,210 +567,6 @@ class TestXEMMLeadLagExecutor(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest
         self.assertEqual(self.executor.taker_order_side, TradeType.SELL)
 
     # ------------------------------------------------------------------ #
-    # Ghost fill guard tests (CANT_CANCEL_FILLED_ORDER race fix)           #
-    # ------------------------------------------------------------------ #
-
-    def test_ghost_fill_registered_on_cancel_with_zero_executed(self):
-        """process_order_canceled_event registers the order as a ghost fill
-        candidate when executed_amount_base == 0 (CANT_CANCEL_FILLED_ORDER race)."""
-        from hummingbot.strategy_v2.models.executors import TrackedOrder
-        from unittest.mock import MagicMock
-
-        maker_order_id = "MAKER-GHOST-1"
-        self.executor.maker_order = TrackedOrder(order_id=maker_order_id)
-        # order object with executed_amount_base == 0 (fill not yet registered)
-        mock_order = MagicMock()
-        mock_order.executed_amount_base = Decimal("0")
-        self.executor.maker_order.order = mock_order
-        self.executor.taker_order = None
-
-        cancel_event = MagicMock()
-        cancel_event.order_id = maker_order_id
-
-        with patch.object(self.executor.__class__.__bases__[0],
-                          "process_order_canceled_event"):
-            self.executor.process_order_canceled_event(0, MagicMock(), cancel_event)
-
-        self.assertIn(maker_order_id, self.executor._ghost_maker_order_ids)
-
-    def test_ghost_fill_not_registered_when_taker_already_set(self):
-        """If taker_order is already set, we never register a ghost fill."""
-        from hummingbot.strategy_v2.models.executors import TrackedOrder
-
-        maker_order_id = "MAKER-DONE-1"
-        self.executor.maker_order = TrackedOrder(order_id=maker_order_id)
-        mock_order = MagicMock()
-        mock_order.executed_amount_base = Decimal("0")
-        self.executor.maker_order.order = mock_order
-        self.executor.taker_order = TrackedOrder(order_id="TAKER-ALREADY-SET")
-
-        cancel_event = MagicMock()
-        cancel_event.order_id = maker_order_id
-
-        with patch.object(self.executor.__class__.__bases__[0],
-                          "process_order_canceled_event"):
-            self.executor.process_order_canceled_event(0, MagicMock(), cancel_event)
-
-        self.assertNotIn(maker_order_id, self.executor._ghost_maker_order_ids)
-
-    def test_ghost_fill_completed_places_taker_hedge(self):
-        """process_order_completed_event places a taker hedge when a ghost fill
-        order completes — bypassing the executor's state machine."""
-        from unittest.mock import MagicMock, patch
-
-        ghost_order_id = "MAKER-GHOST-2"
-        self.executor._ghost_maker_order_ids.add(ghost_order_id)
-        self.executor.taker_order = None
-
-        completed_event = MagicMock()
-        completed_event.order_id = ghost_order_id
-        completed_event.base_asset_amount = Decimal("0.0002")
-
-        placed_ids = []
-
-        def _place(connector_name, trading_pair, order_type, side, amount, **kw):
-            placed_ids.append(f"{connector_name}-{side.name}-{amount}")
-            return f"TAKER-GHOST-{len(placed_ids)}"
-
-        with patch.object(self.executor, "place_order", side_effect=_place), \
-             patch.object(self.executor, "_touch_controller_last_fill_time"):
-            self.executor.process_order_completed_event(0, MagicMock(), completed_event)
-
-        # Hedge placed on taker connector
-        self.assertEqual(len(placed_ids), 1)
-        self.assertIn("binance", placed_ids[0])
-        self.assertIn("SELL", placed_ids[0])
-        # Ghost id removed from registry
-        self.assertNotIn(ghost_order_id, self.executor._ghost_maker_order_ids)
-        # Executor's taker_order NOT overwritten (state machine preserved)
-        self.assertIsNone(self.executor.taker_order)
-
-    def test_ghost_fill_completed_skips_if_taker_already_set(self):
-        """If taker_order is already set when the ghost complete arrives,
-        we skip the hedge to avoid double-hedging."""
-        from hummingbot.strategy_v2.models.executors import TrackedOrder
-
-        ghost_order_id = "MAKER-GHOST-3"
-        self.executor._ghost_maker_order_ids.add(ghost_order_id)
-        self.executor.taker_order = TrackedOrder(order_id="TAKER-ALREADY-PLACED")
-
-        completed_event = MagicMock()
-        completed_event.order_id = ghost_order_id
-        completed_event.base_asset_amount = Decimal("0.0002")
-
-        with patch.object(self.executor, "place_order") as mock_place:
-            self.executor.process_order_completed_event(0, MagicMock(), completed_event)
-
-        mock_place.assert_not_called()
-
-    def test_ghost_fill_touch_controller_last_fill_time(self):
-        """_touch_controller_last_fill_time updates the controller attribute.
-
-        We inject controllers directly onto the executor's strategy object
-        (bypassing spec restrictions) so the accessor finds the mock.
-        """
-        import time
-        mock_ctrl = MagicMock()
-        mock_ctrl._last_fill_time = 0.0
-        # Inject controllers directly — MagicMock(spec=) blocks normal attribute
-        # assignment for instance-only attributes, so we use object.__setattr__.
-        object.__setattr__(self.executor._strategy, "controllers", {"main": mock_ctrl})
-
-        before = time.time()
-        self.executor._touch_controller_last_fill_time()
-        after = time.time()
-
-        self.assertGreaterEqual(mock_ctrl._last_fill_time, before)
-        self.assertLessEqual(mock_ctrl._last_fill_time, after)
-
-    def test_cancel_event_calls_controller_register_ghost_order(self):
-        """When a maker order is cancelled with executed=0, the executor
-        must ALSO notify the controller so the controller's fill listener
-        can hedge late fills even after the executor terminates.
-
-        This is the P0 fix from 2026-05-11 — losing 3 maker fills in 25 min
-        because the local _ghost_maker_order_ids set died with the executor."""
-        from hummingbot.strategy_v2.models.executors import TrackedOrder
-
-        maker_order_id = "MAKER-CTRL-GHOST-1"
-        self.executor.maker_order = TrackedOrder(order_id=maker_order_id)
-        mock_order = MagicMock()
-        mock_order.executed_amount_base = Decimal("0")
-        self.executor.maker_order.order = mock_order
-        self.executor.taker_order = None
-
-        # Inject a mock controller with a spy on register_ghost_order.
-        mock_ctrl = MagicMock()
-        mock_ctrl.register_ghost_order = MagicMock()
-        object.__setattr__(
-            self.executor._strategy, "controllers", {"main": mock_ctrl}
-        )
-
-        cancel_event = MagicMock()
-        cancel_event.order_id = maker_order_id
-
-        with patch.object(self.executor.__class__.__bases__[0],
-                          "process_order_canceled_event"):
-            self.executor.process_order_canceled_event(0, MagicMock(), cancel_event)
-
-        mock_ctrl.register_ghost_order.assert_called_once()
-        kwargs = mock_ctrl.register_ghost_order.call_args.kwargs
-        self.assertEqual(kwargs["order_id"], maker_order_id)
-        # maker_side from the executor config (defaults to BUY in test setUp).
-        self.assertEqual(kwargs["maker_side"], self.executor.config.maker_side)
-        self.assertEqual(kwargs["maker_connector"], self.executor.maker_connector)
-
-    def test_cancel_event_register_does_not_raise_if_controller_unreachable(self):
-        """If the strategy has no controllers attached, register_ghost_order
-        must fail soft (warning) so the executor-local fallback still works."""
-        from hummingbot.strategy_v2.models.executors import TrackedOrder
-
-        maker_order_id = "MAKER-CTRL-GHOST-NOCTRL"
-        self.executor.maker_order = TrackedOrder(order_id=maker_order_id)
-        mock_order = MagicMock()
-        mock_order.executed_amount_base = Decimal("0")
-        self.executor.maker_order.order = mock_order
-        self.executor.taker_order = None
-
-        # No controllers on strategy.
-        object.__setattr__(self.executor._strategy, "controllers", {})
-
-        cancel_event = MagicMock()
-        cancel_event.order_id = maker_order_id
-
-        # Should not raise.
-        with patch.object(self.executor.__class__.__bases__[0],
-                          "process_order_canceled_event"):
-            self.executor.process_order_canceled_event(0, MagicMock(), cancel_event)
-
-        # Local fallback still works.
-        self.assertIn(maker_order_id, self.executor._ghost_maker_order_ids)
-
-    def test_ghost_fill_completed_calls_mark_hedged_after_place(self):
-        """When the executor places the taker hedge for a ghost fill, it
-        notifies the controller so the controller's listener skips a
-        duplicate hedge attempt on the same underlying event."""
-        ghost_order_id = "MAKER-CTRL-GHOST-DEDUP"
-        self.executor._ghost_maker_order_ids.add(ghost_order_id)
-        self.executor.taker_order = None
-
-        mock_ctrl = MagicMock()
-        mock_ctrl.mark_ghost_hedged = MagicMock()
-        object.__setattr__(
-            self.executor._strategy, "controllers", {"main": mock_ctrl}
-        )
-
-        completed_event = MagicMock()
-        completed_event.order_id = ghost_order_id
-        completed_event.base_asset_amount = Decimal("0.0002")
-
-        with patch.object(self.executor, "place_order", return_value="T-1"), \
-             patch.object(self.executor, "_touch_controller_last_fill_time"):
-            self.executor.process_order_completed_event(0, MagicMock(), completed_event)
-
-        mock_ctrl.mark_ghost_hedged.assert_called_once_with(ghost_order_id)
-
-    # ------------------------------------------------------------------ #
     # Reconcile-hedge tests (REST-reconciled fill before event arrives)    #
     # ------------------------------------------------------------------ #
 
@@ -810,8 +606,8 @@ class TestXEMMLeadLagExecutor(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest
         self.assertEqual(connector, "binance")
         self.assertEqual(side_name, "SELL")
         self.assertEqual(amount, Decimal("0.0002"))
-        # Order id registered in ghost set so the delayed event no-ops
-        self.assertIn(maker_order_id, self.executor._ghost_maker_order_ids)
+        # Order id registered in dedup set so the delayed completed-event no-ops
+        self.assertIn(maker_order_id, self.executor._hedged_maker_order_ids)
         # Audit suppression window activated
         mock_touch.assert_called_once()
         # Status transitioned to SHUTTING_DOWN (matches base flow after hedge)
@@ -870,3 +666,51 @@ class TestXEMMLeadLagExecutor(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest
             await self.executor.control_maker_order()
 
         mock_base.assert_awaited_once()
+
+    # ------------------------------------------------------------------ #
+    # Reconcile-hedge anti-double-hedge on delayed completed event       #
+    # ------------------------------------------------------------------ #
+
+    def test_completed_event_dedup_after_reconcile_hedge(self):
+        """Regression: when the reconcile-hedge path has already placed the
+        taker for a maker order and registered the id in
+        ``_hedged_maker_order_ids``, the delayed
+        ``BuyOrderCompletedEvent`` / ``SellOrderCompletedEvent`` must NOT
+        trigger a duplicate ``place_taker_order()`` via the base handler."""
+        from hummingbot.strategy_v2.models.executors import TrackedOrder
+
+        order_id = "MAKER-RECONCILED"
+        self.executor._hedged_maker_order_ids.add(order_id)
+        # Reconcile path already placed taker_order.
+        self.executor.taker_order = TrackedOrder(order_id="TAKER-RECONCILE-HEDGE")
+
+        event = MagicMock()
+        event.order_id = order_id
+        event.base_asset_amount = Decimal("0.0002")
+
+        # Spy on the base class' method to assert it is NOT called.
+        with patch.object(
+            self.executor.__class__.__bases__[0],
+            "process_order_completed_event",
+        ) as mock_base:
+            self.executor.process_order_completed_event(0, MagicMock(), event)
+
+        mock_base.assert_not_called()
+        # The id is consumed once the dedup hits.
+        self.assertNotIn(order_id, self.executor._hedged_maker_order_ids)
+        # Executor transitions to SHUTTING_DOWN so the cycle still closes.
+        self.assertEqual(self.executor._status, RunnableStatus.SHUTTING_DOWN)
+
+    def test_completed_event_falls_through_to_base_when_not_in_dedup_set(self):
+        """For a normal completed event (no reconcile-hedge race), the base
+        handler must run as usual."""
+        event = MagicMock()
+        event.order_id = "MAKER-NORMAL"
+
+        with patch.object(
+            self.executor.__class__.__bases__[0],
+            "process_order_completed_event",
+        ) as mock_base:
+            self.executor.process_order_completed_event(0, MagicMock(), event)
+
+        mock_base.assert_called_once()

@@ -40,13 +40,26 @@ class XEMMLeadLagExecutor(XEMMExecutor):
 
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
-        # Ghost fill guard: maker order IDs that were 'cancelled' with
-        # executed_amount_base == 0.  BitPreco's CANT_CANCEL_FILLED_ORDER
-        # response causes the connector to fire OrderCancelledEvent BEFORE
-        # the WS fill event arrives (up to 20 s later).  We register the
-        # order_id here so process_order_completed_event can detect and hedge
-        # the fill when the event finally lands.
-        self._ghost_maker_order_ids: set = set()
+        # Anti-double-hedge sentinel set. Populated by the reconcile-hedge
+        # path in ``control_maker_order`` when a REST-detected fill is
+        # hedged synchronously, BEFORE the corresponding WS
+        # ``BuyOrderCompletedEvent`` / ``SellOrderCompletedEvent`` arrives.
+        # ``process_order_completed_event`` consults this set to skip a
+        # duplicate ``place_taker_order()`` call when the delayed WS event
+        # eventually lands for an order we already hedged via reconcile.
+        # Cleared on consumption.
+        #
+        # Previously this set was named after BitPreco's
+        # CANT_CANCEL_FILLED_ORDER "ghost fill" race and was paired with a
+        # controller-level mechanism (``_pending_ghost_orders``,
+        # ``register_ghost_order``, ``_handle_ghost_fill_event``). That
+        # controller-level path was removed 2026-05-16 after empirical data
+        # showed 0 hits in 1746 cancel-with-executed=0 opportunities — the
+        # race no longer materialises with current BitPreco REST + Redis
+        # shadow timings. The local dedup remains because the reconcile-
+        # hedge path can still produce the duplicate event scenario, which
+        # is a different race.
+        self._hedged_maker_order_ids: set = set()
         # Lead-lag signal snapshot taken at the last maker placement. Used
         # by ``get_custom_info`` to surface the value to the controller's
         # TradeLedger, which then persists it on the kind=trade record.
@@ -207,10 +220,10 @@ class XEMMLeadLagExecutor(XEMMExecutor):
         vs. the proper cross-exchange hedge that would have made ~+0.025 BRL.
 
         Anti-double-hedge: the order_id is registered in
-        ``_ghost_maker_order_ids`` here, so when the delayed
-        OrderCompletedEvent arrives later, the ghost path in
-        ``process_order_completed_event`` sees ``taker_order is not None``
-        and skips with a warning instead of placing a second hedge.
+        ``_hedged_maker_order_ids`` here, so when the delayed
+        OrderCompletedEvent arrives later, ``process_order_completed_event``
+        sees the id in the set (and ``taker_order is not None``) and skips
+        placing a second hedge.
         """
         if (self.maker_order is not None
                 and self.maker_order.order is not None
@@ -226,7 +239,7 @@ class XEMMLeadLagExecutor(XEMMExecutor):
                     f"before base clears maker_order."
                 )
                 # Anti-double-hedge: register so the delayed event no-ops.
-                self._ghost_maker_order_ids.add(order_id)
+                self._hedged_maker_order_ids.add(order_id)
                 # Activate audit's 10s inflight window — avoids double action
                 # from inventory_audit while the taker MARKET is settling.
                 self._touch_controller_last_fill_time()
@@ -235,18 +248,6 @@ class XEMMLeadLagExecutor(XEMMExecutor):
                     # Match base's flow after place_taker_order: transition
                     # so the next tick goes through control_shutdown_process.
                     self._status = RunnableStatus.SHUTTING_DOWN
-                    # Defensive controller dedup. Normally the order_id is
-                    # not in the controller's pending dict at this point
-                    # (that path only registers on cancel-with-executed=0,
-                    # whereas here executed > 0), but if the cancel event
-                    # ran first this same tick it might have registered —
-                    # tell the controller we own this hedge.
-                    ctrl = self._get_controller()
-                    if ctrl is not None:
-                        try:
-                            ctrl.mark_ghost_hedged(order_id)
-                        except Exception:
-                            pass
                 except Exception as e:
                     self.logger().error(
                         f"[reconcile_hedge] place_taker_order failed for "
@@ -257,160 +258,35 @@ class XEMMLeadLagExecutor(XEMMExecutor):
         await super().control_maker_order()
 
     # ------------------------------------------------------------------
-    # Ghost fill guard — BitPreco CANT_CANCEL_FILLED_ORDER race fix
+    # Reconcile-hedge anti-double-hedge
     # ------------------------------------------------------------------
-
-    def process_order_canceled_event(self, event_tag: int, market, event):
-        """Override: register maker orders that may have filled while in-flight.
-
-        BitPreco's cancel API returns ``CANT_CANCEL_FILLED_ORDER`` when the
-        order matched right before the cancel arrived.  The connector maps
-        this to ``return True`` (order is gone), which fires
-        ``OrderCancelledEvent`` before the WS fill event arrives (typically
-        5–20 s later).  The base class then reads ``executed_amount_base``
-        which is still 0 at that moment and concludes "no fill, no hedge".
-
-        We register the order_id here so that when the delayed
-        ``BuyOrderCompletedEvent`` / ``SellOrderCompletedEvent`` eventually
-        arrives, ``process_order_completed_event`` below can detect and hedge
-        the ghost fill.
-        """
-        # Unconditional trace so we can confirm in prod whether the handler
-        # is wired to the BitPreco cancel path. Audit 2026-05-11 showed 2x
-        # CANT_CANCEL_FILLED_ORDER events with 0 `[ghost_guard]` log lines,
-        # suggesting the handler may never have been invoked. Keep this at
-        # debug level to avoid log spam from normal cancels.
-        self.logger().debug(
-            f"[ghost_guard] process_order_canceled_event called: "
-            f"order_id={getattr(event, 'order_id', None)} "
-            f"maker_order_id={self.maker_order.order_id if self.maker_order else None} "
-            f"taker_order={'set' if self.taker_order else 'None'}"
-        )
-        if (self.maker_order
-                and event.order_id == self.maker_order.order_id
-                and self.taker_order is None):
-            executed = Decimal("0")
-            if self.maker_order.order is not None:
-                executed = self.maker_order.order.executed_amount_base or Decimal("0")
-            if executed <= 0:
-                self._ghost_maker_order_ids.add(event.order_id)
-                self.logger().info(
-                    f"[ghost_guard] Maker order {event.order_id} registered as "
-                    f"potential ghost fill (cancelled with executed=0)."
-                )
-                # Also register at the controller. This executor instance
-                # almost certainly terminates before any delayed fill event
-                # arrives (5–30 s window on BitPreco) — the controller lives
-                # across cycles and its own fill listener will place the
-                # taker hedge if the late event lands.
-                ctrl = self._get_controller()
-                if ctrl is not None:
-                    try:
-                        ctrl.register_ghost_order(
-                            order_id=event.order_id,
-                            maker_side=self.config.maker_side,
-                            maker_connector=self.maker_connector,
-                        )
-                    except Exception as e:
-                        self.logger().warning(
-                            f"[ghost_guard] controller.register_ghost_order "
-                            f"failed: {type(e).__name__}: {e} (fall back to "
-                            f"executor-local handler if still alive)."
-                        )
-        super().process_order_canceled_event(event_tag, market, event)
-
     def process_order_completed_event(self, event_tag: int, market, event):
-        """Override: also handle ghost fills for the CANT_CANCEL_FILLED_ORDER race.
+        """Skip the base hedge when the reconcile-hedge path already placed
+        a taker for this order.
 
-        When a ``BuyOrderCompletedEvent`` / ``SellOrderCompletedEvent`` arrives
-        for an order already in ``_ghost_maker_order_ids``, the executor has
-        moved on to a new maker order so the normal check
-        ``self.maker_order.order_id == event.order_id`` fails.  We detect that
-        here and place the taker hedge directly — bypassing
-        ``place_taker_order()`` to avoid overwriting ``self.taker_order`` /
-        ``_status`` for the running cycle.
+        ``control_maker_order`` may synchronously place the taker hedge as
+        soon as the maker's REST poll reports ``executed > 0``, BEFORE the
+        WS ``BuyOrderCompletedEvent`` / ``SellOrderCompletedEvent`` arrives.
+        When the delayed WS event lands, base's
+        ``process_order_completed_event`` would call
+        ``place_taker_order()`` again unconditionally — double-hedge.
 
-        We also touch the controller's ``_last_fill_time`` which activates the
-        10-second inflight window in ``_has_inflight_activity()``, preventing
-        the inventory audit from double-hedging before our MARKET taker fills.
-        """
-        # Unconditional trace — same rationale as process_order_canceled_event.
-        # Helps verify in prod that completed events reach this handler when
-        # the order_id is in `_ghost_maker_order_ids` (i.e. arrived after the
-        # CANT_CANCEL_FILLED_ORDER race window).
-        self.logger().debug(
-            f"[ghost_guard] process_order_completed_event called: "
-            f"order_id={getattr(event, 'order_id', None)} "
-            f"in_ghost_set={getattr(event, 'order_id', None) in self._ghost_maker_order_ids} "
-            f"maker_order_id={self.maker_order.order_id if self.maker_order else None}"
-        )
-        # Normal path: event is for the current active maker order.
-        if self.maker_order and event.order_id == self.maker_order.order_id:
-            super().process_order_completed_event(event_tag, market, event)
+        We deduplicate by tracking order_ids in ``_hedged_maker_order_ids``
+        and short-circuiting here. Transition to ``SHUTTING_DOWN`` so the
+        executor still closes normally."""
+        order_id = getattr(event, "order_id", None)
+        if (order_id is not None
+                and order_id in self._hedged_maker_order_ids
+                and self.taker_order is not None):
+            self.logger().info(
+                f"[reconcile_hedge_dedup] Late OrderCompletedEvent for "
+                f"{order_id}: taker already hedged via reconcile path; "
+                f"skipping duplicate place_taker_order."
+            )
+            self._hedged_maker_order_ids.discard(order_id)
+            self._status = RunnableStatus.SHUTTING_DOWN
             return
-
-        # Ghost fill path: delayed complete for a previously 'cancelled' order.
-        if event.order_id not in self._ghost_maker_order_ids:
-            return
-
-        self._ghost_maker_order_ids.discard(event.order_id)
-
-        if self.taker_order is not None:
-            # Already hedged via the normal completed-event path or a prior
-            # ghost event — skip to avoid double-hedging.
-            self.logger().warning(
-                f"[ghost_fill] {event.order_id}: taker already set — "
-                f"skipping duplicate hedge."
-            )
-            return
-
-        amount = getattr(event, "base_asset_amount", Decimal("0")) or Decimal("0")
-        if amount <= 0:
-            self.logger().warning(
-                f"[ghost_fill] {event.order_id}: zero base_asset_amount — "
-                f"skipping (inventory_audit will reconcile if needed)."
-            )
-            return
-
-        self.logger().warning(
-            f"[ghost_fill] Late complete for maker order {event.order_id} "
-            f"({amount} base): placing taker hedge on {self.taker_connector} "
-            f"and suppressing inventory_audit for 10 s."
-        )
-
-        # Suppress the inventory_audit's auto_rebalance for 10 s so it does
-        # not double-hedge before our MARKET taker fills (< 1 s on Binance).
-        self._touch_controller_last_fill_time()
-
-        # Place the MARKET taker hedge directly — do NOT call
-        # place_taker_order() as that would set self.taker_order / SHUTTING_DOWN
-        # and terminate the current active maker cycle.
-        try:
-            order_id = self.place_order(
-                connector_name=self.taker_connector,
-                trading_pair=self.taker_trading_pair,
-                order_type=OrderType.MARKET,
-                side=self.taker_order_side,
-                amount=amount,
-            )
-            self.logger().warning(
-                f"[ghost_fill] Taker hedge placed: {order_id} "
-                f"MARKET {self.taker_order_side.name} {amount} {self.taker_trading_pair} "
-                f"on {self.taker_connector}."
-            )
-            # Tell the controller we've handled this order_id so its own
-            # fill-listener skips the late event (controller-level dedup).
-            ctrl = self._get_controller()
-            if ctrl is not None:
-                try:
-                    ctrl.mark_ghost_hedged(event.order_id)
-                except Exception:
-                    pass
-        except Exception as e:
-            self.logger().error(
-                f"[ghost_fill] Failed to place taker hedge for {event.order_id}: "
-                f"{type(e).__name__}: {e}. inventory_audit will reconcile."
-            )
+        super().process_order_completed_event(event_tag, market, event)
 
     def _get_controller(self):
         """Return the owning controller instance, or None if unreachable.
@@ -431,9 +307,10 @@ class XEMMLeadLagExecutor(XEMMExecutor):
     def _touch_controller_last_fill_time(self) -> None:
         """Update the owning controller's ``_last_fill_time`` to now.
 
-        This activates the 10-second inflight window in
+        Activates the 10-second inflight window in
         ``_has_inflight_activity()`` and prevents the inventory audit from
-        queuing an auto_rebalance while our ghost-fill taker hedge is settling.
+        queuing an auto_rebalance while our reconcile-hedge taker MARKET
+        is still settling.
         """
         ctrl = self._get_controller()
         if ctrl is None:
@@ -441,8 +318,8 @@ class XEMMLeadLagExecutor(XEMMExecutor):
         try:
             ctrl._last_fill_time = time.time()
             self.logger().info(
-                f"[ghost_fill] controller._last_fill_time updated "
-                f"(10 s audit-suppression window started)."
+                "[reconcile_hedge] controller._last_fill_time updated "
+                "(10 s audit-suppression window started)."
             )
         except Exception:
             pass  # best-effort; inventory_audit is the fallback

@@ -33,7 +33,7 @@ from hummingbot.strategy_v2.executors.xemm_executor.xemm_lead_lag_executor impor
 def _make_executor() -> XEMMLeadLagExecutor:
     ex = XEMMLeadLagExecutor.__new__(XEMMLeadLagExecutor)
     # Match the __init__ effects we care about.
-    ex._ghost_maker_order_ids = set()
+    ex._hedged_maker_order_ids = set()
     ex._lead_mode_at_placement = None
     ex._lead_bps_at_placement = None
     return ex
