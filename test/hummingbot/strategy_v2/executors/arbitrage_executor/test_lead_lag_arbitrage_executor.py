@@ -558,8 +558,11 @@ class TestLegExecutionOrder(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest):
     """Pin the leg-ordering behaviour of ``execute_arbitrage``:
     parallel, maker_first, taker_first.
 
-    Role-based (maker/taker) instead of exchange-specific so the
-    configuration stays valid when swapping connectors.
+    Fill-based semantics for ``maker_first`` / ``taker_first``: the 2nd
+    leg is only placed AFTER the 1st leg has any executed_amount > 0,
+    and is sized to that realized amount. If the 1st leg terminates
+    with zero fills, the executor closes with CloseType.EXPIRED and
+    no 2nd-leg placement.
     """
 
     def _make_executor(self, leg_order: str, buying: str, selling: str,
@@ -578,74 +581,98 @@ class TestLegExecutionOrder(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest):
             min_profitability=Decimal("0.0004"),
             arb_leg_execution_order=leg_order,
             arb_maker_leg_type="MARKET",  # don't entangle with aggressive-LIMIT in this test
+            arb_aggressive_limit_timeout_sec=0.05,  # short to keep tests fast
             maker_connector_name=maker_connector_name,
         )
         return LeadLagArbitrageExecutor(strategy, cfg, update_interval=0.5)
 
+    def _set_first_fill(self, wrapper, filled_amount: Decimal):
+        """Helper: stub a tracker wrapper so ``_wait_for_first_fill`` sees
+        the given executed_amount immediately."""
+        wrapper.order = MagicMock()
+        wrapper.order.executed_amount_base = filled_amount
+        wrapper.order.is_cancelled = False
+        wrapper.order.is_failure = False
+        wrapper.order.is_done = False
+        wrapper.order_id = "ORDER-ID-1"
+
     async def test_parallel_places_both_without_awaiting_between(self):
-        """parallel mode: both placements happen back-to-back, no ack wait."""
+        """parallel mode: both placements happen back-to-back, no fill wait."""
         ex = self._make_executor("parallel", "binance", "bitpreco")
         call_order = []
         with patch.object(ex, "place_buy_arbitrage_order",
                           side_effect=lambda: call_order.append("buy")):
             with patch.object(ex, "place_sell_arbitrage_order",
                               side_effect=lambda: call_order.append("sell")):
-                with patch.object(ex, "_wait_for_order_ack",
+                with patch.object(ex, "_wait_for_first_fill",
                                   new=AsyncMock()) as mock_wait:
                     await ex.execute_arbitrage()
         # Both called, in original order (buy first per base class semantics)
         self.assertEqual(call_order, ["buy", "sell"])
-        # No ack wait in parallel mode
         mock_wait.assert_not_called()
+        self.assertFalse(ex._fill_based_leg_ordering_active)
 
     async def test_maker_first_long_arb_places_sell_first(self):
         """LONG arb: buying=taker (binance), selling=maker (bitpreco).
-        ``maker_first`` → SELL (maker) first, await, then BUY (taker)."""
+        ``maker_first`` → SELL (maker) placed first, full fill, then BUY (taker)."""
         ex = self._make_executor("maker_first", "binance", "bitpreco",
                                  maker_connector_name="bitpreco")
         call_order = []
-        with patch.object(ex, "place_buy_arbitrage_order",
-                          side_effect=lambda: call_order.append("buy")):
-            with patch.object(ex, "place_sell_arbitrage_order",
-                              side_effect=lambda: call_order.append("sell")):
-                with patch.object(ex, "_wait_for_order_ack",
-                                  new=AsyncMock(return_value=True)) as mock_wait:
-                    await ex.execute_arbitrage()
-        # selling is on the maker (bitpreco) → sell first
+
+        def _on_buy():
+            call_order.append("buy")
+
+        def _on_sell():
+            call_order.append("sell")
+            # Maker leg fully fills on placement
+            self._set_first_fill(ex.sell_order, Decimal("0.0002"))
+
+        with patch.object(ex, "place_buy_arbitrage_order", side_effect=_on_buy):
+            with patch.object(ex, "place_sell_arbitrage_order", side_effect=_on_sell):
+                await ex.execute_arbitrage()
+
+        # selling is on the maker (bitpreco) → sell first, then buy
         self.assertEqual(call_order, ["sell", "buy"])
-        mock_wait.assert_awaited_once()
-        self.assertIs(mock_wait.await_args.args[0], ex.sell_order)
+        # Full fill → order_amount stays at original
+        self.assertEqual(ex.order_amount, Decimal("0.0002"))
+        self.assertTrue(ex._fill_based_leg_ordering_active)
 
     async def test_maker_first_short_arb_places_buy_first(self):
         """SHORT arb: buying=maker (bitpreco), selling=taker (binance).
-        ``maker_first`` → BUY (maker) first, await, then SELL (taker)."""
+        ``maker_first`` → BUY (maker) first, full fill, then SELL (taker)."""
         ex = self._make_executor("maker_first", "bitpreco", "binance",
                                  maker_connector_name="bitpreco")
         call_order = []
-        with patch.object(ex, "place_buy_arbitrage_order",
-                          side_effect=lambda: call_order.append("buy")):
-            with patch.object(ex, "place_sell_arbitrage_order",
-                              side_effect=lambda: call_order.append("sell")):
-                with patch.object(ex, "_wait_for_order_ack",
-                                  new=AsyncMock(return_value=True)) as mock_wait:
-                    await ex.execute_arbitrage()
+
+        def _on_buy():
+            call_order.append("buy")
+            self._set_first_fill(ex.buy_order, Decimal("0.0002"))
+
+        def _on_sell():
+            call_order.append("sell")
+
+        with patch.object(ex, "place_buy_arbitrage_order", side_effect=_on_buy):
+            with patch.object(ex, "place_sell_arbitrage_order", side_effect=_on_sell):
+                await ex.execute_arbitrage()
         self.assertEqual(call_order, ["buy", "sell"])
-        self.assertIs(mock_wait.await_args.args[0], ex.buy_order)
 
     async def test_taker_first_long_arb_places_buy_first(self):
-        """LONG arb: buying=taker. ``taker_first`` → BUY first."""
+        """LONG arb: buying=taker. ``taker_first`` → BUY (taker) first."""
         ex = self._make_executor("taker_first", "binance", "bitpreco",
                                  maker_connector_name="bitpreco")
         call_order = []
-        with patch.object(ex, "place_buy_arbitrage_order",
-                          side_effect=lambda: call_order.append("buy")):
-            with patch.object(ex, "place_sell_arbitrage_order",
-                              side_effect=lambda: call_order.append("sell")):
-                with patch.object(ex, "_wait_for_order_ack",
-                                  new=AsyncMock(return_value=True)) as mock_wait:
-                    await ex.execute_arbitrage()
+
+        def _on_buy():
+            call_order.append("buy")
+            self._set_first_fill(ex.buy_order, Decimal("0.0002"))
+
+        def _on_sell():
+            call_order.append("sell")
+
+        with patch.object(ex, "place_buy_arbitrage_order", side_effect=_on_buy):
+            with patch.object(ex, "place_sell_arbitrage_order", side_effect=_on_sell):
+                await ex.execute_arbitrage()
         self.assertEqual(call_order, ["buy", "sell"])
-        self.assertIs(mock_wait.await_args.args[0], ex.buy_order)
 
     async def test_works_with_arbitrary_exchange_names(self):
         """Role-based: maker/taker abstraction holds for any pair.
@@ -653,13 +680,18 @@ class TestLegExecutionOrder(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest):
         ex = self._make_executor("maker_first", "bybit", "kraken",
                                  maker_connector_name="kraken")
         call_order = []
-        with patch.object(ex, "place_buy_arbitrage_order",
-                          side_effect=lambda: call_order.append("buy")):
-            with patch.object(ex, "place_sell_arbitrage_order",
-                              side_effect=lambda: call_order.append("sell")):
-                with patch.object(ex, "_wait_for_order_ack",
-                                  new=AsyncMock(return_value=True)):
-                    await ex.execute_arbitrage()
+
+        def _on_buy():
+            call_order.append("buy")
+
+        def _on_sell():
+            call_order.append("sell")
+            # Selling market is kraken (maker) → sell_order is the first leg
+            self._set_first_fill(ex.sell_order, Decimal("0.0002"))
+
+        with patch.object(ex, "place_buy_arbitrage_order", side_effect=_on_buy):
+            with patch.object(ex, "place_sell_arbitrage_order", side_effect=_on_sell):
+                await ex.execute_arbitrage()
         # selling_market is on kraken (the maker) → sell first
         self.assertEqual(call_order, ["sell", "buy"])
 
@@ -675,10 +707,10 @@ class TestLegExecutionOrder(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest):
                           side_effect=lambda: call_order.append("buy")):
             with patch.object(ex, "place_sell_arbitrage_order",
                               side_effect=lambda: call_order.append("sell")):
-                with patch.object(ex, "_wait_for_order_ack",
+                with patch.object(ex, "_wait_for_first_fill",
                                   new=AsyncMock()) as mock_wait:
                     await ex.execute_arbitrage()
-        # Falls back to parallel — both placed, no await
+        # Falls back to parallel — both placed, no fill wait
         self.assertEqual(call_order, ["buy", "sell"])
         mock_wait.assert_not_called()
 
@@ -694,24 +726,242 @@ class TestLegExecutionOrder(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest):
                           side_effect=lambda: call_order.append("buy")):
             with patch.object(ex, "place_sell_arbitrage_order",
                               side_effect=lambda: call_order.append("sell")):
-                with patch.object(ex, "_wait_for_order_ack",
+                with patch.object(ex, "_wait_for_first_fill",
                                   new=AsyncMock()) as mock_wait:
                     await ex.execute_arbitrage()
         self.assertEqual(call_order, ["buy", "sell"])
         mock_wait.assert_not_called()
 
-    async def test_wait_for_order_ack_returns_true_when_exchange_id_assigned(self):
-        ex = self._make_executor("parallel", "binance", "bitpreco")
-        # Simulate the tracker registering with exchange_order_id immediately
-        ex.buy_order.order = MagicMock()
-        ex.buy_order.order.exchange_order_id = "EX-1234"
-        result = await ex._wait_for_order_ack(ex.buy_order, max_wait_sec=0.1)
-        self.assertTrue(result)
+    async def test_maker_first_zero_fill_closes_with_expired_no_taker(self):
+        """When the maker leg terminates with zero fills (e.g., watchdog
+        cancel at timeout), no taker leg is placed and the executor
+        closes with CloseType.EXPIRED."""
+        ex = self._make_executor("maker_first", "binance", "bitpreco",
+                                 maker_connector_name="bitpreco")
+        call_order = []
 
-    async def test_wait_for_order_ack_times_out_when_no_id_assigned(self):
+        def _on_buy():
+            call_order.append("buy")
+
+        def _on_sell():
+            call_order.append("sell")
+            # Maker leg registers but never fills; eventually marked cancelled
+            ex.sell_order.order = MagicMock()
+            ex.sell_order.order.executed_amount_base = Decimal("0")
+            ex.sell_order.order.is_cancelled = True
+            ex.sell_order.order.is_failure = False
+            ex.sell_order.order.is_done = False
+            ex.sell_order.order_id = "ORDER-ID-NOFILL"
+
+        with patch.object(ex, "place_buy_arbitrage_order", side_effect=_on_buy):
+            with patch.object(ex, "place_sell_arbitrage_order", side_effect=_on_sell):
+                with patch.object(ex, "stop") as mock_stop:
+                    await ex.execute_arbitrage()
+
+        # Only the maker leg was placed; taker leg never dispatched
+        self.assertEqual(call_order, ["sell"])
+        self.assertEqual(ex.close_type, CloseType.EXPIRED)
+        mock_stop.assert_called_once()
+
+    async def test_maker_first_partial_fill_cancels_and_resizes_taker(self):
+        """When the maker leg fills only partially, the executor cancels
+        the remaining open portion and dispatches the taker leg sized to
+        the realized executed_amount (not the original order_amount)."""
+        ex = self._make_executor("maker_first", "binance", "bitpreco",
+                                 maker_connector_name="bitpreco")
+        call_order = []
+
+        def _on_buy():
+            call_order.append(("buy", ex.order_amount))
+
+        def _on_sell():
+            call_order.append(("sell", ex.order_amount))
+            # Half-fill
+            self._set_first_fill(ex.sell_order, Decimal("0.0001"))
+
+        with patch.object(ex, "place_buy_arbitrage_order", side_effect=_on_buy):
+            with patch.object(ex, "place_sell_arbitrage_order", side_effect=_on_sell):
+                await ex.execute_arbitrage()
+
+        # Sell placed first at original full amount; buy placed second at the
+        # realized fill (0.0001) rather than the original 0.0002.
+        self.assertEqual(call_order[0], ("sell", Decimal("0.0002")))
+        self.assertEqual(call_order[1], ("buy", Decimal("0.0001")))
+        # Strategy.cancel was called on the partial maker leg
+        ex._strategy.cancel.assert_called_once()
+        cancel_kwargs = ex._strategy.cancel.call_args.kwargs
+        self.assertEqual(cancel_kwargs["order_id"], "ORDER-ID-1")
+        self.assertEqual(cancel_kwargs["connector_name"], "bitpreco")
+
+    async def test_wait_for_first_fill_returns_executed_amount(self):
+        ex = self._make_executor("parallel", "binance", "bitpreco")
+        ex.buy_order.order = MagicMock()
+        ex.buy_order.order.executed_amount_base = Decimal("0.00015")
+        ex.buy_order.order.is_cancelled = False
+        ex.buy_order.order.is_failure = False
+        ex.buy_order.order.is_done = False
+        result = await ex._wait_for_first_fill(ex.buy_order, timeout_sec=0.1)
+        self.assertEqual(result, Decimal("0.00015"))
+
+    async def test_wait_for_first_fill_returns_none_on_terminal_zero(self):
+        ex = self._make_executor("parallel", "binance", "bitpreco")
+        ex.buy_order.order = MagicMock()
+        ex.buy_order.order.executed_amount_base = Decimal("0")
+        ex.buy_order.order.is_cancelled = True
+        ex.buy_order.order.is_failure = False
+        ex.buy_order.order.is_done = False
+        result = await ex._wait_for_first_fill(ex.buy_order, timeout_sec=0.1)
+        self.assertIsNone(result)
+
+    async def test_wait_for_first_fill_returns_none_on_timeout(self):
         ex = self._make_executor("parallel", "binance", "bitpreco")
         ex.buy_order.order = None  # never registered
-        result = await ex._wait_for_order_ack(
-            ex.buy_order, max_wait_sec=0.05, poll_interval_sec=0.01
+        result = await ex._wait_for_first_fill(
+            ex.buy_order, timeout_sec=0.05, poll_interval_sec=0.01,
         )
-        self.assertFalse(result)
+        self.assertIsNone(result)
+
+
+class TestLegOrphanHedgeSuppression(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest):
+    """Regression cover for the 2026-05-18 19:01Z double-hedge incident.
+
+    Every leg the arb executor places must register the order_id with
+    the controller's `_self_dispatched_market_ids` so the controller's
+    orphan_hedge does NOT fire in parallel. Without this, a fill on the
+    maker leg triggers two MARKET hedges (one from the controller, one
+    from the executor's leg-2 dispatch), leaving the bot short on the
+    base asset.
+    """
+
+    def _make_executor(self, leg_order: str, buying: str, selling: str,
+                       maker_connector_name: str = "bitpreco"):
+        # Strategy mock exposes `.controllers` dict so the executor's
+        # _notify_controller_self_dispatched_market discovers it.
+        strategy = MagicMock(spec=StrategyV2Base)
+        type(strategy).market_info = PropertyMock(return_value=MagicMock())
+        strategy.connectors = {
+            buying: MagicMock(spec=ConnectorBase),
+            selling: MagicMock(spec=ConnectorBase),
+        }
+        ctrl = MagicMock()
+        ctrl.register_self_dispatched_market_id = MagicMock()
+        strategy.controllers = {"main": ctrl}
+        cfg = LeadLagArbitrageExecutorConfig(
+            timestamp=1234,
+            buying_market=ConnectorPair(connector_name=buying, trading_pair="BTC-BRL"),
+            selling_market=ConnectorPair(connector_name=selling, trading_pair="BTC-BRL"),
+            order_amount=Decimal("0.0002"),
+            min_profitability=Decimal("0.0004"),
+            arb_leg_execution_order=leg_order,
+            arb_maker_leg_type="MARKET",
+            arb_aggressive_limit_timeout_sec=0.05,
+            maker_connector_name=maker_connector_name,
+        )
+        ex = LeadLagArbitrageExecutor(strategy, cfg, update_interval=0.5)
+        return ex, ctrl
+
+    async def test_parallel_registers_both_leg_ids(self):
+        ex, ctrl = self._make_executor("parallel", "binance", "bitpreco")
+
+        def _on_buy():
+            ex.buy_order.order_id = "BUY-ID-1"
+
+        def _on_sell():
+            ex.sell_order.order_id = "SELL-ID-1"
+
+        with patch.object(ex, "place_buy_arbitrage_order", side_effect=_on_buy):
+            with patch.object(ex, "place_sell_arbitrage_order", side_effect=_on_sell):
+                await ex.execute_arbitrage()
+
+        registered = {
+            c.args[0]
+            for c in ctrl.register_self_dispatched_market_id.call_args_list
+        }
+        self.assertIn("BUY-ID-1", registered)
+        self.assertIn("SELL-ID-1", registered)
+
+    async def test_maker_first_registers_first_leg_id(self):
+        """LONG arb maker_first: maker (bitpreco) leg = SELL is placed first
+        and must have its order_id registered BEFORE the fill arrives,
+        suppressing controller orphan_hedge."""
+        ex, ctrl = self._make_executor(
+            "maker_first", "binance", "bitpreco", maker_connector_name="bitpreco"
+        )
+
+        def _on_sell():
+            ex.sell_order.order_id = "MAKER-LEG-1"
+            ex.sell_order.order = MagicMock()
+            ex.sell_order.order.executed_amount_base = Decimal("0.0002")
+            ex.sell_order.order.is_cancelled = False
+            ex.sell_order.order.is_failure = False
+            ex.sell_order.order.is_done = False
+
+        def _on_buy():
+            ex.buy_order.order_id = "TAKER-LEG-2"
+
+        with patch.object(ex, "place_buy_arbitrage_order", side_effect=_on_buy):
+            with patch.object(ex, "place_sell_arbitrage_order", side_effect=_on_sell):
+                await ex.execute_arbitrage()
+
+        registered = [
+            c.args[0]
+            for c in ctrl.register_self_dispatched_market_id.call_args_list
+        ]
+        # First leg (maker) MUST be registered. Without this the
+        # controller's orphan_hedge fires the moment the maker fill lands.
+        self.assertIn("MAKER-LEG-1", registered)
+
+    async def test_taker_first_registers_first_leg_id(self):
+        """taker_first: first leg is the taker side (buying on binance for
+        LONG arb). Even though orphan_hedge only fires on maker-side fills,
+        registering the first leg id is defensive and consistent."""
+        ex, ctrl = self._make_executor(
+            "taker_first", "binance", "bitpreco", maker_connector_name="bitpreco"
+        )
+
+        def _on_buy():
+            ex.buy_order.order_id = "TAKER-LEG-1"
+            ex.buy_order.order = MagicMock()
+            ex.buy_order.order.executed_amount_base = Decimal("0.0002")
+            ex.buy_order.order.is_cancelled = False
+            ex.buy_order.order.is_failure = False
+            ex.buy_order.order.is_done = False
+
+        def _on_sell():
+            ex.sell_order.order_id = "MAKER-LEG-2"
+
+        with patch.object(ex, "place_buy_arbitrage_order", side_effect=_on_buy):
+            with patch.object(ex, "place_sell_arbitrage_order", side_effect=_on_sell):
+                await ex.execute_arbitrage()
+
+        registered = [
+            c.args[0]
+            for c in ctrl.register_self_dispatched_market_id.call_args_list
+        ]
+        self.assertIn("TAKER-LEG-1", registered)
+
+    async def test_fallback_parallel_when_maker_unset_still_registers(self):
+        """When maker_connector_name is absent and we fall back to parallel,
+        BOTH legs must still be registered (we don't know which is the
+        maker, so register both — safe)."""
+        ex, ctrl = self._make_executor(
+            "maker_first", "binance", "bitpreco", maker_connector_name="bitpreco"
+        )
+        object.__setattr__(ex.config, "maker_connector_name", None)
+
+        def _on_buy():
+            ex.buy_order.order_id = "BUY-X"
+
+        def _on_sell():
+            ex.sell_order.order_id = "SELL-X"
+
+        with patch.object(ex, "place_buy_arbitrage_order", side_effect=_on_buy):
+            with patch.object(ex, "place_sell_arbitrage_order", side_effect=_on_sell):
+                await ex.execute_arbitrage()
+
+        registered = {
+            c.args[0]
+            for c in ctrl.register_self_dispatched_market_id.call_args_list
+        }
+        self.assertIn("BUY-X", registered)
+        self.assertIn("SELL-X", registered)

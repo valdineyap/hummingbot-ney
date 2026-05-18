@@ -14,6 +14,13 @@ class XEMMExecutorConfig(ExecutorConfigBase):
     min_profitability: Decimal
     target_profitability: Decimal
     max_profitability: Decimal
+    # Hedge floor: any partial-fill cancel path whose ``executed × mid_now``
+    # falls below this value (in QUOTE, e.g. BRL) is left UNHEDGED. The
+    # inventory_audit (or external reconciliation) absorbs the residual as
+    # drift. Set to 0 to always hedge regardless of size. Default 0
+    # preserves backward-compat for non-lead-lag XEMM users; the lead-lag
+    # controller passes the audit's max_drift_quote (typically 60 BRL).
+    min_hedge_value_quote: Decimal = Decimal("0")
 
 
 class XEMMLeadLagExecutorConfig(XEMMExecutorConfig):

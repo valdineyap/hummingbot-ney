@@ -56,6 +56,38 @@ from hummingbot.strategy_v2.utils.lead_lag_signal import (
 )
 
 
+class FeeAssetConfig(BaseModel):
+    """Assets usados para pagamento de fees (ex: BNB no Binance com desconto
+    de 10%). Tratamento **sutilmente diferente** do `base_targets`:
+
+      * Top-up **unidirecional** — só BUY quando saldo cair abaixo do target
+        por margem >= `min_topup_quote`. Nunca SELL: o saldo só drena via
+        consumo de taxas, não acumulamos por trading.
+      * **Sem subscrição de livro** — preço via REST on-demand com cache
+        (`price_cache_ttl_sec`). Evita banda/CPU permanente de WS pra moeda
+        raramente negociada.
+      * **Par implícito**: assume `taker_connector + ASSET-BRL` (convenção;
+        não precisa configurar nada se o exchange listar nessa convenção).
+      * **Valoração**: o saldo participa do PnL via a MESMA fórmula drift-
+        target usada para BTC. Top-up de R$60 fica neutro no PnL (ΔBRL -60
+        ≈ +0.05 BNB × R$1200/BNB), evitando que compra de fee asset trip
+        os kill switches (max_daily_loss, max_session_drawdown).
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = False
+    targets: Dict[str, Decimal] = Field(default_factory=dict)
+    # Mínimo em quote currency para disparar uma compra. Espelha o
+    # min_notional do exchange (Binance BNB-BRL ≈ R$60). Abaixo disso,
+    # espera o saldo acumular o gap maior antes de fazer o top-up.
+    min_topup_quote: Decimal = Decimal("60")
+    check_interval_sec: float = 300.0
+    price_cache_ttl_sec: float = 60.0
+    # Cooldown entre top-ups do mesmo asset (segundos). Evita rajada se
+    # uma compra parcial ou rejeitada deixou o saldo ainda abaixo do target.
+    topup_cooldown_sec: float = 120.0
+
+
 class InventoryAuditConfig(BaseModel):
     """
     State-based inventory reconciliation: for each base asset, the bot's total
@@ -143,6 +175,27 @@ class XEMMLeadLagConfig(ControllerConfigBase):
     # but blocks "rebalance my entire stack" sized mistakes.
     max_order_amount_multiplier: Decimal = Field(default=Decimal("2.0"))
 
+    # === Snap-to-top dynamic sizing ===
+    # When the top of the taker book is thin but has a materially better
+    # price than the VWAP for the full ``order_amount``, shrink the maker
+    # order so it hedges against ONLY that top layer. This makes the maker
+    # quote more competitive (tighter spread) at the cost of capturing
+    # smaller individual fills. Cap is always ``order_amount`` — snap can
+    # only shrink, never grow.
+    snap_to_top_enabled: bool = Field(default=True)
+    # Minimum edge gain (in bps) between top_layer_price and full VWAP to
+    # trigger snap. 0.5 bps is aggressive; raise if overhead per fill is
+    # significant relative to captured edge.
+    snap_threshold_bps: Decimal = Field(default=Decimal("0.5"))
+    # Floor for the snapped order amount. Prevents dust orders that the
+    # exchange would reject (min_notional) or that would be lost to fee
+    # overhead. Must be >= one LOT_SIZE step on the taker side.
+    min_dynamic_order_amount: Decimal = Field(default=Decimal("0.002"))
+    # Safety fraction applied to the observed top-layer size before
+    # quantization. <1.0 leaves headroom against other bots racing to
+    # consume the same layer between observation and our maker placement.
+    snap_safety_fraction: Decimal = Field(default=Decimal("0.8"))
+
     # === Profitability (NET of fees — XEMMExecutor adds tx_cost_pct internally) ===
     min_profitability: Decimal = Field(default=Decimal("0.0007"))
     target_profitability: Decimal = Field(default=Decimal("0.0020"))
@@ -226,7 +279,12 @@ class XEMMLeadLagConfig(ControllerConfigBase):
 
     # Leg ordering: "parallel" (default), "maker_first", "taker_first".
     # Role-based — works regardless of which exchange is maker / taker.
-    # See LeadLagArbitrageExecutorConfig for full semantics.
+    # In "maker_first" and "taker_first" the second leg is gated on the
+    # ACTUAL FILL (full or partial) of the first leg, and its amount is
+    # resized to match the realized executed_amount. If the first leg
+    # ends with zero fills (watchdog cancel), no second leg is placed and
+    # the arb closes cleanly with no exposure (no unwind path needed).
+    # See LeadLagArbitrageExecutorConfig for the full semantics.
     arb_leg_execution_order: str = Field(default="parallel")
 
     # Circuit breakers
@@ -274,25 +332,15 @@ class XEMMLeadLagConfig(ControllerConfigBase):
     # Captures "won early, gave it back" patterns that net daily PnL hides.
     # Resets only on process restart — peak is per-process, not per-day.
     max_session_drawdown_quote: Decimal = Field(default=Decimal("50"))
-    # Consecutive closed executors with net_pnl_quote < 0. Catches adverse-selection
-    # clusters or signal inversion before total loss reaches daily limit.
-    max_consecutive_losing_fills: int = Field(default=5)
-    # Time-decay for the losing-streak counter. If more than this many seconds
-    # elapse between consecutive losing fills, the streak resets to 0 before
-    # the new loss is counted. Without decay, an old loss from hours ago plus
-    # a fresh one count as 2 — even though they are uncorrelated events.
-    # Observed prod 2026-05-17 23:54: 2 losses at 14:05 + 3 losses at 23:42-54
-    # (9h37min gap between groups) tripped LOSING_STREAK_5 → bot shutdown.
-    # Default 1h matches the typical XEMM cycle cadence; longer idle periods
-    # imply something structural changed (inventory, market regime).
-    losing_streak_decay_sec: float = Field(default=3600.0)
-    # Minimum |net_pnl| (BRL) a losing fill must have to advance the streak.
-    # Below this, the loss is treated as noise (Binance taker fee dominating a
-    # near-zero gross PnL) — neither advances nor resets the counter. Wins
-    # (net_pnl >= 0) always reset. Without this threshold the streak gate
-    # killed the bot 3× in 2026-05-13 from sequences of ~R$0.01-R$0.06 losses
-    # whose total was <R$0.30 — well under the daily loss limit.
-    min_loss_per_fill_quote_to_count: Decimal = Field(default=Decimal("0.10"))
+    # NOTE (2026-05-18): LOSING_STREAK gate removed. Was redundant with
+    # MINUTE_BURN once that gate existed; also was the gate that mis-fired
+    # in prod 2026-05-17 23:54 due to the XEMM `get_net_pnl_quote` sign bug
+    # on maker_side=SELL fills. The whole per-fill PnL accounting path was
+    # replaced with portfolio-value-derived gates (see _compute_regime).
+    # Config fields previously here:
+    #   max_consecutive_losing_fills, losing_streak_decay_sec,
+    #   min_loss_per_fill_quote_to_count.
+    #
     # Rolling 1min burn rate: kill when sum(net_pnl) over last 60s <= -limit.
     # Companion gate to max_hourly_burn_quote — pegs acute drawdowns
     # (signal inversion, cascade of bad fills) without waiting for the 1h
@@ -303,10 +351,20 @@ class XEMMLeadLagConfig(ControllerConfigBase):
     # Rolling 1h burn rate: kill when sum(net_pnl) over last 3600s <= -limit.
     # Detects slow bleeds that would not trip daily_loss until hours later.
     max_hourly_burn_quote: Decimal = Field(default=Decimal("50"))
-    # Unrealized-PnL proxy via inventory drift in quote terms (sum across base
-    # assets of |actual-target| * mid_price). Catches large open exposure even
-    # when realized PnL still looks fine. Should be > inventory_audit.max_drift_quote.
-    max_unrealized_loss_quote: Decimal = Field(default=Decimal("100"))
+    # Maximum open inventory exposure (sum across base assets of |actual-target|
+    # × mid_price, in quote currency). Named ``_loss`` for historical reasons —
+    # the metric is really *notional exposure*, not loss. The real loss potential
+    # is much smaller (~5-10 bps of unwind cost). Must be > inventory_audit's
+    # max_drift_quote, and ideally >= 2× lot_value so a single transient lot
+    # post-partial-fill doesn't trip it before audit can reconcile.
+    max_unrealized_loss_quote: Decimal = Field(default=Decimal("16000"))
+    # Grace period: how long the exposure must STAY above the limit, with audit
+    # not actively rebalancing, before KILL fires. Audit-busy state (pending
+    # rebalance queue OR recent fill within ``_has_inflight_activity``'s 10s
+    # window) freezes this counter so we never kill while audit is doing its
+    # job. Default 90s = ~3 audit cycles at the default 30s interval; gives
+    # MARKET rebalances time to settle into the next audit observation.
+    unrealized_exposure_grace_sec: float = Field(default=90.0)
     # When KILLED and there are no active executors and inventory is in tolerance,
     # the controller sends SIGTERM to its own process so the supervisor (or operator)
     # can restart cleanly. Opt-in to avoid surprising shutdowns in shadow_mode.
@@ -317,6 +375,12 @@ class XEMMLeadLagConfig(ControllerConfigBase):
 
     # === Inventory audit (state-based reconciliation) ===
     inventory_audit: InventoryAuditConfig = Field(default_factory=InventoryAuditConfig)
+
+    # === Fee assets (BNB para fee discount no Binance, etc.) ===
+    # Separado do `inventory_audit` porque: (a) top-up unidirecional só BUY,
+    # (b) sem subscrição de livro (REST on-demand), (c) participa do PnL
+    # via drift-target pra não tripar kill switches em top-ups.
+    fee_assets: FeeAssetConfig = Field(default_factory=FeeAssetConfig)
 
     # === Operational ===
     shadow_mode: bool = Field(default=True)
@@ -416,9 +480,10 @@ class XEMMLeadLagCSVLogger:
         # Boot state
         "boot_paused",
         # PnL-safety telemetry (drives circuit breakers and external watchdog)
-        "daily_realized_pnl", "session_pnl_total", "session_pnl_peak",
-        "session_drawdown", "consecutive_losing_fills", "hourly_burn",
-        "minute_burn",
+        # V-derived (portfolio-value-based PnL — 2026-05-18 refactor)
+        "v_now", "v_initial", "v_day_start", "v_peak",
+        "daily_realized_pnl", "session_pnl_total", "session_drawdown",
+        "hourly_burn", "minute_burn",
         # Max-lot guard counters (audit auto_rebalance / spawn-time guard)
         "oversized_blocks_total", "last_oversized_block_source",
     ]
@@ -765,9 +830,10 @@ class TradeLedger:
         Called by the controller on a coarse cadence (e.g. every 60s) so the
         external monitor can read fresh values without waiting for the next
         fill. The ``safety`` dict carries the same names as the CSV columns
-        (``daily_realized_pnl``, ``session_drawdown``, ``hourly_burn``,
-        ``minute_burn``, ``consecutive_losing_fills``, ``regime``,
-        ``kill_reason``) so any consumer can cross-reference.
+        (``v_now``, ``v_initial``, ``v_day_start``, ``v_peak``,
+        ``daily_realized_pnl``, ``session_drawdown``, ``hourly_burn``,
+        ``minute_burn``, ``regime``, ``kill_reason``) so any consumer can
+        cross-reference.
 
         Snapshot is cached on the ledger so ``_write_state`` (called from
         fills) keeps producing a state file that includes it.
@@ -844,28 +910,56 @@ class XEMMLeadLagController(ControllerBase):
         self._last_balance_warn_ts: float = 0.0
         self._last_cancel_reason: Optional[str] = None
         self._consecutive_hedge_failures: int = 0
-        self._daily_realized_pnl: Decimal = Decimal("0")
         self._kill_reason: Optional[str] = None
 
-        # === Layered PnL safety state (see _compute_regime gates) ===
-        # Session-level: persists for the process lifetime.
-        self._session_pnl_total: Decimal = Decimal("0")
-        self._session_pnl_peak: Decimal = Decimal("0")
-        # Counts how many closed executors in a row had net_pnl_quote < 0.
-        # Resets on the first non-loss fill OR after `losing_streak_decay_sec`
-        # idle since the last losing fill (whichever happens first).
-        self._consecutive_losing_fills: int = 0
-        # Timestamp of the last fill that ADVANCED the streak (i.e. a loss
-        # above the noise floor). Used by the time-decay logic in
-        # on_executors_update to expire stale streaks before counting a
-        # fresh loss against an unrelated old one.
-        self._last_losing_fill_time: float = 0.0
-        # Sliding 1h history of (timestamp, net_pnl_quote) tuples used by the
-        # hourly burn-rate gate. Trimmed lazily on each access in _hourly_burn.
-        self._hourly_pnl_history: Deque[Tuple[float, Decimal]] = deque()
-        # Day key (UTC) for the daily_realized_pnl reset — separate from
-        # _arb_last_reset_day so the two reset paths are independent.
-        self._daily_pnl_last_reset_day: str = ""
+        # === PnL accounting (drift-target model, 2026-05-18 v2) ===
+        # All PnL gates (daily_loss, session_drawdown, hourly_burn,
+        # minute_burn) measure deltas of ``pnl_brl``, defined as:
+        #
+        #   pnl_brl(t) = (BRL_now − BRL_0)
+        #              + (drift_now × mid_now − drift_0 × mid_0)
+        #
+        # where:
+        #   BRL_now / BRL_0 — sum of QUOTE balances now / at boot
+        #   drift_X        — BASE_X − BTC_target (signed)
+        #   BTC_target     — config.inventory_audit.base_targets[BASE]
+        #                    (fallback: BASE_0, i.e. boot inventory)
+        #   mid_X          — maker mid_price at time X
+        #
+        # Why this beats raw V_now (mid_now everywhere):
+        #   * MtM noise on the *target* inventory cancels: when balanced at
+        #     target, ΔBTC × Δmid = 0 — gates do NOT fire on price ticks.
+        #   * Drift is priced at mid_now (current rebalance cost) — captures
+        #     the BRL impact of the next auto_rebalance/hedge that will
+        #     convert that BTC drift back to quote currency.
+        #   * pnl_brl(0) = 0 by construction (regardless of how skewed the
+        #     boot inventory was relative to target).
+        # See _compute_pnl_brl() for the canonical impl.
+        #
+        # Diagnostic V_now is still captured (uses mid_now everywhere) and
+        # logged to CSV alongside pnl_brl so we can empirically verify the
+        # noise-cancellation in prod. V_now does NOT drive any gate.
+        #
+        # _brl_initial / _btc_initial : snapshot at first valid tick
+        # _btc_target                 : config target (or _btc_initial)
+        # _mid_baseline               : maker mid at first valid tick
+        # _pnl_brl_now                : latest pnl_brl
+        # _pnl_brl_peak               : running max (drawdown anchor)
+        # _pnl_brl_day_start          : pnl_brl at last UTC midnight
+        # _pnl_brl_history            : rolling 1h+ of (ts, pnl_brl)
+        self._brl_initial: Optional[Decimal] = None
+        self._btc_initial: Optional[Decimal] = None
+        self._btc_target: Optional[Decimal] = None
+        self._mid_baseline: Optional[Decimal] = None
+        self._pnl_brl_now: Optional[Decimal] = None
+        self._pnl_brl_peak: Optional[Decimal] = None
+        self._pnl_brl_day_start: Optional[Decimal] = None
+        self._pnl_brl_day_start_key: str = ""  # UTC date string
+        self._pnl_brl_history: Deque[Tuple[float, Decimal]] = deque()
+        # Diagnostic-only V_now (uses mid_now everywhere; NOT used by any
+        # gate). Recomputed every tick — cheap. Logged to CSV/state.json
+        # to make MtM-noise cancellation visible in production data.
+        self._v_now: Optional[Decimal] = None
         # Set when KILLED has latched; the auto-terminate path uses this to
         # know when the grace period started.
         self._kill_latched_at: Optional[float] = None
@@ -884,6 +978,17 @@ class XEMMLeadLagController(ControllerBase):
         # Max-lot guard counters (incremented by _check_max_lot on reject).
         self._oversized_blocks_total: int = 0
         self._last_oversized_block_source: str = ""
+
+        # UNREALIZED_EXPOSURE persistence timer. Set when total drift first
+        # crosses ``max_unrealized_loss_quote`` AND audit is not actively
+        # rebalancing. Cleared when exposure drops, when a rebalance is
+        # queued, or when ``_has_inflight_activity`` reports True. Kill
+        # fires only after the timer has been continuously set for
+        # ``unrealized_exposure_grace_sec`` — i.e. audit had time but
+        # failed to reduce exposure. Prevents the 2026-05-18 11:32
+        # incident where a single transient unhedged lot tripped the gate
+        # in seconds, before the audit's 30s cycle had a chance to fix it.
+        self._unrealized_exposure_trip_at: Optional[float] = None
 
         # === Watchdog: detect event loop lag (e.g. MQTT-style asyncio blocking) ===
         # Tracks wall-clock time of last successful tick. If a tick observes a gap
@@ -966,6 +1071,19 @@ class XEMMLeadLagController(ControllerBase):
         self._rebalance_last_time: Dict[str, float] = {}
         # Minimum seconds between rebalance orders for the same asset.
         self._rebalance_cooldown_sec: float = 120.0
+        # === Fee asset top-up state (BNB, etc) ===
+        # REST price cache: pair → (price, fetched_at). Refreshed via
+        # `_get_spot_price_rest` when expired (TTL from FeeAssetConfig).
+        # Não usa WS — pares de fee asset são consultados raramente.
+        self._fee_price_cache: Dict[str, Tuple[Decimal, float]] = {}
+        # Último timestamp de top-up por asset (cooldown anti-rajada).
+        self._fee_topup_last_time: Dict[str, float] = {}
+        # Última vez que rodamos o loop de top-up (gate por check_interval_sec).
+        self._last_fee_topup_check: float = 0.0
+        # Baselines per fee asset (paralelo a `_btc_initial` / `_btc_target`
+        # mas em dict; latched no mesmo bloco do PnL baseline).
+        self._fee_assets_initial: Dict[str, Decimal] = {}
+        self._fee_assets_mid_baseline: Dict[str, Decimal] = {}
         # === Barrier-pattern audit state (2026-05-12 simplification) ===
         # Replaces _drift_consecutive_audits/HEDGE_FAILURES_N strike-rule and
         # the audit-in-killed-mode complexity. State machine:
@@ -2062,6 +2180,89 @@ class XEMMLeadLagController(ControllerBase):
         except Exception:
             return Decimal("0")
 
+    async def _get_spot_price_rest(
+        self, connector_name: str, pair: str, ttl_sec: float = 60.0,
+    ) -> Optional[Decimal]:
+        """Mid_price aproximado via REST com cache local.
+
+        Usado para assets que NÃO estão nos pares subscritos via WS (ex:
+        BNB-BRL para fee top-up). Evita banda/CPU permanente que uma
+        subscrição de livro consumiria para algo raramente acessado.
+
+        Estratégia:
+          1. Se cache válido (idade < ttl_sec) → retorna do cache.
+          2. Senão, pede ao connector ``get_last_traded_price`` (REST call
+             leve, ~50 bytes payload no Binance).
+          3. Em caso de erro, retorna o último preço cacheado (mesmo stale)
+             para não bloquear decisões; só retorna None se nunca houve
+             cache válido (boot).
+        """
+        now = time.monotonic()
+        cached = self._fee_price_cache.get(pair)
+        if cached is not None:
+            price, fetched_at = cached
+            if (now - fetched_at) < ttl_sec:
+                return price
+
+        try:
+            conn = self.market_data_provider.get_connector(connector_name)
+        except Exception as e:
+            self.logger().warning(
+                f"[fee_price] connector {connector_name} unavailable: "
+                f"{type(e).__name__}: {e}"
+            )
+            return cached[0] if cached else None
+
+        get_last = getattr(conn, "get_last_traded_price", None)
+        if get_last is None:
+            self.logger().warning(
+                f"[fee_price] connector {connector_name} has no "
+                f"get_last_traded_price method"
+            )
+            return cached[0] if cached else None
+
+        try:
+            raw = await get_last(pair)
+            price = Decimal(str(raw))
+            if price <= 0:
+                raise ValueError(f"non-positive price {raw}")
+            self._fee_price_cache[pair] = (price, now)
+            return price
+        except Exception as e:
+            self.logger().warning(
+                f"[fee_price] REST fetch failed for {connector_name}/{pair}: "
+                f"{type(e).__name__}: {e}"
+            )
+            return cached[0] if cached else None
+
+    def _fee_asset_pair(self, asset: str) -> str:
+        """Convenção implícita: par de top-up é ``ASSET-<quote do maker>``.
+
+        Ex: maker BTC-BRL → BNB usa BNB-BRL. Não exige config extra.
+        """
+        _, quote = split_hb_trading_pair(self.config.maker_trading_pair)
+        return f"{asset}-{quote}"
+
+    async def _prime_fee_asset_prices(self) -> None:
+        """Atualiza o cache REST de preço para todos os fee assets configurados.
+
+        Chamado uma vez por tick async (early-out por TTL torna isso barato).
+        Sem esta primagem o PnL não enxerga o valor dos fee assets no boot
+        (cache vazio = contribuição zero), o que poderia tripar kill switch
+        se o saldo de BNB fosse comparável aos thresholds. Com priming, o
+        cache enche no primeiro tick e o latch lazy de baseline acontece
+        no mesmo ciclo.
+        """
+        cfg = self.config.fee_assets
+        if not cfg.enabled or not cfg.targets:
+            return
+        for asset in cfg.targets.keys():
+            pair = self._fee_asset_pair(asset)
+            await self._get_spot_price_rest(
+                self.config.taker_connector, pair,
+                ttl_sec=cfg.price_cache_ttl_sec,
+            )
+
     # ------------------------------------------------------------------ #
     # Orphan-fill hedge dispatch                                         #
     # ------------------------------------------------------------------ #
@@ -2929,6 +3130,151 @@ class XEMMLeadLagController(ControllerBase):
 
         self._pending_rebalances.clear()
 
+    async def _run_fee_asset_topup(self, now: float) -> None:
+        """Top-up unidirecional de assets usados pra fee discount.
+
+        Diferenças do `_execute_pending_rebalances`:
+          * Só BUY — saldo de fee asset só drena por consumo de taxas.
+          * Sem VWAP/livro — usa o preço do cache REST (`_fee_price_cache`),
+            populado por `_prime_fee_asset_prices`. Order book não é
+            subscrito.
+          * Convenção implícita de par: `ASSET-<quote do maker>` no taker.
+          * Max-lot dedicado: rejeita amount > 2× target (gate analogo ao
+            `_check_max_lot`, mas dimensionado pelo target do asset — o
+            global é em BTC e não se aplica aqui).
+          * Não passa pela barreira/quiescence do audit: top-ups são
+            independentes de drift de inventário de trading.
+
+        Disparo: deficit (target − actual) com notional ≥ `min_topup_quote`.
+        Cooldown por asset = `topup_cooldown_sec`. Resultado registrado em
+        `_fee_topup_last_time[asset]`.
+        """
+        cfg = self.config.fee_assets
+        if not cfg.enabled or not cfg.targets:
+            return
+        if (now - self._last_fee_topup_check) < cfg.check_interval_sec:
+            return
+        self._last_fee_topup_check = now
+
+        try:
+            connector = self.market_data_provider.get_connector(
+                self.config.taker_connector)
+        except Exception as e:
+            self.logger().warning(
+                f"[fee_topup] taker connector unavailable: "
+                f"{type(e).__name__}: {e}"
+            )
+            return
+
+        for asset, target_raw in cfg.targets.items():
+            target = Decimal(str(target_raw))
+            pair = self._fee_asset_pair(asset)
+
+            actual = (
+                self._safe_total_balance(self.config.maker_connector, asset)
+                + self._safe_total_balance(self.config.taker_connector, asset)
+            )
+            deficit = target - actual
+            if deficit <= 0:
+                continue  # acima do target, nada a fazer
+
+            cached = self._fee_price_cache.get(pair)
+            if cached is None:
+                self.logger().debug(
+                    f"[fee_topup] {asset} deficit={deficit} mas preço REST "
+                    f"ainda não cacheado — aguarda priming"
+                )
+                continue
+            price, _ = cached
+
+            notional = deficit * price
+            if notional < cfg.min_topup_quote:
+                self.logger().debug(
+                    f"[fee_topup] {asset} notional {notional:.2f} < "
+                    f"min_topup_quote {cfg.min_topup_quote} — aguarda gap maior"
+                )
+                continue
+
+            last = self._fee_topup_last_time.get(asset, 0.0)
+            if (now - last) < cfg.topup_cooldown_sec:
+                self.logger().debug(
+                    f"[fee_topup] {asset} cooldown ativo "
+                    f"({cfg.topup_cooldown_sec - (now - last):.0f}s remaining)"
+                )
+                continue
+
+            # Max-lot per-asset: nunca compre mais que 2× o target em uma
+            # única ordem. Protege contra baseline mal latched ou bug que
+            # zere o saldo na conta — análogo ao `_check_max_lot` global
+            # (que é em BTC e não se aplica aqui).
+            max_topup = target * Decimal("2")
+            if deficit > max_topup:
+                self.logger().critical(
+                    f"[fee_topup] {asset} deficit {deficit:.8f} > 2x target "
+                    f"{target:.8f} — REFUSING (suspeita de baseline corrompido "
+                    f"ou drain anormal). Verifique manualmente."
+                )
+                continue
+
+            # Trading rules + quantize
+            try:
+                rules = connector.trading_rules.get(pair)
+                if rules:
+                    if deficit < rules.min_order_size:
+                        self.logger().debug(
+                            f"[fee_topup] {asset} amount {deficit} < "
+                            f"min_order_size {rules.min_order_size} — skip"
+                        )
+                        continue
+                    if (rules.min_notional_size
+                            and notional < rules.min_notional_size):
+                        self.logger().debug(
+                            f"[fee_topup] {asset} notional {notional:.2f} < "
+                            f"min_notional {rules.min_notional_size} — skip"
+                        )
+                        continue
+            except Exception as e:
+                self.logger().warning(
+                    f"[fee_topup] trading_rules lookup failed for {pair}: "
+                    f"{type(e).__name__}: {e}"
+                )
+
+            try:
+                amount_q = connector.quantize_order_amount(pair, deficit)
+                if amount_q <= 0:
+                    self.logger().warning(
+                        f"[fee_topup] {asset} quantized amount = 0 "
+                        f"(deficit {deficit:.8f} < LOT_SIZE em {pair}) — skip"
+                    )
+                    continue
+                amount = amount_q
+            except Exception as e:
+                self.logger().warning(
+                    f"[fee_topup] quantize_order_amount falhou para {pair}: "
+                    f"{type(e).__name__}: {e} — usando deficit cru"
+                )
+                amount = deficit
+
+            try:
+                order_id = connector.buy(
+                    pair, amount, OrderType.MARKET, Decimal("0"))
+                # Suprimir orphan-hedge — fee top-up é uma compra
+                # one-sided por design; não tem nada pra hedgear.
+                self.register_self_dispatched_market_id(order_id)
+                self._fee_topup_last_time[asset] = now
+                self.logger().warning(
+                    f"[fee_topup] BUY MARKET {amount:.8f} {asset} on "
+                    f"{self.config.taker_connector}/{pair} "
+                    f"price≈{price:.2f} notional≈{(amount*price):.2f} "
+                    f"target={target} actual_before={actual:.8f} "
+                    f"order_id={order_id}"
+                )
+            except Exception as e:
+                self.logger().error(
+                    f"[fee_topup] Failed to place MARKET BUY for {asset} "
+                    f"on {pair}: {type(e).__name__}: {e}"
+                )
+
     def _vwap_for_amount(
         self, connector: str, pair: str, is_buy: bool, amount: Decimal,
     ) -> Optional[Decimal]:
@@ -2948,6 +3294,133 @@ class XEMMLeadLagController(ControllerBase):
                 f"VWAP fetch failed for {connector}/{pair} is_buy={is_buy}: {e}"
             )
             return None
+
+    # ------------------------------------------------------------------ #
+    # Snap-to-top dynamic sizing                                         #
+    # ------------------------------------------------------------------ #
+    def _top_taker_layer(
+        self, maker_side: TradeType,
+    ) -> Optional[Tuple[Decimal, Decimal]]:
+        """
+        Return ``(top_price, top_amount)`` for the taker-book side the hedge
+        will hit, or ``None`` if the book is unavailable / degenerate.
+
+        Mapping of maker side → taker side the hedge consumes liquidity from:
+          maker BUY  → hedge SELL → hits taker BIDS (top = highest bid)
+          maker SELL → hedge BUY  → hits taker ASKS (top = lowest ask)
+        """
+        try:
+            ob = self.market_data_provider.get_order_book(
+                self.config.taker_connector, self.config.taker_trading_pair,
+            )
+            entries = (
+                ob.bid_entries() if maker_side == TradeType.BUY
+                else ob.ask_entries()
+            )
+            for entry in entries:
+                price = Decimal(str(entry.price))
+                amount = Decimal(str(entry.amount))
+                if price > 0 and amount > 0:
+                    return (price, amount)
+                # Skip degenerate level (price=0 or amount=0).
+        except Exception as e:
+            self.logger().warning(f"[snap] top-layer fetch failed: {e}")
+        return None
+
+    @staticmethod
+    def _quantize_amount_with_pad(amount: Decimal) -> Decimal:
+        """
+        Round ``amount`` down to a multiple of 1000 satoshis (BTC LOT_SIZE
+        step on Binance) and add +1 satoshi. The +1 sat compensates for the
+        framework's ``adjust_order_candidates`` which deducts 1 sat before
+        placement — same trick used for the static ``order_amount`` config
+        value (e.g. ``0.02000001`` → ``0.02000000`` post-adjust).
+
+        Returns Decimal("0") if the input is too small to produce a valid
+        quantized amount (caller decides what to do).
+        """
+        sats = int(amount * Decimal("100000000"))  # 1 BTC = 1e8 sats
+        sats_quantized = (sats // 1000) * 1000
+        if sats_quantized <= 0:
+            return Decimal("0")
+        return Decimal(sats_quantized + 1) / Decimal("100000000")
+
+    def _compute_snap_order_amount(
+        self, maker_side: TradeType,
+    ) -> Tuple[Decimal, Dict[str, Any]]:
+        """
+        Decide the maker order's effective base amount for the given side.
+
+        If the top of the taker book is materially cheaper than the VWAP for
+        the full ``order_amount`` (gain >= snap_threshold_bps) AND has at
+        least ``min_dynamic_order_amount`` of size after the safety fraction,
+        we shrink the maker order to ride that single layer at a tighter
+        hedge price. Otherwise we fall back to ``order_amount``.
+
+        Returns ``(effective_amount, telemetry_dict)``. The telemetry dict is
+        emitted as a ``[snap]`` log line so behaviour is observable in prod.
+        ``effective_amount`` is guaranteed to be in ``(0, order_amount]`` and
+        already quantized for LOT_SIZE + the +1 sat pad trick.
+        """
+        full_amount = self.config.order_amount
+        tel: Dict[str, Any] = {
+            "active": False,
+            "reason": "disabled",
+            "chosen": str(full_amount),
+        }
+        if not self.config.snap_to_top_enabled:
+            return full_amount, tel
+
+        top = self._top_taker_layer(maker_side)
+        if top is None:
+            tel["reason"] = "no_book"
+            return full_amount, tel
+        top_price, top_size = top
+        tel["top_size"] = str(top_size)
+        tel["top_price"] = str(top_price)
+
+        is_buy_hedge = (maker_side == TradeType.SELL)
+        vwap_full = self._vwap_for_amount(
+            self.config.taker_connector,
+            self.config.taker_trading_pair,
+            is_buy=is_buy_hedge,
+            amount=full_amount,
+        )
+        if vwap_full is None or vwap_full <= 0:
+            tel["reason"] = "no_vwap"
+            return full_amount, tel
+        tel["vwap_full"] = str(vwap_full)
+
+        # Hedge SELL profits when top_price > vwap_full (sell higher).
+        # Hedge BUY  profits when top_price < vwap_full (buy lower).
+        if is_buy_hedge:
+            edge_gain_bps = (vwap_full - top_price) / vwap_full * Decimal("10000")
+        else:
+            edge_gain_bps = (top_price - vwap_full) / vwap_full * Decimal("10000")
+        tel["edge_gain_bps"] = str(edge_gain_bps.quantize(Decimal("0.01")))
+
+        if edge_gain_bps < self.config.snap_threshold_bps:
+            tel["reason"] = "edge_below_threshold"
+            return full_amount, tel
+
+        candidate = top_size * self.config.snap_safety_fraction
+        if candidate >= full_amount:
+            # Top layer already absorbs the full order — no shrink benefit.
+            tel["reason"] = "top_covers_full"
+            return full_amount, tel
+        if candidate < self.config.min_dynamic_order_amount:
+            tel["reason"] = "below_min_dynamic"
+            return full_amount, tel
+
+        quantized = self._quantize_amount_with_pad(candidate)
+        if quantized < self.config.min_dynamic_order_amount or quantized <= 0:
+            tel["reason"] = "quantized_below_min"
+            return full_amount, tel
+
+        tel["active"] = True
+        tel["reason"] = "snapped"
+        tel["chosen"] = str(quantized)
+        return quantized, tel
 
     def _compute_arb_gross_bps(self, side: str) -> Decimal:
         """
@@ -3255,44 +3728,15 @@ class XEMMLeadLagController(ControllerBase):
                     # last_fill.touch). Never let ledger I/O block the loop.
                     if self._trade_ledger is not None:
                         self._trade_ledger.record_fill(ex)
-                    # === Safety counters (drive PnL-based circuit breakers) ===
-                    # Increment realized PnL counters AFTER trade-ledger I/O so
-                    # ledger failures cannot mask a loss from the gates.
-                    self._daily_realized_pnl += net_pnl
-                    self._session_pnl_total += net_pnl
-                    if self._session_pnl_total > self._session_pnl_peak:
-                        self._session_pnl_peak = self._session_pnl_total
-                    # Losing-streak counter with noise-floor: only fills
-                    # whose |net_pnl| exceeds `min_loss_per_fill_quote_to_count`
-                    # advance the streak. Sub-threshold losses (Binance taker
-                    # fee dominating a near-zero gross capture) are treated
-                    # as noise — neither advance nor reset.
-                    #
-                    # Time-decay: before incrementing, expire the streak if
-                    # the previous losing fill was too long ago. Old losses
-                    # are uncorrelated with current ones; counting them
-                    # together produces false-positive KILL (observed prod
-                    # 2026-05-17: 2 losses at 14:05 + 3 at 23:42 → streak=5).
-                    if net_pnl >= Decimal("0"):
-                        self._consecutive_losing_fills = 0
-                    elif abs(net_pnl) >= self.config.min_loss_per_fill_quote_to_count:
-                        now_ts = time.time()
-                        if (self._consecutive_losing_fills > 0
-                                and self._last_losing_fill_time > 0
-                                and (now_ts - self._last_losing_fill_time)
-                                > self.config.losing_streak_decay_sec):
-                            self.logger().info(
-                                f"[streak_decay] resetting losing_streak "
-                                f"{self._consecutive_losing_fills}→0 after "
-                                f"{now_ts - self._last_losing_fill_time:.0f}s "
-                                f"idle (> decay_sec="
-                                f"{self.config.losing_streak_decay_sec:.0f})"
-                            )
-                            self._consecutive_losing_fills = 0
-                        self._consecutive_losing_fills += 1
-                        self._last_losing_fill_time = now_ts
-                    # else: noise loss, no change
-                    self._hourly_pnl_history.append((time.time(), net_pnl))
+                    # === Per-fill PnL accounting removed 2026-05-18 ===
+                    # All PnL gates (DAILY_LOSS, SESSION_DRAWDOWN, MINUTE_BURN,
+                    # HOURLY_BURN) now derive from portfolio value V, computed
+                    # each tick from exchange balances. Per-fill net_pnl is no
+                    # longer summed into running counters — the sign bug in
+                    # XEMMExecutor.get_net_pnl_quote on maker_side=SELL is
+                    # bypassed entirely. See _compute_portfolio_value /
+                    # _compute_regime for the new path.
+
                     # Per-executor-type accounting for arb circuit breakers.
                     # Arb executors close once; XEMM executors also close once.
                     # We only count arb losses/failures here; XEMM losses flow
@@ -3344,9 +3788,8 @@ class XEMMLeadLagController(ControllerBase):
                         f"filled_quote={filled_quote} net_pnl={net_pnl} "
                         f"cum_fees={cum_fees} → _last_fill_time updated "
                         f"(10s audit-suppression window started); "
-                        f"safety: daily_pnl={self._daily_realized_pnl} "
-                        f"session_pnl={self._session_pnl_total} "
-                        f"losing_streak={self._consecutive_losing_fills}"
+                        f"pnl_brl_now={self._pnl_brl_now} "
+                        f"V_now_diag={self._v_now}"
                     )
 
         # === Initial inventory audit (Solution C: boot-paused mode) ===
@@ -3418,6 +3861,19 @@ class XEMMLeadLagController(ControllerBase):
         if self._pending_rebalances:
             await self._execute_pending_rebalances()
 
+        # === Refresh fee asset price cache (REST, throttled by TTL) ===
+        # Roda a cada tick mas faz REST apenas quando o cache de cada par
+        # expira (TTL = `fee_assets.price_cache_ttl_sec`). Steady-state: 1
+        # request por minuto por asset. Sem isso o PnL/snapshot não enxerga
+        # o valor dos fee assets e top-ups distorcem o pnl_brl.
+        await self._prime_fee_asset_prices()
+
+        # === Fee asset top-up (BNB, etc) ===
+        # Gate interno por `check_interval_sec`. Não interage com a
+        # barreira do audit (top-up de fee não é drift de inventário).
+        if not self._boot_paused:
+            await self._run_fee_asset_topup(now)
+
         # === Tiered polling (Priority 3) ===
         # Tier 1 (200ms — every tick): Re-evaluate state when fingerprint changes.
         #   Prices, regime, lead, balances, arb VWAPs — used by determine_executor_actions.
@@ -3481,6 +3937,95 @@ class XEMMLeadLagController(ControllerBase):
         else:
             combined_pct = Decimal("0.5")
         inventory_skew = combined_pct - self.config.inventory_target_pct
+
+        # === PnL accounting (drift-target model — see _compute_pnl_brl) ===
+        # pnl_brl(t) = (BRL_now − BRL_0) + (drift_now × mid_now − drift_0 × mid_0).
+        # Latches baselines on the first valid tick (post boot-pause):
+        #   BRL_0, BTC_0, mid_0 ← current values; pnl_brl(0) = 0.
+        # Diagnostic V_now uses mid_now everywhere; NOT a gate input.
+        if valuation_mid > 0 and not self._boot_paused:
+            # Latch baselines once.
+            if self._mid_baseline is None:
+                self._brl_initial = combined_quote
+                self._btc_initial = combined_base
+                self._mid_baseline = valuation_mid
+                # BTC_target: prefer audit config; fall back to boot inventory.
+                base_asset, _ = split_hb_trading_pair(self.config.maker_trading_pair)
+                cfg_target = self.config.inventory_audit.base_targets.get(base_asset)
+                if cfg_target is not None and cfg_target > 0:
+                    self._btc_target = Decimal(str(cfg_target))
+                    target_source = "config"
+                else:
+                    self._btc_target = combined_base
+                    target_source = "boot_inventory_fallback"
+                self._pnl_brl_now = Decimal("0")
+                self._pnl_brl_peak = Decimal("0")
+                self.logger().info(
+                    f"[pnl_baseline] BRL_0={combined_quote:.2f} "
+                    f"BTC_0={combined_base:.8f} "
+                    f"mid_0={valuation_mid:.2f} "
+                    f"BTC_target={self._btc_target:.8f} ({target_source}) "
+                    f"drift_0={(combined_base - self._btc_target):.8f}"
+                )
+
+            # Fee asset baselines — latch lazy, asset-por-asset, quando o
+            # cache REST tem preço pra primeira vez. Diferente do BTC_0/
+            # mid_0 (que latch atômico no mesmo tick), aqui cada asset pode
+            # latchear num tick distinto se o REST priming demorou. Isso é
+            # OK: top-up só dispara depois do latch (`_run_fee_asset_topup`
+            # também depende do cache), então não existe top-up sem
+            # baseline.
+            fee_cfg = self.config.fee_assets
+            if fee_cfg.enabled:
+                for fee_asset, fee_target in fee_cfg.targets.items():
+                    if fee_asset in self._fee_assets_initial:
+                        continue
+                    fee_pair = self._fee_asset_pair(fee_asset)
+                    cached = self._fee_price_cache.get(fee_pair)
+                    if cached is None:
+                        continue
+                    fee_price_0, _ = cached
+                    fee_actual_0 = (
+                        self._safe_total_balance(
+                            self.config.maker_connector, fee_asset)
+                        + self._safe_total_balance(
+                            self.config.taker_connector, fee_asset)
+                    )
+                    self._fee_assets_initial[fee_asset] = fee_actual_0
+                    self._fee_assets_mid_baseline[fee_asset] = fee_price_0
+                    self.logger().info(
+                        f"[pnl_baseline] fee_asset {fee_asset}_0="
+                        f"{fee_actual_0} mid_0={fee_price_0} "
+                        f"target={fee_target} "
+                        f"drift_0={(fee_actual_0 - Decimal(str(fee_target)))}"
+                    )
+
+            # Compute pnl_brl_now and update derived state.
+            pnl_now = self._compute_pnl_brl(valuation_mid)
+            if pnl_now is not None:
+                self._pnl_brl_now = pnl_now
+                self._pnl_brl_history.append((now, pnl_now))
+                self._trim_pnl_history(now)
+                if self._pnl_brl_peak is None or pnl_now > self._pnl_brl_peak:
+                    self._pnl_brl_peak = pnl_now
+                # Day rollover: snapshot pnl_brl at each UTC midnight crossing.
+                today_key = datetime.utcfromtimestamp(now).strftime("%Y-%m-%d")
+                if today_key != self._pnl_brl_day_start_key:
+                    if self._pnl_brl_day_start_key:  # not the very first day
+                        self.logger().info(
+                            f"[pnl_day_rollover] pnl_brl_day_start "
+                            f"{self._pnl_brl_day_start} → {pnl_now} "
+                            f"({self._pnl_brl_day_start_key} → {today_key})"
+                        )
+                    self._pnl_brl_day_start = pnl_now
+                    self._pnl_brl_day_start_key = today_key
+
+        # Diagnostic V_now (mid_now everywhere). Used only in CSV/state.json;
+        # gates ignore it. Computed even during boot-pause so the first
+        # tick already has a non-None value in telemetry.
+        v_now_diag = self._compute_portfolio_value(valuation_mid)
+        if v_now_diag is not None:
+            self._v_now = v_now_diag
 
         # 4. Compute lead signal + adjusted targets (Priority 5: basis-aware skew included)
         best_lead = self._signal.best_lead_signal_bps()
@@ -3596,16 +4141,9 @@ class XEMMLeadLagController(ControllerBase):
             self._arb_realized_loss_today = Decimal("0")
             self._arb_last_reset_day = today
 
-        # 6.7b. Reset daily realized-PnL counter at UTC date rollover (independent
-        # day key from arb so the two paths stay decoupled — if one ever moves
-        # to a different rollover schedule the other is unaffected).
-        if today != self._daily_pnl_last_reset_day:
-            if self._daily_pnl_last_reset_day:
-                self.logger().info(
-                    f"Daily realized PnL reset (was {self._daily_realized_pnl})"
-                )
-            self._daily_realized_pnl = Decimal("0")
-            self._daily_pnl_last_reset_day = today
+        # 6.7b. NOTE (2026-05-18): daily PnL reset logic is now driven by the
+        # V_day_start snapshot in the portfolio-value path (see section 3 of
+        # update_processed_data). No separate counter to reset here.
 
         # 7. Active executor count
         active = self.filter_executors(
@@ -3665,14 +4203,44 @@ class XEMMLeadLagController(ControllerBase):
             "audit_drift_active": 1 if self._last_audit_results.get("_drift_active") else 0,
             "audit_inflight_active": 1 if self._last_audit_results.get("_inflight_active") else 0,
             "boot_paused": 1 if self._boot_paused else 0,
-            # PnL-safety telemetry (drives CSV columns and external watchdog).
-            "daily_realized_pnl": self._daily_realized_pnl,
-            "session_pnl_total": self._session_pnl_total,
-            "session_pnl_peak": self._session_pnl_peak,
-            "session_drawdown": self._session_pnl_peak - self._session_pnl_total,
-            "consecutive_losing_fills": self._consecutive_losing_fills,
+            # PnL-safety telemetry (drift-target model 2026-05-18 v2;
+            # see _compute_regime + _compute_pnl_brl).
+            "pnl_brl_now": (self._pnl_brl_now
+                            if self._pnl_brl_now is not None else Decimal("0")),
+            "pnl_brl_peak": (self._pnl_brl_peak
+                             if self._pnl_brl_peak is not None else Decimal("0")),
+            "pnl_brl_day_start": (self._pnl_brl_day_start
+                                  if self._pnl_brl_day_start is not None
+                                  else Decimal("0")),
+            "brl_initial": (self._brl_initial
+                            if self._brl_initial is not None else Decimal("0")),
+            "btc_initial": (self._btc_initial
+                            if self._btc_initial is not None else Decimal("0")),
+            "btc_target": (self._btc_target
+                           if self._btc_target is not None else Decimal("0")),
+            "mid_baseline": (self._mid_baseline
+                             if self._mid_baseline is not None else Decimal("0")),
+            "daily_realized_pnl": (
+                (self._pnl_brl_now - self._pnl_brl_day_start)
+                if (self._pnl_brl_now is not None
+                    and self._pnl_brl_day_start is not None)
+                else Decimal("0")
+            ),
+            "session_pnl_total": (
+                self._pnl_brl_now if self._pnl_brl_now is not None
+                else Decimal("0")
+            ),
+            "session_drawdown": (
+                (self._pnl_brl_peak - self._pnl_brl_now)
+                if (self._pnl_brl_peak is not None
+                    and self._pnl_brl_now is not None)
+                else Decimal("0")
+            ),
             "hourly_burn": self._hourly_burn(now),
             "minute_burn": self._minute_burn(now),
+            # Diagnostic V_now (mid_now everywhere) — used to verify MtM
+            # cancellation empirically. NOT a gate input.
+            "v_now": self._v_now if self._v_now is not None else Decimal("0"),
             "oversized_blocks_total": self._oversized_blocks_total,
             "last_oversized_block_source": self._last_oversized_block_source,
         }
@@ -3696,13 +4264,28 @@ class XEMMLeadLagController(ControllerBase):
                 self._trade_ledger.write_safety_snapshot({
                     "regime": regime,
                     "kill_reason": self._kill_reason or "",
-                    "daily_realized_pnl": self._daily_realized_pnl,
-                    "session_pnl_total": self._session_pnl_total,
-                    "session_pnl_peak": self._session_pnl_peak,
-                    "session_drawdown": (
-                        self._session_pnl_peak - self._session_pnl_total
+                    # Drift-target pnl_brl metrics (gates) + diagnostic V_now.
+                    "pnl_brl_now": self._pnl_brl_now,
+                    "pnl_brl_peak": self._pnl_brl_peak,
+                    "pnl_brl_day_start": self._pnl_brl_day_start,
+                    "brl_initial": self._brl_initial,
+                    "btc_initial": self._btc_initial,
+                    "btc_target": self._btc_target,
+                    "mid_baseline": self._mid_baseline,
+                    "v_now_diagnostic": self._v_now,  # MtM-noisy, NOT a gate
+                    "daily_realized_pnl": (
+                        (self._pnl_brl_now - self._pnl_brl_day_start)
+                        if (self._pnl_brl_now is not None
+                            and self._pnl_brl_day_start is not None)
+                        else None
                     ),
-                    "consecutive_losing_fills": self._consecutive_losing_fills,
+                    "session_pnl_total": self._pnl_brl_now,
+                    "session_drawdown": (
+                        (self._pnl_brl_peak - self._pnl_brl_now)
+                        if (self._pnl_brl_peak is not None
+                            and self._pnl_brl_now is not None)
+                        else None
+                    ),
                     "hourly_burn": self._hourly_burn(now),
                     "minute_burn": self._minute_burn(now),
                     # Limits embedded so the monitor never drifts from the
@@ -3711,9 +4294,6 @@ class XEMMLeadLagController(ControllerBase):
                         "max_daily_loss_quote": self.config.max_daily_loss_quote,
                         "max_session_drawdown_quote": (
                             self.config.max_session_drawdown_quote
-                        ),
-                        "max_consecutive_losing_fills": (
-                            self.config.max_consecutive_losing_fills
                         ),
                         "max_minute_burn_quote": (
                             self.config.max_minute_burn_quote
@@ -3783,41 +4363,169 @@ class XEMMLeadLagController(ControllerBase):
         except Exception:
             return False
 
-    def _hourly_burn(self, now: float) -> Decimal:
-        """Return the net PnL sum across the last 3600 seconds.
+    # ------------------------------------------------------------------ #
+    # Portfolio-value PnL (replaces per-fill accounting 2026-05-18)      #
+    # ------------------------------------------------------------------ #
+    def _compute_portfolio_value(self, base_mid: Decimal) -> Optional[Decimal]:
+        """Sum the total balance (free + locked) across both exchanges,
+        priced in QUOTE (BRL) at ``base_mid``.
 
-        Trims expired entries in-place (deque popleft from the front). Cheap
-        in the steady state because closed executors are rare (~tens per hour
-        at worst), so the deque stays small.
+        Returns None if any connector is missing or balances unavailable.
+        Uses ``get_balance`` (total) NOT ``get_available_balance``, so
+        placing an order does NOT distort V — only fills/fees move it.
         """
-        cutoff = now - 3600.0
-        while self._hourly_pnl_history and self._hourly_pnl_history[0][0] < cutoff:
-            self._hourly_pnl_history.popleft()
-        if not self._hourly_pnl_history:
+        try:
+            base, quote = split_hb_trading_pair(self.config.maker_trading_pair)
+        except Exception:
+            return None
+        try:
+            maker = self.market_data_provider.get_connector(
+                self.config.maker_connector)
+            taker = self.market_data_provider.get_connector(
+                self.config.taker_connector)
+        except Exception:
+            return None
+        if maker is None or taker is None:
+            return None
+        try:
+            quote_total = (Decimal(str(maker.get_balance(quote)))
+                           + Decimal(str(taker.get_balance(quote))))
+            base_total = (Decimal(str(maker.get_balance(base)))
+                          + Decimal(str(taker.get_balance(base))))
+        except Exception:
+            return None
+        if base_mid <= 0:
+            # Without a valid mid we cannot price BTC — refuse to invent V.
+            return None
+        return quote_total + base_total * base_mid
+
+    def _compute_pnl_brl(self, mid_now: Decimal) -> Optional[Decimal]:
+        """Return current pnl_brl in BRL, or None if baselines not latched.
+
+        pnl_brl(t) = (BRL_now − BRL_0) + (drift_now × mid_now − drift_0 × mid_0)
+
+        where ``drift = BASE_balance − BTC_target``. Cancels MtM noise on
+        the target inventory: when balances stay at target and only mid
+        moves, drift_now = drift_0 = 0 → pnl_brl is invariant under price
+        ticks. Trading PnL (spread × size, fees) flows through ΔBRL.
+        See _compute_portfolio_value for the diagnostic V_now (MtM noise).
+        """
+        if (self._brl_initial is None or self._btc_initial is None
+                or self._btc_target is None or self._mid_baseline is None):
+            return None
+        if mid_now <= 0:
+            return None
+        try:
+            base_asset, quote_asset = split_hb_trading_pair(
+                self.config.maker_trading_pair)
+        except Exception:
+            return None
+        try:
+            maker = self.market_data_provider.get_connector(
+                self.config.maker_connector)
+            taker = self.market_data_provider.get_connector(
+                self.config.taker_connector)
+        except Exception:
+            return None
+        if maker is None or taker is None:
+            return None
+        try:
+            brl_now = (Decimal(str(maker.get_balance(quote_asset)))
+                       + Decimal(str(taker.get_balance(quote_asset))))
+            btc_now = (Decimal(str(maker.get_balance(base_asset)))
+                       + Decimal(str(taker.get_balance(base_asset))))
+        except Exception:
+            return None
+        drift_now = btc_now - self._btc_target
+        drift_0 = self._btc_initial - self._btc_target
+        pnl = ((brl_now - self._brl_initial)
+               + (drift_now * mid_now - drift_0 * self._mid_baseline))
+
+        # Fee asset contribution — mesma fórmula drift-target. Mantém a
+        # compra de BNB (ou outro fee asset) PnL-neutra: ΔBRL cai pelo
+        # custo, drift_fee×mid_fee sobe na mesma magnitude. Mark-to-market
+        # do saldo de fee asset segue exposto (correto: é exposição real).
+        fee_cfg = self.config.fee_assets
+        if fee_cfg.enabled and self._fee_assets_initial:
+            for fee_asset, fee_target_raw in fee_cfg.targets.items():
+                initial = self._fee_assets_initial.get(fee_asset)
+                mid_baseline = self._fee_assets_mid_baseline.get(fee_asset)
+                if initial is None or mid_baseline is None:
+                    continue  # baseline not latched yet — skip this tick
+                pair = self._fee_asset_pair(fee_asset)
+                cached = self._fee_price_cache.get(pair)
+                if cached is None:
+                    continue  # no price yet — skip
+                price_now, _ = cached
+                try:
+                    actual_now = (
+                        self._safe_total_balance(
+                            self.config.maker_connector, fee_asset)
+                        + self._safe_total_balance(
+                            self.config.taker_connector, fee_asset)
+                    )
+                except Exception:
+                    continue
+                fee_target = Decimal(str(fee_target_raw))
+                fee_drift_now = actual_now - fee_target
+                fee_drift_0 = initial - fee_target
+                pnl += (fee_drift_now * price_now
+                        - fee_drift_0 * mid_baseline)
+        return pnl
+
+    def _trim_pnl_history(self, now: float) -> None:
+        """Drop entries older than the longest burn window + buffer.
+
+        Critical: must retain at least one sample older than the burn
+        window so ``_pnl_at_or_before(now - window)`` finds a comparator.
+        Hourly burn = 3600s, so we keep up to 3700s of history (100s
+        buffer absorbs tick jitter).
+        """
+        cutoff = now - 3700.0
+        while len(self._pnl_brl_history) > 1 and self._pnl_brl_history[1][0] < cutoff:
+            # Keep the oldest sample if it's the only one older than the
+            # window — it's still the right comparator for hourly_burn.
+            # Only pop when there's a NEWER sample that also pre-dates the
+            # cutoff (i.e. the current "oldest" is now redundant).
+            self._pnl_brl_history.popleft()
+
+    def _pnl_at_or_before(self, target_ts: float) -> Optional[Decimal]:
+        """Return the most recent pnl_brl sample whose ts <= target_ts.
+
+        Returns None if no sample is old enough — the burn window has
+        not yet collected the data point we'd compare against, so the
+        gate should NOT fire (treat as 0 burn).
+        """
+        last: Optional[Decimal] = None
+        for ts, pnl in self._pnl_brl_history:
+            if ts <= target_ts:
+                last = pnl
+            else:
+                break
+        return last
+
+    def _hourly_burn(self, now: float) -> Decimal:
+        """Return pnl_brl_now − pnl_brl_(now-3600s).
+
+        Negative values are losses; HOURLY_BURN gate trips when this is
+        ≤ -max_hourly_burn_quote. Returns 0 until the 1h sample window
+        has data old enough to compare against (avoids cold-start trips).
+        """
+        if self._pnl_brl_now is None:
             return Decimal("0")
-        total = Decimal("0")
-        for _, pnl in self._hourly_pnl_history:
-            total += pnl
-        return total
+        pnl_old = self._pnl_at_or_before(now - 3600.0)
+        if pnl_old is None:
+            return Decimal("0")
+        return self._pnl_brl_now - pnl_old
 
     def _minute_burn(self, now: float) -> Decimal:
-        """Return the net PnL sum across the last 60 seconds.
-
-        Reuses the same `_hourly_pnl_history` deque used by `_hourly_burn`;
-        no separate state. Iterates from the right (newest first) and stops
-        as soon as it crosses the 60s cutoff — O(k) where k is the count of
-        entries in the last minute (usually 0-3). Does NOT trim the deque,
-        since the 1h window still needs older entries; trimming is owned by
-        `_hourly_burn`.
-        """
-        cutoff = now - 60.0
-        total = Decimal("0")
-        # reversed() over a deque is O(1) per step
-        for ts, pnl in reversed(self._hourly_pnl_history):
-            if ts < cutoff:
-                break
-            total += pnl
-        return total
+        """Same idea as _hourly_burn but over 60s. Same cold-start guard."""
+        if self._pnl_brl_now is None:
+            return Decimal("0")
+        pnl_old = self._pnl_at_or_before(now - 60.0)
+        if pnl_old is None:
+            return Decimal("0")
+        return self._pnl_brl_now - pnl_old
 
     def _compute_regime(
         self,
@@ -3837,67 +4545,94 @@ class XEMMLeadLagController(ControllerBase):
             self._kill_reason = "KILL_SWITCH"
             return Regime.KILLED, "KILL_SWITCH"
 
-        # 3. Circuit breakers (PnL-based — each measures a different failure mode)
+        # 3. Circuit breakers (PnL-based — derived from drift-target pnl_brl)
+        #
+        # pnl_brl(t) = (BRL_now − BRL_0)
+        #            + (drift_now × mid_now − drift_0 × mid_0)
+        # where drift = BASE_balance − BTC_target. See _compute_pnl_brl.
+        #
+        # Why not V_now (mid_now everywhere): with 0.2 BTC inventory, every
+        # BTC price tick moved V by ~0.2 × Δmid — pure MtM noise. The
+        # drift-target model cancels that: balanced inventory at target
+        # has drift=0, so price ticks do not flow into pnl_brl.
+        # 2026-05-18 v2 (replaced 2026-05-18 v1 V-MtM model after prod
+        # incident at 09:53 — MINUTE_BURN tripped on a 0.025% BTC move).
+        #
+        # NOTES on removed gates:
+        #   * HEDGE_FAILURES_N (removed 2026-05-12) — superseded by
+        #     barrier-pattern audit + UNREALIZED_LOSS.
+        #   * LOSING_STREAK_N (removed 2026-05-18) — was redundant with
+        #     MINUTE_BURN, and mis-fired in prod 2026-05-17 23:54 due to
+        #     a sign bug in XEMMExecutor.get_net_pnl_quote on SELL fills.
 
-        # NOTE (2026-05-12): HEDGE_FAILURES_N gate removed. It was based on
-        # the ``_drift_consecutive_audits`` strike rule which fired on false
-        # positives from stale balance / hedge-in-flight races. The barrier-
-        # pattern audit (see _run_inventory_audit) eliminates those races at
-        # the source, so a separate "N strikes" rule serves no purpose.
-        # Real hedge failures still surface via UNREALIZED_LOSS (drift × mid
-        # over the absolute threshold) and DAILY_LOSS_LIMIT (cumulative PnL).
+        # 3a. DAILY_LOSS_LIMIT — pnl_brl vs pnl_brl at most recent UTC midnight.
+        if (self._pnl_brl_day_start is not None and self._pnl_brl_now is not None):
+            daily_pnl = self._pnl_brl_now - self._pnl_brl_day_start
+            if daily_pnl <= -self.config.max_daily_loss_quote:
+                self._kill_reason = "DAILY_LOSS_LIMIT"
+                return Regime.KILLED, "DAILY_LOSS_LIMIT"
 
-        # 3a. DAILY_LOSS_LIMIT — realized PnL since UTC midnight.
-        if self._daily_realized_pnl <= -self.config.max_daily_loss_quote:
-            self._kill_reason = "DAILY_LOSS_LIMIT"
-            return Regime.KILLED, "DAILY_LOSS_LIMIT"
+        # 3b. SESSION_DRAWDOWN — pnl_brl_peak vs pnl_brl_now (peak-to-trough).
+        # Catches "made 80 BRL by lunch, gave back 60 by dinner".
+        if (self._pnl_brl_peak is not None and self._pnl_brl_now is not None):
+            drawdown = self._pnl_brl_peak - self._pnl_brl_now
+            if drawdown >= self.config.max_session_drawdown_quote:
+                self._kill_reason = f"SESSION_DRAWDOWN_{drawdown:.2f}"
+                return Regime.KILLED, self._kill_reason
 
-        # 3c. SESSION_DRAWDOWN — peak-to-trough since process start.
-        # Catches "made 80 BRL by lunch, gave back 60 by dinner" — net daily
-        # is +20 (under DAILY_LOSS_LIMIT) but drawdown is 60 BRL.
-        drawdown = self._session_pnl_peak - self._session_pnl_total
-        if drawdown >= self.config.max_session_drawdown_quote:
-            self._kill_reason = f"SESSION_DRAWDOWN_{drawdown:.2f}"
-            return Regime.KILLED, self._kill_reason
-
-        # 3d. LOSING_STREAK — N consecutive closed executors with net_pnl < 0.
-        # Fast-trip for adverse-selection clusters before daily_loss accumulates.
-        if self._consecutive_losing_fills >= self.config.max_consecutive_losing_fills:
-            self._kill_reason = f"LOSING_STREAK_{self._consecutive_losing_fills}"
-            return Regime.KILLED, self._kill_reason
-
-        # 3e1. MINUTE_BURN — sum of net_pnl over the last 60s.
-        # Catches acute drawdowns (signal inversion, cascade of bad fills)
-        # before the 1h window has time to accumulate. Companion to
-        # HOURLY_BURN, not a replacement.
+        # 3c. MINUTE_BURN — pnl_brl_now − pnl_brl_{now-60s}.
+        # Catches acute drawdowns (signal inversion, cascade of bad fills).
         minute_burn = self._minute_burn(now)
         if minute_burn <= -self.config.max_minute_burn_quote:
             self._kill_reason = f"MINUTE_BURN_{minute_burn:.2f}"
             return Regime.KILLED, self._kill_reason
 
-        # 3e2. HOURLY_BURN — sum of net_pnl over the last 3600s.
-        # Detects slow bleeds before daily_loss bites (e.g. consistent ~5 BRL
-        # losses across an hour adds to 50 BRL — half the daily limit, but a
-        # clear signal something is broken).
+        # 3d. HOURLY_BURN — pnl_brl_now − pnl_brl_{now-3600s}.
+        # Catches slow bleeds before daily_loss bites.
         burn = self._hourly_burn(now)
         if burn <= -self.config.max_hourly_burn_quote:
             self._kill_reason = f"HOURLY_BURN_{burn:.2f}"
             return Regime.KILLED, self._kill_reason
 
-        # 3f. UNREALIZED_LOSS — sum of |drift| * mid_price across base assets.
-        # Defense-in-depth against the case where inventory_audit's auto_rebalance
-        # cannot keep up with growing drift (e.g. taker side keeps rejecting
-        # MARKET orders). max_drift_quote triggers rebalance at e.g. 60 BRL;
-        # this gate trips KILL once the cumulative exposure crosses the higher
-        # threshold (default 100 BRL) without waiting for the 30-audit DRIFT_STUCK.
+        # 3f. UNREALIZED_EXPOSURE — sum of |drift| × mid_price across base
+        # assets. Audit-aware: kill ONLY if exposure persists for
+        # ``unrealized_exposure_grace_sec`` while audit is NOT actively
+        # trying to reduce it (no pending rebalance, no recent fill).
+        # Prior naming was UNREALIZED_LOSS but the metric is notional
+        # exposure; real "loss" is unwind cost (~5-10 bps of this notional).
         total_drift_quote = Decimal("0")
         for asset, info in self._last_audit_results.items():
             if asset.startswith("_") or not isinstance(info, dict):
                 continue
             total_drift_quote += info.get("delta_quote", Decimal("0"))
-        if total_drift_quote >= self.config.max_unrealized_loss_quote:
-            self._kill_reason = f"UNREALIZED_LOSS_{total_drift_quote:.2f}"
-            return Regime.KILLED, self._kill_reason
+
+        if total_drift_quote < self.config.max_unrealized_loss_quote:
+            self._unrealized_exposure_trip_at = None
+        else:
+            audit_busy = (
+                len(self._pending_rebalances) > 0
+                or self._has_inflight_activity()
+            )
+            if audit_busy:
+                # Audit / hedge in progress — defer kill, reset timer.
+                self._unrealized_exposure_trip_at = None
+            else:
+                # Exposure persists with audit quiet. Start (or continue)
+                # the persistence timer.
+                if self._unrealized_exposure_trip_at is None:
+                    self._unrealized_exposure_trip_at = now
+                    self.logger().warning(
+                        f"[exposure_trip_start] drift={total_drift_quote:.2f} "
+                        f">= {self.config.max_unrealized_loss_quote}; "
+                        f"grace={self.config.unrealized_exposure_grace_sec}s "
+                        f"before KILL. audit_busy=false"
+                    )
+                elapsed = now - self._unrealized_exposure_trip_at
+                if elapsed >= self.config.unrealized_exposure_grace_sec:
+                    self._kill_reason = (
+                        f"UNREALIZED_EXPOSURE_{total_drift_quote:.2f}"
+                    )
+                    return Regime.KILLED, self._kill_reason
 
         # 4. Hard PAUSE gates
         if self._signal.is_any_stale:
@@ -4125,11 +4860,37 @@ class XEMMLeadLagController(ControllerBase):
     def _make_create_action(
         self, maker_side: TradeType, target_profitability: Decimal, now: float,
     ) -> Optional[CreateExecutorAction]:
-        # Defensive max-lot gate. ``order_amount`` is config-fixed so this
-        # should never trip in normal operation — fires only if config got
-        # mutated at runtime or `max_order_amount_multiplier` was set < 1.
+        # Snap-to-top dynamic sizing: shrink maker order to ride the top of
+        # the taker book when it offers a materially better price than the
+        # VWAP for the full ``order_amount``. Falls back to order_amount when
+        # disabled, when no book data is available, or when the top layer is
+        # too thin / not enough of an edge. ``effective_amount`` is always
+        # in ``(0, order_amount]``.
+        effective_amount, snap_tel = self._compute_snap_order_amount(maker_side)
+        if snap_tel.get("active"):
+            self.logger().info(
+                f"[snap] side={maker_side.name} active=true "
+                f"top_size={snap_tel.get('top_size')} "
+                f"top_price={snap_tel.get('top_price')} "
+                f"vwap_full={snap_tel.get('vwap_full')} "
+                f"edge_gain_bps={snap_tel.get('edge_gain_bps')} "
+                f"chosen={snap_tel.get('chosen')} "
+                f"(full={self.config.order_amount})"
+            )
+        else:
+            # DEBUG to avoid spam; reason is greppable when needed.
+            self.logger().debug(
+                f"[snap] side={maker_side.name} active=false "
+                f"reason={snap_tel.get('reason')} "
+                f"top_size={snap_tel.get('top_size')} "
+                f"edge_gain_bps={snap_tel.get('edge_gain_bps')}"
+            )
+
+        # Defensive max-lot gate. Snap can only shrink, so this should never
+        # trip; kept as belt-and-suspenders if config gets mutated at runtime
+        # or `max_order_amount_multiplier` was set < 1.
         if not self._check_max_lot(
-            self.config.order_amount,
+            effective_amount,
             source=f"xemm_spawn:{maker_side.name}",
         ):
             return None
@@ -4157,7 +4918,7 @@ class XEMMLeadLagController(ControllerBase):
             buying_market=buying,
             selling_market=selling,
             maker_side=maker_side,
-            order_amount=self.config.order_amount,
+            order_amount=effective_amount,
             min_profitability=self.config.min_profitability,
             target_profitability=target_profitability,
             max_profitability=self.config.max_profitability,
@@ -4165,6 +4926,10 @@ class XEMMLeadLagController(ControllerBase):
             lead_signal_bps=best_lead,
             placement_lead_aware_delta_bps=self.config.placement_lead_aware_delta_bps,
             placement_lead_signal_threshold_bps=self.config.placement_lead_signal_threshold_bps,
+            # Below this notional value the hedge is antieconômico (Binance
+            # MIN_NOTIONAL rejects ~50 BRL anyway; audit's silent threshold
+            # is the same value). Audit picks up the unhedged residual.
+            min_hedge_value_quote=self.config.inventory_audit.max_drift_quote,
         )
         return CreateExecutorAction(
             controller_id=self.config.id,

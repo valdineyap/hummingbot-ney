@@ -20,13 +20,11 @@ This subclass adds:
 import asyncio
 import logging
 from decimal import Decimal
-from typing import Optional, Union
+from typing import Optional
 
 from hummingbot.core.data_type.common import OrderType, PriceType, TradeType
 from hummingbot.core.event.events import (
-    BuyOrderCreatedEvent,
     MarketOrderFailureEvent,
-    SellOrderCreatedEvent,
 )
 from hummingbot.core.utils.async_utils import safe_ensure_future
 from hummingbot.logger import HummingbotLogger
@@ -68,6 +66,12 @@ class LeadLagArbitrageExecutor(ArbitrageExecutor):
         # supervision (they're synchronously matched server-side).
         self._aggressive_limit_buy_active: bool = False
         self._aggressive_limit_sell_active: bool = False
+        # Set True when execute_arbitrage runs in a fill-based leg-ordering
+        # mode ("maker_first" / "taker_first"). The aggressive-limit watchdog
+        # uses this to skip the unwind path — in fill-based modes the second
+        # leg is sized to the realized executed_amount, so by construction
+        # there is no taker exposure to unwind.
+        self._fill_based_leg_ordering_active: bool = False
 
     # ------------------------------------------------------------------ #
     # Leg ordering (parallel / maker_first / taker_first)                  #
@@ -76,14 +80,29 @@ class LeadLagArbitrageExecutor(ArbitrageExecutor):
         """Override base to support configurable leg ordering.
 
         Modes (role-based, exchange-agnostic):
-          - ``parallel`` (default): place both legs back-to-back without
-            awaiting between them. The REST round-trips overlap on the
-            event loop — minimal exposure window between spawn and both
-            legs landing on their respective exchanges.
-          - ``maker_first``: dispatch the leg on the maker connector
-            first, wait for its REST to ACK (exchange_order_id assigned),
-            then dispatch the taker leg.
-          - ``taker_first``: symmetric — taker leg first.
+
+          ``parallel`` (default)
+            Place both legs back-to-back without awaiting between them.
+            REST round-trips overlap on the event loop. Lowest latency,
+            highest exposure if one leg fails to fill (failed-leg unwind
+            path then fires).
+
+          ``maker_first``
+            Place the maker leg first at full ``order_amount``. Poll
+            until ``executed_amount_base > 0`` OR the maker order
+            terminates with zero fills.
+              - Any fill (full or partial) → cancel any remaining open
+                portion, then place the taker leg sized to the realized
+                maker ``executed_amount_base``. The 2nd leg matches what
+                actually crossed, never more.
+              - Zero fills at terminal state (typically the aggressive-
+                limit watchdog's cancel at timeout) → close cleanly with
+                no taker placement. By construction there is no exposure
+                to unwind.
+
+          ``taker_first``
+            Symmetric to ``maker_first`` — taker leg placed first,
+            second leg (maker) sized to the realized taker fill.
 
         Maker/taker identification comes from ``config.maker_connector_name``
         (passed by the controller). If absent and a non-parallel mode is
@@ -98,6 +117,15 @@ class LeadLagArbitrageExecutor(ArbitrageExecutor):
         if mode == "parallel":
             self.place_buy_arbitrage_order()
             self.place_sell_arbitrage_order()
+            # Suppress controller-level orphan_hedge for whichever leg
+            # lands on the maker connector. Without this the controller's
+            # _maybe_dispatch_orphan_hedge fires in parallel with the arb
+            # executor processing its own fill — observed 2026-05-18 19:01Z
+            # double-hedge incident on a maker_first arb. The taker leg's
+            # id is also registered (defensive no-op: orphan_hedge only
+            # dispatches on maker-side fills).
+            self._notify_controller_self_dispatched_market(self.buy_order.order_id)
+            self._notify_controller_self_dispatched_market(self.sell_order.order_id)
             return
 
         maker_name = getattr(self.config, "maker_connector_name", None)
@@ -108,6 +136,8 @@ class LeadLagArbitrageExecutor(ArbitrageExecutor):
             )
             self.place_buy_arbitrage_order()
             self.place_sell_arbitrage_order()
+            self._notify_controller_self_dispatched_market(self.buy_order.order_id)
+            self._notify_controller_self_dispatched_market(self.sell_order.order_id)
             return
 
         # Sequential modes — determine which leg is "first" based on
@@ -124,46 +154,148 @@ class LeadLagArbitrageExecutor(ArbitrageExecutor):
             )
             self.place_buy_arbitrage_order()
             self.place_sell_arbitrage_order()
+            self._notify_controller_self_dispatched_market(self.buy_order.order_id)
+            self._notify_controller_self_dispatched_market(self.sell_order.order_id)
             return
 
+        # Fill-based execution: place 1st leg, wait for any fill, then
+        # place 2nd leg sized to the realized executed_amount.
+        self._fill_based_leg_ordering_active = True
         if buy_is_first:
             self.place_buy_arbitrage_order()
-            await self._wait_for_order_ack(self.buy_order)
-            self.place_sell_arbitrage_order()
+            first_wrapper = self.buy_order
+            first_market = self.buying_market
         else:
             self.place_sell_arbitrage_order()
-            await self._wait_for_order_ack(self.sell_order)
+            first_wrapper = self.sell_order
+            first_market = self.selling_market
+
+        # Suppress controller-level orphan_hedge for the first leg. The
+        # arb executor owns this order and processes the fill via
+        # _wait_for_first_fill below; without this, the controller's
+        # _maybe_dispatch_orphan_hedge fires in parallel and the resulting
+        # MARKET hedge runs alongside the executor's own leg-2 dispatch
+        # → double-hedge → short position → MINUTE_BURN kill (observed
+        # 2026-05-18 19:01Z, ~R$75 loss). The controller's ownership
+        # lookup (_find_live_executor_owning_maker) can't see arb owners
+        # because ArbitrageExecutor.get_custom_info doesn't expose
+        # maker_order_id; this explicit registration bridges that gap.
+        self._notify_controller_self_dispatched_market(first_wrapper.order_id)
+
+        # Wait until first leg has any executed amount > 0 OR reaches a
+        # terminal state with zero fills. Time budget = aggressive-limit
+        # timeout + 1.5s grace (so we observe the watchdog's cancel and
+        # any late_fill_recovery emission before bailing out).
+        timeout_sec = (
+            self.config.arb_aggressive_limit_timeout_sec + 1.5
+        )
+        filled_amount = await self._wait_for_first_fill(
+            first_wrapper,
+            timeout_sec=timeout_sec,
+        )
+
+        if filled_amount is None or filled_amount <= Decimal("0"):
+            self.logger().info(
+                f"[leg_ordering] {mode}: first leg "
+                f"{first_wrapper.order_id} terminated with zero fills — "
+                f"closing executor with no taker placement (no exposure)"
+            )
+            self.close_type = CloseType.EXPIRED
+            self.stop()
+            return
+
+        # Any fill (full or partial) — cancel any remaining open portion
+        # of the first leg and capture late fills that land during the
+        # cancel round-trip.
+        full_amount = self.order_amount
+        first_order_id = first_wrapper.order_id
+        if filled_amount < full_amount and first_order_id is not None:
+            try:
+                self._strategy.cancel(
+                    connector_name=first_market.connector_name,
+                    trading_pair=first_market.trading_pair,
+                    order_id=first_order_id,
+                )
+            except Exception as e:
+                self.logger().error(
+                    f"[leg_ordering] {mode}: cancel of partial first leg "
+                    f"{first_order_id} raised "
+                    f"{type(e).__name__}: {e} — proceeding to hedge "
+                    f"the {filled_amount} already filled"
+                )
+            # Give the cancel REST + late_fill_recovery a moment to
+            # reconcile the tracker. Re-read executed_amount in case more
+            # filled during the cancel.
+            await asyncio.sleep(0.5)
+            if first_wrapper.order is not None:
+                latest_filled = first_wrapper.order.executed_amount_base
+                if latest_filled > filled_amount:
+                    self.logger().info(
+                        f"[leg_ordering] {mode}: late fill during cancel "
+                        f"raised executed from {filled_amount} to "
+                        f"{latest_filled} — hedging the larger amount"
+                    )
+                    filled_amount = latest_filled
+                    # If the late fill brought us all the way to the
+                    # original size, no shrink is needed below — but
+                    # cap defensively anyway.
+                    if filled_amount > full_amount:
+                        filled_amount = full_amount
+
+        # Resize order_amount so the 2nd leg matches the realized fill of
+        # the 1st leg. The 1st leg already placed at full size (above) so
+        # this mutation only affects the 2nd-leg dispatch path.
+        self.order_amount = filled_amount
+        self.logger().info(
+            f"[leg_ordering] {mode}: first leg filled {filled_amount} of "
+            f"{full_amount} (ratio={filled_amount / full_amount:.4f}) — "
+            f"placing second leg sized to the realized fill"
+        )
+        if buy_is_first:
+            self.place_sell_arbitrage_order()
+        else:
             self.place_buy_arbitrage_order()
 
-    async def _wait_for_order_ack(
+    async def _wait_for_first_fill(
         self,
         tracked_order_wrapper,
-        max_wait_sec: float = 5.0,
+        timeout_sec: float,
         poll_interval_sec: float = 0.05,
-    ) -> bool:
-        """Wait until the order has been acknowledged by the exchange
-        (i.e., ``exchange_order_id`` is assigned on the tracker). This is
-        the moment ``_place_order`` REST returned successfully. Does NOT
-        wait for fill — that would take arbitrarily long for non-crossing
-        LIMITs and conflict with the AGGRESSIVE_LIMIT timeout watchdog.
+    ) -> Optional[Decimal]:
+        """Poll the order until ``executed_amount_base`` is positive OR
+        the order reaches a terminal state (cancelled / failed / done).
 
-        On timeout (max_wait_sec elapsed), logs a warning and returns
-        False — the caller proceeds to the next leg anyway, treating
-        the timeout as a placement failure that the partial-leg
-        ``UNWIND`` path will handle if the order eventually lands.
+        Returns:
+            Decimal(executed_amount_base) — when any fill is detected.
+            None — when the order terminated with zero fills (or the
+                   timeout elapsed without any fill).
+
+        This is the gating primitive for the fill-based leg-ordering
+        modes (``maker_first`` and ``taker_first``). The caller cancels
+        any remaining open portion when the returned amount is < the
+        full ``order_amount``.
         """
-        max_iterations = int(max_wait_sec / poll_interval_sec)
+        max_iterations = int(timeout_sec / poll_interval_sec)
         for _ in range(max_iterations):
             order = tracked_order_wrapper.order
-            if order is not None and order.exchange_order_id is not None:
-                return True
+            if order is not None:
+                executed = order.executed_amount_base
+                if executed > Decimal("0"):
+                    return executed
+                if (
+                    order.is_cancelled
+                    or order.is_failure
+                    or order.is_done
+                ):
+                    # Terminal with zero fills
+                    return None
             await asyncio.sleep(poll_interval_sec)
         self.logger().warning(
-            f"[leg_ordering] timeout {max_wait_sec}s waiting for ACK on "
-            f"order_id={tracked_order_wrapper.order_id} — placing next leg "
-            f"anyway (partial-leg failure path will handle inconsistency)"
+            f"[leg_ordering] _wait_for_first_fill: timeout {timeout_sec}s "
+            f"waiting on {tracked_order_wrapper.order_id} — treating as "
+            f"zero-fill termination"
         )
-        return False
+        return None
 
     # ------------------------------------------------------------------ #
     # Order placement — aggressive LIMIT for BitPreco                     #
@@ -294,6 +426,17 @@ class LeadLagArbitrageExecutor(ArbitrageExecutor):
         # Give the cancel + late_fill_recovery path a moment to update the
         # tracker's executed_amount before we compute the imbalance.
         await asyncio.sleep(0.5)
+
+        # Fill-based leg ordering (``maker_first`` / ``taker_first``) sizes
+        # the 2nd leg to the realized executed_amount of the 1st leg, so by
+        # construction there is no taker exposure to unwind. Suppress the
+        # unwind path to avoid racing the 2nd-leg placement.
+        if self._fill_based_leg_ordering_active:
+            self.logger().info(
+                "[aggressive_limit_timeout] fill-based leg ordering active "
+                "— skipping unwind path (2nd leg sized to realized fill)"
+            )
+            return
 
         buy_filled = (
             self.buy_order.executed_amount_base
@@ -514,14 +657,30 @@ class LeadLagArbitrageExecutor(ArbitrageExecutor):
             self.stop()
 
     def _notify_controller_self_dispatched_market(self, order_id: Optional[str]) -> None:
-        """Register a self-dispatched MARKET (unwind) on any controller
-        that exposes ``register_self_dispatched_market_id``. Best-effort:
-        we discover controllers via ``self._strategy.controllers`` and
-        ignore strategies that don't expose them (e.g. tests that mock
-        the strategy with MagicMock). Silently no-op on any failure —
-        the absence of this notification only re-enables the prior
-        (buggy) orphan_hedge behaviour on the unwind fill, but never
-        breaks the unwind itself.
+        """Tell controllers to skip orphan_hedge for ``order_id``.
+
+        Used in two paths:
+
+          1. **Unwind** (`_unwind_partial`) — a self-dispatched MARKET
+             that closes a one-sided exposure. Firing controller's
+             orphan_hedge on it re-opens the exposure (drift→rebalance
+             loop seen 2026-05-16).
+
+          2. **Arb leg placement** (`execute_arbitrage`) — every leg
+             placed by the arb executor is owned by it: the executor
+             processes its own fill via the normal listener path or via
+             `_wait_for_first_fill`. The controller's orphan_hedge would
+             fire in parallel and create a double-hedge (observed
+             2026-05-18 19:01Z, ~R$75 loss). The controller's owner
+             lookup (`_find_live_executor_owning_maker`) doesn't catch
+             arb owners because `ArbitrageExecutor.get_custom_info`
+             doesn't expose `maker_order_id`; this explicit registration
+             bridges that gap.
+
+        Best-effort: discovers controllers via ``self._strategy.controllers``;
+        silently no-ops if absent (e.g. MagicMock strategies in tests).
+        Failure here only re-enables the prior orphan_hedge behaviour
+        on that order's fill — it never breaks the arb itself.
         """
         if not order_id:
             return

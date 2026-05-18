@@ -391,6 +391,63 @@ class TestXEMMExecutor(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest):
         # shutdown path (waiting for taker to settle).
         self.assertEqual(self.executor.status, RunnableStatus.SHUTTING_DOWN)
 
+    def test_process_order_canceled_skips_hedge_for_sub_threshold_partial(self):
+        """When ``executed × mid < min_hedge_value_quote``, the executor
+        must NOT place a taker hedge — let inventory_audit absorb the
+        residual as drift. Prevents the 2026-05-18 11:32 over-hedge bug
+        chain: MIN_NOTIONAL reject → buggy retry → 2000x full-lot hedge.
+        """
+        self.executor._status = RunnableStatus.RUNNING
+        # Inject min_hedge_value_quote on the config (default 60 BRL on
+        # XEMMLeadLagExecutorConfig; base XEMMExecutorConfig is patched
+        # via setattr for this test).
+        self.executor.config.min_hedge_value_quote = Decimal("60")
+        # Tiny partial fill: 0.001 base × mid 1.0 = 0.001 quote ≪ 60.
+        self.executor.maker_order = TrackedOrder(order_id="OID-BUY-1")
+        in_flight = MagicMock()
+        in_flight.executed_amount_base = Decimal("0.001")
+        self.executor.maker_order.order = in_flight
+
+        with patch.object(self.executor, "get_price", return_value=Decimal("1")):
+            cancel_event = OrderCancelledEvent(
+                timestamp=1234, order_id="OID-BUY-1",
+                exchange_order_id="ex-OID-BUY-1",
+            )
+            self.executor.process_order_canceled_event(
+                1, MagicMock(), cancel_event,
+            )
+
+        # No hedge placed (the fix).
+        self.assertIsNone(self.executor.taker_order)
+        self.strategy.sell.assert_not_called()
+        # Executor shuts down — controller spawns fresh on next tick.
+        self.assertEqual(self.executor.status, RunnableStatus.SHUTTING_DOWN)
+
+    def test_process_order_canceled_hedges_above_threshold_partial(self):
+        """Above-threshold partial fills still get hedged — the skip is
+        only for residuals too small to economically hedge."""
+        self.executor._status = RunnableStatus.RUNNING
+        self.executor.config.min_hedge_value_quote = Decimal("60")
+        # 50 base × mid 2.0 = 100 quote > 60 → hedge normally.
+        self.executor.maker_order = TrackedOrder(order_id="OID-BUY-1")
+        in_flight = MagicMock()
+        in_flight.executed_amount_base = Decimal("50")
+        self.executor.maker_order.order = in_flight
+
+        with patch.object(self.executor, "get_price", return_value=Decimal("2")):
+            cancel_event = OrderCancelledEvent(
+                timestamp=1234, order_id="OID-BUY-1",
+                exchange_order_id="ex-OID-BUY-1",
+            )
+            self.executor.process_order_canceled_event(
+                1, MagicMock(), cancel_event,
+            )
+
+        self.assertIsNotNone(self.executor.taker_order)
+        self.strategy.sell.assert_called_once()
+        # Hedged for the executed amount, not the full config order_amount.
+        self.assertEqual(self.strategy.sell.call_args.args[2], Decimal("50"))
+
     def test_process_order_canceled_no_fill_no_hedge(self):
         """Cancel with zero executed amount must not place a hedge."""
         self.executor._status = RunnableStatus.RUNNING
@@ -505,7 +562,7 @@ class TestXEMMExecutor(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest):
         self.strategy.sell.assert_called_once()
         self.assertEqual(self.strategy.sell.call_args.args[2], Decimal("100"))
 
-    def test_process_order_failed_event(self):
+    def test_process_order_failed_event_maker_clears_state(self):
         self.executor.maker_order = TrackedOrder(order_id="OID-BUY-1")
         maker_failure_event = MarketOrderFailureEvent(
             timestamp=1234,
@@ -515,14 +572,34 @@ class TestXEMMExecutor(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest):
         self.executor.process_order_failed_event(1, MagicMock(), maker_failure_event)
         self.assertEqual(self.executor.maker_order, None)
 
+    def test_process_order_failed_event_taker_does_not_retry(self):
+        """When the taker hedge fails (e.g. Binance MIN_NOTIONAL reject on a
+        tiny partial-fill hedge), the executor MUST NOT silently retry with
+        the default ``self.config.order_amount`` (full lot) — that bug
+        produced a 2000x over-hedge in prod 2026-05-18 11:32. The new
+        behaviour: log + transition to SHUTTING_DOWN; let inventory_audit
+        reconcile via auto_rebalance.
+        """
+        self.executor._status = RunnableStatus.RUNNING
         self.executor.taker_order = TrackedOrder(order_id="OID-SELL-0")
+        # Side-effect tracker — we must NOT call strategy.sell again after
+        # the original "OID-SELL-0" placement.
+        self.strategy.sell.reset_mock()
+
         taker_failure_event = MarketOrderFailureEvent(
             timestamp=1234,
             order_id="OID-SELL-0",
             order_type=OrderType.MARKET,
         )
         self.executor.process_order_failed_event(1, MagicMock(), taker_failure_event)
-        self.assertEqual(self.executor.taker_order.order_id, "OID-SELL-1")
+
+        # No new hedge placed (the fix).
+        self.strategy.sell.assert_not_called()
+        # Executor shuts down so the controller can spawn fresh on next tick;
+        # audit will catch any residual drift.
+        self.assertEqual(self.executor.status, RunnableStatus.SHUTTING_DOWN)
+        # Original failed order recorded for diagnostics.
+        self.assertIn(self.executor.taker_order, self.executor.failed_orders)
 
     def test_get_custom_info(self):
         self.assertEqual(self.executor.get_custom_info(), {'maker_connector': 'binance',

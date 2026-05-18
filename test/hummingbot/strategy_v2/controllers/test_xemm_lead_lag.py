@@ -34,6 +34,7 @@ from hummingbot.strategy_v2.models.executor_actions import (
 )
 
 from controllers.generic.xemm_lead_lag import (
+    FeeAssetConfig,
     InventoryAuditConfig,
     Regime,
     XEMMLeadLagConfig,
@@ -350,9 +351,10 @@ class TestRiskGates(_BaseControllerTest):
 class TestPnlSafetyGates(_BaseControllerTest):
     """Verifies each PnL-based circuit breaker fires and latches KILLED.
 
-    All tests bypass warmup with _push_warm_history-equivalent inline loops
-    then set the relevant counter directly. The regime computation is what
-    we want to test, not the fill-detection path.
+    Gates are derived from drift-target pnl_brl (refactor 2026-05-18 v2):
+       pnl_brl(t) = (BRL_now − BRL_0) + (drift_now × mid_now − drift_0 × mid_0)
+    Tests inject specific pnl_brl values by mocking ``_compute_pnl_brl``
+    and pre-setting baseline anchors so the tick's latch logic is skipped.
     """
 
     async def _warm(self):
@@ -360,10 +362,39 @@ class TestPnlSafetyGates(_BaseControllerTest):
             self.market_data_provider.time.return_value = 1700000000.0 + i
             await self.controller.update_processed_data()
 
+    def _mock_pnl(self, pnl_now: Decimal) -> None:
+        """Make ``_compute_pnl_brl`` return ``pnl_now`` each call.
+
+        Side-effects:
+          * Pre-sets the four baseline fields so the tick latch block is
+            skipped (the tick latches baselines only when
+            ``_mid_baseline is None``).
+          * Tests should call this AFTER setting any state they want to
+            persist (e.g. ``_pnl_brl_day_start``).
+        """
+        from unittest.mock import MagicMock
+        self.controller._compute_pnl_brl = MagicMock(return_value=pnl_now)
+        if self.controller._mid_baseline is None:
+            self.controller._brl_initial = Decimal("0")
+            self.controller._btc_initial = Decimal("0")
+            self.controller._btc_target = Decimal("0")
+            self.controller._mid_baseline = Decimal("300000")
+
+    def _seed_pnl_day_key(self, now_ts: float = 1700000050.0) -> None:
+        """Pre-set _pnl_brl_day_start_key so the day-rollover branch in
+        the next tick does NOT overwrite _pnl_brl_day_start."""
+        from datetime import datetime as _dt
+        self.controller._pnl_brl_day_start_key = (
+            _dt.utcfromtimestamp(now_ts).strftime("%Y-%m-%d")
+        )
+
     async def test_daily_loss_limit_trips_killed(self):
         await self._warm()
-        # Push past the limit (default 100 BRL).
-        self.controller._daily_realized_pnl = Decimal("-100.01")
+        # pnl_brl_day_start = 0; push pnl_brl_now = -100.01 → daily = -100.01.
+        self.controller._pnl_brl_day_start = Decimal("0")
+        self.controller._pnl_brl_peak = Decimal("0")
+        self._seed_pnl_day_key()
+        self._mock_pnl(Decimal("-100.01"))
         self.market_data_provider.time.return_value = 1700000050.0
         await self.controller.update_processed_data()
         self.assertEqual(self.controller.processed_data["regime"], Regime.KILLED)
@@ -373,7 +404,11 @@ class TestPnlSafetyGates(_BaseControllerTest):
 
     async def test_daily_loss_just_under_does_not_trip(self):
         await self._warm()
-        self.controller._daily_realized_pnl = Decimal("-99.99")
+        # daily = -99.99. peak=pnl_now to keep drawdown=0.
+        self.controller._pnl_brl_day_start = Decimal("0")
+        self.controller._pnl_brl_peak = Decimal("-99.99")
+        self._seed_pnl_day_key()
+        self._mock_pnl(Decimal("-99.99"))
         self.market_data_provider.time.return_value = 1700000050.0
         await self.controller.update_processed_data()
         self.assertNotEqual(
@@ -382,10 +417,12 @@ class TestPnlSafetyGates(_BaseControllerTest):
 
     async def test_session_drawdown_trips_killed(self):
         await self._warm()
-        # Peak was 80 BRL, currently -20 → drawdown = 100 BRL.
-        # Default max_session_drawdown_quote = 50 BRL → trips.
-        self.controller._session_pnl_peak = Decimal("80")
-        self.controller._session_pnl_total = Decimal("-20")
+        # Peak +80, current +29 → drawdown 51 ≥ 50 → trips.
+        # day_start = pnl_now so DAILY_LOSS_LIMIT doesn't fire first.
+        self.controller._pnl_brl_peak = Decimal("80")
+        self.controller._pnl_brl_day_start = Decimal("29")
+        self._seed_pnl_day_key()
+        self._mock_pnl(Decimal("29"))
         self.market_data_provider.time.return_value = 1700000050.0
         await self.controller.update_processed_data()
         self.assertEqual(self.controller.processed_data["regime"], Regime.KILLED)
@@ -397,30 +434,11 @@ class TestPnlSafetyGates(_BaseControllerTest):
 
     async def test_session_drawdown_below_threshold_does_not_trip(self):
         await self._warm()
-        # Peak 30, current 0 → drawdown 30 BRL < 50 → no trip.
-        self.controller._session_pnl_peak = Decimal("30")
-        self.controller._session_pnl_total = Decimal("0")
-        self.market_data_provider.time.return_value = 1700000050.0
-        await self.controller.update_processed_data()
-        self.assertNotEqual(
-            self.controller.processed_data["regime"], Regime.KILLED
-        )
-
-    async def test_losing_streak_trips_killed(self):
-        await self._warm()
-        self.controller._consecutive_losing_fills = 5  # default max=5 → trips
-        self.market_data_provider.time.return_value = 1700000050.0
-        await self.controller.update_processed_data()
-        self.assertEqual(self.controller.processed_data["regime"], Regime.KILLED)
-        self.assertTrue(
-            self.controller.processed_data["cancel_reason"].startswith(
-                "LOSING_STREAK_"
-            )
-        )
-
-    async def test_losing_streak_under_threshold_does_not_trip(self):
-        await self._warm()
-        self.controller._consecutive_losing_fills = 4  # 4 < 5 → no trip
+        # Peak +30, current 0 → drawdown 30 < 50 → no trip.
+        self.controller._pnl_brl_peak = Decimal("30")
+        self.controller._pnl_brl_day_start = Decimal("0")
+        self._seed_pnl_day_key()
+        self._mock_pnl(Decimal("0"))
         self.market_data_provider.time.return_value = 1700000050.0
         await self.controller.update_processed_data()
         self.assertNotEqual(
@@ -429,16 +447,24 @@ class TestPnlSafetyGates(_BaseControllerTest):
 
     async def test_hourly_burn_trips_killed(self):
         await self._warm()
-        # Advance mock clock so update_processed_data definitely re-runs the
-        # regime check (signal buffer ignores same-timestamp ticks).
+        # Disable competing gates to isolate HOURLY_BURN.
+        self.controller.config.max_daily_loss_quote = Decimal("1000")
+        self.controller.config.max_session_drawdown_quote = Decimal("1000")
         self.market_data_provider.time.return_value = 1700000050.0
         now = self.market_data_provider.time.return_value
         # Default max_hourly_burn_quote = 50 BRL.
-        # Inject 10 entries × -10 BRL within the last 30 min → sum = -100.
+        # Two history samples so minute_burn doesn't co-trip:
+        #   (now-3700, +60): 1h-old anchor → hourly_burn = -1 - 60 = -61
+        #   (now-65,    -1): recent anchor → minute_burn = -1 - (-1) = 0
         from collections import deque
-        self.controller._hourly_pnl_history = deque(
-            (now - 60 - i * 30, Decimal("-10")) for i in range(10)
-        )
+        self.controller._pnl_brl_history = deque([
+            (now - 3700, Decimal("60")),
+            (now - 65, Decimal("-1")),
+        ])
+        self.controller._pnl_brl_day_start = Decimal("-1")
+        self.controller._pnl_brl_peak = Decimal("60")
+        self._seed_pnl_day_key()
+        self._mock_pnl(Decimal("-1"))
         await self.controller.update_processed_data()
         self.assertEqual(self.controller.processed_data["regime"], Regime.KILLED)
         self.assertTrue(
@@ -447,33 +473,39 @@ class TestPnlSafetyGates(_BaseControllerTest):
             )
         )
 
-    async def test_hourly_burn_old_entries_trimmed(self):
+    async def test_hourly_burn_no_old_sample_does_not_trip(self):
+        """Cold-start guard: without a sample 1h old, burn returns 0."""
         await self._warm()
         self.market_data_provider.time.return_value = 1700000050.0
-        now = self.market_data_provider.time.return_value
-        # All entries older than 3600s → should be trimmed and not trigger.
         from collections import deque
-        self.controller._hourly_pnl_history = deque(
-            (now - 4000 - i * 30, Decimal("-10")) for i in range(10)
+        self.controller._pnl_brl_history = deque(
+            [(1700000049.0, Decimal("0"))]
         )
+        self.controller._pnl_brl_day_start = Decimal("0")
+        self.controller._pnl_brl_peak = Decimal("0")
+        self._mock_pnl(Decimal("-100"))  # large drop
         await self.controller.update_processed_data()
-        self.assertNotEqual(
-            self.controller.processed_data["regime"], Regime.KILLED
+        # No old sample → hourly_burn returns 0 → no HOURLY_BURN trip.
+        # (DAILY_LOSS_LIMIT will trip first because daily = -100.)
+        self.assertEqual(
+            self.controller._hourly_burn(1700000050.0), Decimal("0")
         )
-        # Hourly burn helper should have purged everything.
-        self.assertEqual(self.controller._hourly_burn(now), Decimal("0"))
 
     async def test_minute_burn_trips_killed(self):
         await self._warm()
+        # Disable competing gates to isolate MINUTE_BURN.
+        self.controller.config.max_session_drawdown_quote = Decimal("1000")
         self.market_data_provider.time.return_value = 1700000050.0
         now = self.market_data_provider.time.return_value
-        # Default max_minute_burn_quote = 15 BRL.
-        # Inject 2 losses totalling -20 BRL within the last 60s → trips.
+        # Old sample at (now-65s) = +20. pnl_now = 0 → burn = -20 ≤ -15 → trip.
         from collections import deque
-        self.controller._hourly_pnl_history = deque([
-            (now - 30, Decimal("-12")),
-            (now - 5, Decimal("-8")),
+        self.controller._pnl_brl_history = deque([
+            (now - 65, Decimal("20")),
         ])
+        self.controller._pnl_brl_day_start = Decimal("0")
+        self.controller._pnl_brl_peak = Decimal("20")
+        self._seed_pnl_day_key()
+        self._mock_pnl(Decimal("0"))
         await self.controller.update_processed_data()
         self.assertEqual(self.controller.processed_data["regime"], Regime.KILLED)
         self.assertTrue(
@@ -482,43 +514,25 @@ class TestPnlSafetyGates(_BaseControllerTest):
             )
         )
 
-    async def test_minute_burn_ignores_older_than_60s(self):
+    async def test_minute_burn_recent_sample_does_not_trip(self):
+        """Old sample within the 60s window (NOT old enough) → no burn."""
         await self._warm()
         self.market_data_provider.time.return_value = 1700000050.0
-        now = self.market_data_provider.time.return_value
-        # All losses are 90-150s old → outside the 1min window → does NOT
-        # trip MINUTE_BURN (but their sum is -40 ≤ -hourly limit? No, hourly
-        # default 50, sum is -40, also safe).
         from collections import deque
-        self.controller._hourly_pnl_history = deque([
-            (now - 150, Decimal("-15")),
-            (now - 120, Decimal("-15")),
-            (now - 90, Decimal("-10")),
-        ])
-        await self.controller.update_processed_data()
-        self.assertNotEqual(
-            self.controller.processed_data["regime"], Regime.KILLED
+        # Only sample is 30s old → no comparator at (now-60s).
+        self.controller._pnl_brl_history = deque(
+            [(1700000020.0, Decimal("100"))]
         )
-        # Helper returns 0 — nothing in the last 60s.
-        self.assertEqual(self.controller._minute_burn(now), Decimal("0"))
-
-    async def test_minute_burn_does_not_trim_hourly_deque(self):
-        """`_minute_burn` must not pop entries — `_hourly_burn` owns trimming."""
-        await self._warm()
-        now = 1700000050.0
-        from collections import deque
-        entries = [
-            (now - 30, Decimal("-5")),
-            (now - 90, Decimal("-5")),
-            (now - 1800, Decimal("-5")),
-        ]
-        self.controller._hourly_pnl_history = deque(entries)
-        self.controller._minute_burn(now)
-        # Length unchanged after _minute_burn — all 3 entries preserved.
-        self.assertEqual(len(self.controller._hourly_pnl_history), 3)
+        self.controller._pnl_brl_day_start = Decimal("0")
+        self.controller._pnl_brl_peak = Decimal("100")
+        self._mock_pnl(Decimal("0"))
+        await self.controller.update_processed_data()
+        self.assertEqual(
+            self.controller._minute_burn(1700000050.0), Decimal("0")
+        )
 
     async def test_safety_snapshot_written_to_state_json(self):
-        """Periodic snapshot must include all PnL safety fields + limits."""
+        """Periodic snapshot must include pnl_brl fields + diagnostic V."""
         import json
         await self._warm()
         # Force snapshot cadence to fire on next tick.
@@ -531,58 +545,262 @@ class TestPnlSafetyGates(_BaseControllerTest):
             state = json.load(f)
         self.assertIn("safety", state)
         safety = state["safety"]
-        for key in ("regime", "kill_reason", "daily_realized_pnl",
+        for key in ("regime", "kill_reason",
+                    "pnl_brl_now", "pnl_brl_peak", "pnl_brl_day_start",
+                    "brl_initial", "btc_initial", "btc_target",
+                    "mid_baseline", "v_now_diagnostic",
+                    "daily_realized_pnl", "session_pnl_total",
                     "session_drawdown", "hourly_burn", "minute_burn",
-                    "consecutive_losing_fills", "limits"):
+                    "limits"):
             self.assertIn(key, safety)
         for key in ("max_daily_loss_quote", "max_minute_burn_quote",
-                    "max_hourly_burn_quote", "max_session_drawdown_quote",
-                    "max_consecutive_losing_fills"):
+                    "max_hourly_burn_quote", "max_session_drawdown_quote"):
             self.assertIn(key, safety["limits"])
+        # Old V-MtM fields explicitly REMOVED (replaced by pnl_brl_*).
+        self.assertNotIn("v_initial", safety)
+        self.assertNotIn("v_day_start", safety)
+        self.assertNotIn("v_peak", safety)
+        # LOSING_STREAK fields explicitly REMOVED.
+        self.assertNotIn("consecutive_losing_fills", safety)
+        self.assertNotIn(
+            "max_consecutive_losing_fills", safety["limits"],
+        )
 
-    async def test_unrealized_loss_trips_killed(self):
-        await self._warm()
-        # max_unrealized_loss_quote default = 100 BRL.
+    def _seed_drift(self, delta_quote: Decimal) -> None:
+        """Inject audit drift state so the UNREALIZED_EXPOSURE gate has data."""
         self.controller._last_audit_results = {
             "_drift_active": True,
             "BTC": {
                 "actual": Decimal("0.0015"),
                 "target": Decimal("0.001"),
                 "delta": Decimal("0.0005"),
-                "delta_quote": Decimal("150"),  # > 100 → trips
+                "delta_quote": delta_quote,
                 "within": False,
             },
         }
+
+    async def test_unrealized_exposure_kills_after_grace(self):
+        """Drift above limit + audit quiet + grace expired → KILL."""
+        await self._warm()
+        # Tighten limits for testability.
+        self.controller.config.max_unrealized_loss_quote = Decimal("100")
+        self.controller.config.unrealized_exposure_grace_sec = 10.0
+        # Disable audit so seeded drift state persists across ticks.
+        from unittest.mock import AsyncMock as _AsyncMock
+        self.controller._run_inventory_audit = _AsyncMock()
+        self.controller._execute_pending_rebalances = _AsyncMock()
+        self._seed_drift(Decimal("150"))
+        # Ensure audit is quiet.
+        self.controller._pending_rebalances = {}
+        self.controller._last_fill_time = 0.0
+        # First tick: trip timer starts (no kill yet).
         self.market_data_provider.time.return_value = 1700000050.0
+        await self.controller.update_processed_data()
+        self.assertNotEqual(
+            self.controller.processed_data["regime"], Regime.KILLED
+        )
+        self.assertIsNotNone(self.controller._unrealized_exposure_trip_at)
+        # Second tick: 11s later → grace exceeded → KILL.
+        self._seed_drift(Decimal("150"))  # re-seed (would otherwise be cleared)
+        self.market_data_provider.time.return_value = 1700000061.0
         await self.controller.update_processed_data()
         self.assertEqual(self.controller.processed_data["regime"], Regime.KILLED)
         self.assertTrue(
             self.controller.processed_data["cancel_reason"].startswith(
-                "UNREALIZED_LOSS_"
+                "UNREALIZED_EXPOSURE_"
             )
         )
 
-    # NOTE: test_hedge_failures_via_drift_audits_trips_killed removed
-    # 2026-05-12 — the HEDGE_FAILURES_N strike rule was eliminated in
-    # favour of the barrier-pattern audit (see _run_inventory_audit).
-    # Race-induced false-positive drift no longer accumulates because
-    # the audit reaches quiescence before each authoritative read.
-    # Genuine hedge failures still surface via UNREALIZED_LOSS_quote
-    # gate and DAILY_LOSS_LIMIT.
+    async def test_unrealized_exposure_defers_when_rebalance_pending(self):
+        """Pending rebalance → audit is busy → do NOT kill even past grace."""
+        await self._warm()
+        self.controller.config.max_unrealized_loss_quote = Decimal("100")
+        self.controller.config.unrealized_exposure_grace_sec = 5.0
+        # Disable audit + rebalance execution so our seeded state persists.
+        from unittest.mock import AsyncMock as _AsyncMock
+        self.controller._run_inventory_audit = _AsyncMock()
+        self.controller._execute_pending_rebalances = _AsyncMock()
+        self.controller._last_fill_time = 0.0
+        # Multiple ticks well past grace; reseed state each tick so the
+        # gate evaluates against the audit-busy + drifted condition.
+        for ts in (1700000050.0, 1700000060.0, 1700000070.0, 1700000100.0):
+            self._seed_drift(Decimal("500"))
+            self.controller._pending_rebalances = {"BTC": Decimal("0.0005")}
+            self.market_data_provider.time.return_value = ts
+            await self.controller.update_processed_data()
+            self.assertNotEqual(
+                self.controller.processed_data["regime"], Regime.KILLED,
+                msg=f"unexpected KILL at ts={ts} "
+                f"reason={self.controller.processed_data.get('cancel_reason')}"
+            )
+        self.assertIsNone(self.controller._unrealized_exposure_trip_at)
+
+    async def test_unrealized_exposure_defers_when_inflight_activity(self):
+        """Recent fill (< 10s) → inflight activity → do NOT kill."""
+        await self._warm()
+        self.controller.config.max_unrealized_loss_quote = Decimal("100")
+        self.controller.config.unrealized_exposure_grace_sec = 5.0
+        from unittest.mock import AsyncMock as _AsyncMock, MagicMock
+        self.controller._run_inventory_audit = _AsyncMock()
+        self.controller._execute_pending_rebalances = _AsyncMock()
+        self._seed_drift(Decimal("500"))
+        self.controller._pending_rebalances = {}
+        # Patch _has_inflight_activity to True (simulates recent fill).
+        self.controller._has_inflight_activity = MagicMock(return_value=True)
+        self.market_data_provider.time.return_value = 1700000100.0
+        await self.controller.update_processed_data()
+        self.assertNotEqual(
+            self.controller.processed_data["regime"], Regime.KILLED
+        )
+        self.assertIsNone(self.controller._unrealized_exposure_trip_at)
+
+    async def test_unrealized_exposure_timer_resets_when_below_limit(self):
+        """Drift drops below limit → trip timer resets, no KILL."""
+        await self._warm()
+        self.controller.config.max_unrealized_loss_quote = Decimal("100")
+        self.controller.config.unrealized_exposure_grace_sec = 5.0
+        from unittest.mock import AsyncMock as _AsyncMock
+        self.controller._run_inventory_audit = _AsyncMock()
+        self.controller._execute_pending_rebalances = _AsyncMock()
+        self.controller._pending_rebalances = {}
+        self.controller._last_fill_time = 0.0
+        # First tick: above limit, start timer.
+        self._seed_drift(Decimal("500"))
+        self.market_data_provider.time.return_value = 1700000050.0
+        await self.controller.update_processed_data()
+        self.assertIsNotNone(self.controller._unrealized_exposure_trip_at)
+        # Second tick: drift cleared (audit worked) → reset timer.
+        self._seed_drift(Decimal("10"))
+        self.market_data_provider.time.return_value = 1700000052.0
+        await self.controller.update_processed_data()
+        self.assertIsNone(self.controller._unrealized_exposure_trip_at)
+        self.assertNotEqual(
+            self.controller.processed_data["regime"], Regime.KILLED
+        )
 
     async def test_killed_reason_is_sticky_across_recovery(self):
-        # Trip session drawdown, then restore PnL — should remain KILLED.
+        # Trip session drawdown, then "recover" pnl — should remain KILLED.
         await self._warm()
-        self.controller._session_pnl_peak = Decimal("100")
-        self.controller._session_pnl_total = Decimal("-50")  # dd=150
+        self.controller._pnl_brl_peak = Decimal("100")
+        self.controller._pnl_brl_day_start = Decimal("-50")
+        self._seed_pnl_day_key()
+        self._mock_pnl(Decimal("-50"))  # dd = 100-(-50) = 150 → KILL
         self.market_data_provider.time.return_value = 1700000050.0
         await self.controller.update_processed_data()
         self.assertEqual(self.controller.processed_data["regime"], Regime.KILLED)
         # Now "recover" — kill should remain.
-        self.controller._session_pnl_total = Decimal("100")
+        self._mock_pnl(Decimal("100"))
         self.market_data_provider.time.return_value = 1700000060.0
         await self.controller.update_processed_data()
         self.assertEqual(self.controller.processed_data["regime"], Regime.KILLED)
+
+
+class TestPnlBrlInvariants(_BaseControllerTest):
+    """Property-style tests on _compute_pnl_brl validating the core
+    invariants of the drift-target model.
+
+    KEY invariant: when the bot is balanced at target, no trades happen,
+    and only the BTC mid moves, pnl_brl is unchanged. This is the whole
+    point of the model — MtM noise on the *target* inventory cancels.
+    """
+
+    def _setup_baseline(
+        self,
+        brl_per_exchange: Decimal = Decimal("5000"),
+        btc_per_exchange: Decimal = Decimal("0.1"),  # total = 0.2
+        btc_target: Decimal = Decimal("0.2"),
+        mid_baseline: Decimal = Decimal("300000"),
+    ) -> None:
+        self.controller._brl_initial = brl_per_exchange * 2
+        self.controller._btc_initial = btc_per_exchange * 2
+        self.controller._btc_target = btc_target
+        self.controller._mid_baseline = mid_baseline
+        # Wire balances to a flexible mock the test can mutate.
+        self._brl_total = brl_per_exchange * 2
+        self._btc_total = btc_per_exchange * 2
+
+        def bal(connector, asset):
+            if asset == "BRL":
+                return self._brl_total / Decimal("2")
+            if asset == "BTC":
+                return self._btc_total / Decimal("2")
+            return Decimal("0")
+
+        self.market_data_provider.get_balance.side_effect = bal
+
+        def conn(name):
+            c = MagicMock()
+            c.get_balance.side_effect = lambda asset: bal(name, asset)
+            return c
+
+        self.market_data_provider.get_connector.side_effect = conn
+
+    def test_mtm_noise_cancels_when_balanced_at_target(self):
+        """No trades, balanced at target, BTC moves R$1000 → pnl_brl = 0."""
+        self._setup_baseline()
+        # No fills: balances unchanged. mid_now moves +1000.
+        pnl = self.controller._compute_pnl_brl(Decimal("301000"))
+        # drift_now = drift_0 = 0 → pnl = 0 + (0 × mid_now − 0 × mid_0) = 0
+        self.assertEqual(pnl, Decimal("0"))
+
+    def test_pnl_zero_at_t_zero(self):
+        """At t=0 (no mutation), pnl_brl == 0 regardless of starting drift."""
+        # Start with 0.18 BTC (below target 0.20) so drift_0 = -0.02.
+        self._setup_baseline(btc_per_exchange=Decimal("0.09"))  # total = 0.18
+        pnl = self.controller._compute_pnl_brl(Decimal("300000"))  # mid_now = mid_0
+        self.assertEqual(pnl, Decimal("0"))
+
+    def test_drift_increases_pnl_when_long_and_btc_rises(self):
+        """Long drift (btc > target), BTC up → pnl positive (sellable surplus)."""
+        # Start at target 0.2; later acquire +0.01 BTC unhedged.
+        self._setup_baseline()
+        self._btc_total = Decimal("0.21")  # drift_now = +0.01
+        # mid moves +1000. drift_0 = 0 → contribution from baseline term = 0.
+        pnl = self.controller._compute_pnl_brl(Decimal("301000"))
+        # ΔBRL = 0 (no BRL movement modelled here; pure inventory drift).
+        # Expected: 0 + (+0.01 × 301000 − 0 × 300000) = +3010
+        self.assertEqual(pnl, Decimal("3010"))
+
+    def test_drift_decreases_pnl_when_short_and_btc_rises(self):
+        """Short drift (btc < target), BTC up → pnl negative (costs more to buy back)."""
+        self._setup_baseline()
+        self._btc_total = Decimal("0.19")  # drift_now = -0.01
+        pnl = self.controller._compute_pnl_brl(Decimal("301000"))
+        # 0 + (-0.01 × 301000 − 0 × 300000) = -3010
+        self.assertEqual(pnl, Decimal("-3010"))
+
+    def test_perfect_xemm_cycle_captures_only_spread(self):
+        """Maker BUY 0.02@p_m, hedge SELL 0.02@p_t → pnl_brl = spread × size,
+        regardless of mid_now (delta-flat cycle)."""
+        self._setup_baseline()
+        # Simulate: maker BUY 0.02 @ 300050, hedge SELL 0.02 @ 300080.
+        # ΔBRL = -0.02×300050 + 0.02×300080 = +0.60
+        # ΔBTC = 0 (perfectly hedged)
+        self._brl_total = self.controller._brl_initial + Decimal("0.60")
+        # btc total unchanged at 0.2 → drift_now = 0
+        # mid_now moves arbitrarily — should not affect pnl_brl.
+        for mid_now in (Decimal("300000"), Decimal("301000"), Decimal("295000")):
+            pnl = self.controller._compute_pnl_brl(mid_now)
+            self.assertEqual(pnl, Decimal("0.60"))
+
+    def test_fees_paid_flow_through_brl(self):
+        """Fees deducted from BRL show up directly in pnl_brl."""
+        self._setup_baseline()
+        # Fee scenario: lose 5 BRL of fees, no other balance moves.
+        self._brl_total = self.controller._brl_initial - Decimal("5")
+        pnl = self.controller._compute_pnl_brl(Decimal("300000"))
+        self.assertEqual(pnl, Decimal("-5"))
+
+    def test_pnl_none_when_baselines_unset(self):
+        """Before first valid tick latches baselines, pnl_brl is None."""
+        # Default test setup: no baselines set. Should return None.
+        pnl = self.controller._compute_pnl_brl(Decimal("300000"))
+        self.assertIsNone(pnl)
+
+    def test_pnl_none_when_mid_invalid(self):
+        self._setup_baseline()
+        self.assertIsNone(self.controller._compute_pnl_brl(Decimal("0")))
+        self.assertIsNone(self.controller._compute_pnl_brl(Decimal("-1")))
 
 
 # ===================================================================== #
@@ -663,6 +881,173 @@ class TestMaxLotGuard(_BaseControllerTest):
             self.controller._last_oversized_block_source.startswith(
                 "xemm_spawn:"
             )
+        )
+
+
+# ===================================================================== #
+# Group C.5 — Snap-to-top dynamic sizing                                #
+# ===================================================================== #
+class TestSnapToTop(_BaseControllerTest):
+    """Verifies ``_compute_snap_order_amount`` and its integration in
+    ``_make_create_action``. The mechanism shrinks the maker order to ride
+    the top of the taker book when it offers a materially better price than
+    the VWAP for the full ``order_amount``.
+
+    Setup uses ``order_amount=0.02`` and ``min_dynamic_order_amount=0.002``
+    so realistic snap candidates exist between those bounds.
+    """
+
+    def setUp(self):
+        super().setUp()
+        # Re-instantiate with snap-friendly config: order=0.02, min=0.002.
+        self.config.order_amount = Decimal("0.02")
+        self.config.snap_to_top_enabled = True
+        self.config.snap_threshold_bps = Decimal("0.5")
+        self.config.min_dynamic_order_amount = Decimal("0.002")
+        self.config.snap_safety_fraction = Decimal("0.8")
+        self.controller = XEMMLeadLagController(
+            config=self.config,
+            market_data_provider=self.market_data_provider,
+            actions_queue=self.actions_queue,
+        )
+        self.set_loggers([self.controller.logger()])
+        self._setup_default_market_data()
+
+    def _mock_book(self, top_bid=None, top_ask=None):
+        """Mock get_order_book with controllable top entries.
+
+        top_bid / top_ask: Optional[Tuple[Decimal, Decimal]] = (price, amount)
+        """
+        ob = MagicMock()
+        bid = MagicMock()
+        bid.price = float(top_bid[0]) if top_bid else 300100.0
+        bid.amount = float(top_bid[1]) if top_bid else 1.0
+        ask = MagicMock()
+        ask.price = float(top_ask[0]) if top_ask else 300110.0
+        ask.amount = float(top_ask[1]) if top_ask else 1.0
+        ob.bid_entries = MagicMock(return_value=iter([bid]))
+        ob.ask_entries = MagicMock(return_value=iter([ask]))
+        self.market_data_provider.get_order_book = MagicMock(return_value=ob)
+
+    def _mock_vwap(self, value: Decimal) -> None:
+        self.controller._vwap_for_amount = MagicMock(return_value=value)
+
+    # ------------------ pure unit tests ------------------ #
+    def test_quantize_pads_with_one_satoshi(self):
+        # 0.00567 BTC → 567,000 sats → quantize to 567,000 (already step) +1
+        out = self.controller._quantize_amount_with_pad(Decimal("0.00567"))
+        self.assertEqual(out, Decimal("0.00567001"))
+
+    def test_quantize_rounds_down_below_step(self):
+        # 0.005671 BTC → 567,100 sats → rounds down to 567,000 +1 sat
+        out = self.controller._quantize_amount_with_pad(Decimal("0.005671"))
+        self.assertEqual(out, Decimal("0.00567001"))
+
+    def test_quantize_zero_input(self):
+        self.assertEqual(
+            self.controller._quantize_amount_with_pad(Decimal("0")),
+            Decimal("0"),
+        )
+
+    def test_quantize_below_lot_step(self):
+        # 999 sats < 1000 sats step → quantized to 0 → returns Decimal("0").
+        self.assertEqual(
+            self.controller._quantize_amount_with_pad(Decimal("0.00000999")),
+            Decimal("0"),
+        )
+
+    # ------------------ snap decision logic ------------------ #
+    def test_snap_disabled_returns_full_amount(self):
+        self.controller.config.snap_to_top_enabled = False
+        amt, tel = self.controller._compute_snap_order_amount(TradeType.BUY)
+        self.assertEqual(amt, self.config.order_amount)
+        self.assertFalse(tel["active"])
+        self.assertEqual(tel["reason"], "disabled")
+
+    def test_snap_no_book_returns_full_amount(self):
+        self.market_data_provider.get_order_book = MagicMock(
+            side_effect=Exception("boom")
+        )
+        amt, tel = self.controller._compute_snap_order_amount(TradeType.BUY)
+        self.assertEqual(amt, self.config.order_amount)
+        self.assertFalse(tel["active"])
+        self.assertEqual(tel["reason"], "no_book")
+
+    def test_snap_no_vwap_returns_full_amount(self):
+        self._mock_book(top_bid=(Decimal("300200"), Decimal("0.005")))
+        self._mock_vwap(None)
+        amt, tel = self.controller._compute_snap_order_amount(TradeType.BUY)
+        self.assertEqual(amt, self.config.order_amount)
+        self.assertFalse(tel["active"])
+        self.assertEqual(tel["reason"], "no_vwap")
+
+    def test_snap_edge_below_threshold_returns_full_amount(self):
+        # top_bid 300100, vwap_full 300099 → edge_gain ≈ 0.03 bps < 0.5
+        self._mock_book(top_bid=(Decimal("300100"), Decimal("0.005")))
+        self._mock_vwap(Decimal("300099"))
+        amt, tel = self.controller._compute_snap_order_amount(TradeType.BUY)
+        self.assertEqual(amt, self.config.order_amount)
+        self.assertEqual(tel["reason"], "edge_below_threshold")
+
+    def test_snap_top_covers_full_returns_full_amount(self):
+        # Top layer carries 1 BTC ≫ 0.02 → 0.8×1 ≥ order_amount → no shrink.
+        self._mock_book(top_bid=(Decimal("300200"), Decimal("1.0")))
+        self._mock_vwap(Decimal("300100"))  # huge gain, but irrelevant here
+        amt, tel = self.controller._compute_snap_order_amount(TradeType.BUY)
+        self.assertEqual(amt, self.config.order_amount)
+        self.assertEqual(tel["reason"], "top_covers_full")
+
+    def test_snap_below_min_dynamic_returns_full_amount(self):
+        # Top layer 0.002 BTC, safety 0.8 → 0.0016 < 0.002 floor → no shrink.
+        self._mock_book(top_bid=(Decimal("300200"), Decimal("0.002")))
+        self._mock_vwap(Decimal("300100"))
+        amt, tel = self.controller._compute_snap_order_amount(TradeType.BUY)
+        self.assertEqual(amt, self.config.order_amount)
+        self.assertEqual(tel["reason"], "below_min_dynamic")
+
+    def test_snap_active_buy_side_returns_quantized_amount(self):
+        # Hedge SELL: top_bid=300200 > vwap_full=300100 → edge ≈ 3.3 bps > 0.5.
+        # Top size = 0.01 BTC → 0.8×0.01 = 0.008 BTC → quantize to 0.00800001.
+        self._mock_book(top_bid=(Decimal("300200"), Decimal("0.01")))
+        self._mock_vwap(Decimal("300100"))
+        amt, tel = self.controller._compute_snap_order_amount(TradeType.BUY)
+        self.assertTrue(tel["active"])
+        self.assertEqual(tel["reason"], "snapped")
+        self.assertEqual(amt, Decimal("0.00800001"))
+        self.assertLess(amt, self.config.order_amount)
+
+    def test_snap_active_sell_side_returns_quantized_amount(self):
+        # Hedge BUY: top_ask=300050 < vwap_full=300150 → edge ≈ 3.3 bps > 0.5.
+        # Top size = 0.005 BTC → 0.8×0.005 = 0.004 BTC → quantize to 0.00400001.
+        self._mock_book(top_ask=(Decimal("300050"), Decimal("0.005")))
+        self._mock_vwap(Decimal("300150"))
+        amt, tel = self.controller._compute_snap_order_amount(TradeType.SELL)
+        self.assertTrue(tel["active"])
+        self.assertEqual(tel["reason"], "snapped")
+        self.assertEqual(amt, Decimal("0.00400001"))
+        self.assertLess(amt, self.config.order_amount)
+
+    # ------------------ integration with _make_create_action ------------------ #
+    def test_make_create_action_uses_snap_amount(self):
+        """When snap fires, the executor config receives the shrunken amount."""
+        self._mock_book(top_bid=(Decimal("300200"), Decimal("0.01")))
+        self._mock_vwap(Decimal("300100"))
+        action = self.controller._make_create_action(
+            TradeType.BUY, Decimal("0.0010"), now=1700000000.0,
+        )
+        self.assertIsNotNone(action)
+        self.assertEqual(action.executor_config.order_amount, Decimal("0.00800001"))
+
+    def test_make_create_action_full_amount_when_snap_disabled(self):
+        self.controller.config.snap_to_top_enabled = False
+        self._mock_book(top_bid=(Decimal("300200"), Decimal("0.01")))
+        self._mock_vwap(Decimal("300100"))
+        action = self.controller._make_create_action(
+            TradeType.BUY, Decimal("0.0010"), now=1700000000.0,
+        )
+        self.assertIsNotNone(action)
+        self.assertEqual(
+            action.executor_config.order_amount, self.config.order_amount,
         )
 
 
@@ -1578,189 +1963,6 @@ class TestArbDangerousFailure(_ArbBaseTest):
         self.assertEqual(self.controller._arb_failures_today, 0)
         self.assertEqual(self.controller._arb_realized_loss_today, Decimal("0.10"))
 
-
-class TestLosingStreakNoiseFloor(_ArbBaseTest):
-    """The losing-streak counter only advances on losses whose magnitude
-    exceeds ``min_loss_per_fill_quote_to_count``. Below the noise floor
-    (typical: Binance taker fee dominating a near-zero gross capture),
-    the loss is treated as neutral noise — neither advances nor resets
-    the counter. Wins always reset.
-    """
-
-    def _make_xemm_closed_executor(self, executor_id: str, net_pnl: Decimal):
-        ex = MagicMock()
-        ex.id = executor_id
-        ex.is_done = True
-        ex.close_type = None
-        ex.net_pnl_quote = net_pnl
-        ex.cum_fees_quote = Decimal("0.024")
-        ex.filled_amount_quote = Decimal("80")
-        ex.custom_info = {}
-        ex.config = MagicMock()
-        ex.config.type = "xemm_executor"  # NOT arb — so we test the MM path
-        ex.config.id = executor_id
-        ex.timestamp = self.market_data_provider.time.return_value - 5.0
-        return ex
-
-    async def _drive_with_executor(self, ex):
-        self.controller.executors_info = [ex]
-        self.controller._last_fingerprint = None
-        self.controller._last_full_update = 0.0
-        from datetime import datetime as _dt
-        now_ts = self.market_data_provider.time.return_value
-        self.controller._arb_last_reset_day = _dt.utcfromtimestamp(now_ts).strftime("%Y-%m-%d")
-        self.controller._daily_pnl_last_reset_day = self.controller._arb_last_reset_day
-        await self.controller.update_processed_data()
-
-    async def test_noise_loss_below_threshold_does_not_advance(self):
-        """net_pnl = -R$ 0.05 with threshold R$ 0.10 → counter unchanged."""
-        self.controller.config.min_loss_per_fill_quote_to_count = Decimal("0.10")
-        self.controller._consecutive_losing_fills = 2
-        ex = self._make_xemm_closed_executor("X-NOISE", Decimal("-0.05"))
-        await self._drive_with_executor(ex)
-        # Counter NOT advanced (noise loss)
-        self.assertEqual(self.controller._consecutive_losing_fills, 2)
-
-    async def test_real_loss_above_threshold_advances(self):
-        """net_pnl = -R$ 0.50 with threshold R$ 0.10 → counter ++."""
-        self.controller.config.min_loss_per_fill_quote_to_count = Decimal("0.10")
-        self.controller._consecutive_losing_fills = 2
-        ex = self._make_xemm_closed_executor("X-REAL", Decimal("-0.50"))
-        await self._drive_with_executor(ex)
-        self.assertEqual(self.controller._consecutive_losing_fills, 3)
-
-    async def test_win_resets_streak_regardless_of_threshold(self):
-        """Any positive net_pnl resets the counter to 0."""
-        self.controller.config.min_loss_per_fill_quote_to_count = Decimal("0.10")
-        self.controller._consecutive_losing_fills = 4
-        ex = self._make_xemm_closed_executor("X-WIN", Decimal("0.05"))
-        await self._drive_with_executor(ex)
-        self.assertEqual(self.controller._consecutive_losing_fills, 0)
-
-    async def test_zero_pnl_resets_streak(self):
-        """net_pnl == 0 is treated as break-even → reset."""
-        self.controller.config.min_loss_per_fill_quote_to_count = Decimal("0.10")
-        self.controller._consecutive_losing_fills = 3
-        ex = self._make_xemm_closed_executor("X-BE", Decimal("0"))
-        # Need filled_quote/fees non-zero so did_trade=True
-        ex.filled_amount_quote = Decimal("80")
-        ex.cum_fees_quote = Decimal("0.024")
-        await self._drive_with_executor(ex)
-        self.assertEqual(self.controller._consecutive_losing_fills, 0)
-
-    async def test_loss_exactly_at_threshold_advances(self):
-        """Boundary: |net_pnl| == threshold → counts (>=)."""
-        self.controller.config.min_loss_per_fill_quote_to_count = Decimal("0.10")
-        self.controller._consecutive_losing_fills = 0
-        ex = self._make_xemm_closed_executor("X-BOUNDARY", Decimal("-0.10"))
-        await self._drive_with_executor(ex)
-        self.assertEqual(self.controller._consecutive_losing_fills, 1)
-
-
-class TestLosingStreakTimeDecay(_ArbBaseTest):
-    """Regression pin (2026-05-17 23:54 LOSING_STREAK_5 shutdown):
-    losses separated by a long idle period must not accumulate into the
-    streak. After `losing_streak_decay_sec` of idle, the next losing
-    fill resets the counter to 0 BEFORE counting itself.
-    """
-
-    def _make_xemm_closed_executor(self, executor_id: str, net_pnl: Decimal):
-        ex = MagicMock()
-        ex.id = executor_id
-        ex.is_done = True
-        ex.close_type = None
-        ex.net_pnl_quote = net_pnl
-        ex.cum_fees_quote = Decimal("0.024")
-        ex.filled_amount_quote = Decimal("80")
-        ex.custom_info = {}
-        ex.config = MagicMock()
-        ex.config.type = "xemm_executor"
-        ex.config.id = executor_id
-        ex.timestamp = self.market_data_provider.time.return_value - 5.0
-        return ex
-
-    async def _drive_with_executor(self, ex):
-        self.controller.executors_info = [ex]
-        self.controller._last_fingerprint = None
-        self.controller._last_full_update = 0.0
-        from datetime import datetime as _dt
-        now_ts = self.market_data_provider.time.return_value
-        self.controller._arb_last_reset_day = _dt.utcfromtimestamp(now_ts).strftime("%Y-%m-%d")
-        self.controller._daily_pnl_last_reset_day = self.controller._arb_last_reset_day
-        await self.controller.update_processed_data()
-
-    async def test_streak_decays_after_idle_window(self):
-        """Streak was 4; idle gap > decay; new loss → counter=1, not 5."""
-        self.controller.config.min_loss_per_fill_quote_to_count = Decimal("0.10")
-        self.controller.config.losing_streak_decay_sec = 100.0
-        self.controller._consecutive_losing_fills = 4
-        # Last losing fill timestamp is far in the past (1.0 epoch).
-        # time.time() at test runtime is ~10^9, so gap is enormous.
-        self.controller._last_losing_fill_time = 1.0
-        ex = self._make_xemm_closed_executor("X-DECAY", Decimal("-0.50"))
-        await self._drive_with_executor(ex)
-        # 4 → decayed to 0 → incremented to 1.
-        self.assertEqual(self.controller._consecutive_losing_fills, 1)
-        # _last_losing_fill_time should be updated to ~now.
-        import time
-        self.assertAlmostEqual(
-            self.controller._last_losing_fill_time, time.time(), delta=5.0,
-        )
-
-    async def test_streak_does_not_decay_within_window(self):
-        """Fresh consecutive losses (gap < decay) still accumulate."""
-        import time
-        self.controller.config.min_loss_per_fill_quote_to_count = Decimal("0.10")
-        self.controller.config.losing_streak_decay_sec = 3600.0  # 1h
-        self.controller._consecutive_losing_fills = 4
-        # Last loss 10s ago → well within decay window.
-        self.controller._last_losing_fill_time = time.time() - 10.0
-        ex = self._make_xemm_closed_executor("X-NODECAY", Decimal("-0.50"))
-        await self._drive_with_executor(ex)
-        # No decay; counter advances to 5.
-        self.assertEqual(self.controller._consecutive_losing_fills, 5)
-
-    async def test_first_loss_sets_last_losing_fill_time(self):
-        """When streak starts from 0, `_last_losing_fill_time` is stamped
-        so future decay checks have an anchor."""
-        import time
-        self.controller.config.min_loss_per_fill_quote_to_count = Decimal("0.10")
-        self.controller._consecutive_losing_fills = 0
-        self.controller._last_losing_fill_time = 0.0
-        ex = self._make_xemm_closed_executor("X-FIRST", Decimal("-0.50"))
-        await self._drive_with_executor(ex)
-        self.assertEqual(self.controller._consecutive_losing_fills, 1)
-        self.assertGreater(self.controller._last_losing_fill_time, 0.0)
-        self.assertAlmostEqual(
-            self.controller._last_losing_fill_time, time.time(), delta=5.0,
-        )
-
-    async def test_decay_does_not_apply_when_streak_already_zero(self):
-        """If streak is already 0, decay path is a no-op; loss starts a
-        fresh streak (counter = 1). Sanity check: the decay log line
-        should not fire."""
-        self.controller.config.min_loss_per_fill_quote_to_count = Decimal("0.10")
-        self.controller.config.losing_streak_decay_sec = 100.0
-        self.controller._consecutive_losing_fills = 0
-        self.controller._last_losing_fill_time = 1.0  # ancient
-        ex = self._make_xemm_closed_executor("X-NOOP", Decimal("-0.50"))
-        await self._drive_with_executor(ex)
-        # 0 → 1 (no decay log because streak was 0).
-        self.assertEqual(self.controller._consecutive_losing_fills, 1)
-
-    async def test_decay_prevents_2026_05_17_regression(self):
-        """Reproduces the prod incident: 4 old losses + 1 fresh = should
-        be 1 (not 5). Without decay this would trip KILL."""
-        import time
-        self.controller.config.min_loss_per_fill_quote_to_count = Decimal("0.10")
-        self.controller.config.losing_streak_decay_sec = 3600.0
-        # 4 losses accumulated more than 1h ago.
-        self.controller._consecutive_losing_fills = 4
-        self.controller._last_losing_fill_time = time.time() - 9 * 3600  # 9h ago
-        ex = self._make_xemm_closed_executor("X-PROD", Decimal("-2.02"))
-        await self._drive_with_executor(ex)
-        # Old streak expired; fresh loss → streak = 1.
-        self.assertEqual(self.controller._consecutive_losing_fills, 1)
 
 
 # ===================================================================== #
@@ -3340,5 +3542,272 @@ class TestMemoryMetricsLogging(_BaseControllerTest):
         snap_mock.assert_called_once()
         self.assertTrue(self.controller._tracemalloc_started)
         self.assertIsNotNone(self.controller._tracemalloc_prev_snapshot)
+
+
+class TestFeeAssetPriceCache(_BaseControllerTest):
+    """REST cache helper para preço de fee assets (BNB, etc)."""
+
+    async def test_cache_miss_fetches_via_rest(self):
+        conn = MagicMock()
+        conn.get_last_traded_price = AsyncMock(return_value="1234.5")
+        self.market_data_provider.get_connector = MagicMock(return_value=conn)
+
+        price = await self.controller._get_spot_price_rest("binance", "BNB-BRL")
+        self.assertEqual(price, Decimal("1234.5"))
+        self.assertIn("BNB-BRL", self.controller._fee_price_cache)
+
+    async def test_cache_hit_skips_rest(self):
+        conn = MagicMock()
+        conn.get_last_traded_price = AsyncMock(return_value="9999")
+        self.market_data_provider.get_connector = MagicMock(return_value=conn)
+
+        # Pre-populate cache with fresh entry
+        self.controller._fee_price_cache["BNB-BRL"] = (
+            Decimal("1200"), time.monotonic()
+        )
+        price = await self.controller._get_spot_price_rest(
+            "binance", "BNB-BRL", ttl_sec=60.0
+        )
+        self.assertEqual(price, Decimal("1200"))
+        conn.get_last_traded_price.assert_not_called()
+
+    async def test_cache_expired_refetches(self):
+        conn = MagicMock()
+        conn.get_last_traded_price = AsyncMock(return_value="9999")
+        self.market_data_provider.get_connector = MagicMock(return_value=conn)
+
+        # Stale entry (older than TTL)
+        self.controller._fee_price_cache["BNB-BRL"] = (
+            Decimal("1200"), time.monotonic() - 100
+        )
+        price = await self.controller._get_spot_price_rest(
+            "binance", "BNB-BRL", ttl_sec=60.0
+        )
+        self.assertEqual(price, Decimal("9999"))
+
+    async def test_rest_error_falls_back_to_stale_cache(self):
+        conn = MagicMock()
+        conn.get_last_traded_price = AsyncMock(side_effect=Exception("boom"))
+        self.market_data_provider.get_connector = MagicMock(return_value=conn)
+
+        self.controller._fee_price_cache["BNB-BRL"] = (
+            Decimal("500"), time.monotonic() - 100
+        )
+        price = await self.controller._get_spot_price_rest(
+            "binance", "BNB-BRL", ttl_sec=60.0
+        )
+        # Returns stale cache rather than None — keeps PnL stable on transient REST hiccup.
+        self.assertEqual(price, Decimal("500"))
+
+    async def test_rest_error_with_no_cache_returns_none(self):
+        conn = MagicMock()
+        conn.get_last_traded_price = AsyncMock(side_effect=Exception("boom"))
+        self.market_data_provider.get_connector = MagicMock(return_value=conn)
+        price = await self.controller._get_spot_price_rest("binance", "BNB-BRL")
+        self.assertIsNone(price)
+
+
+class TestFeeAssetPnLContribution(_BaseControllerTest):
+    """`_compute_pnl_brl` deve somar drift × mid dos fee_assets também,
+    fazendo top-up de fee asset ficar PnL-neutro."""
+
+    def _setup_baseline(self):
+        # Latch baselines manualmente
+        self.controller._brl_initial = Decimal("100000")
+        self.controller._btc_initial = Decimal("0.2")
+        self.controller._btc_target = Decimal("0.2")
+        self.controller._mid_baseline = Decimal("500000")
+
+    def _patch_balances(self, balances):
+        def get_conn(name):
+            conn = MagicMock()
+            conn.get_balance = lambda asset: balances.get((name, asset), Decimal("0"))
+            return conn
+        self.market_data_provider.get_connector = MagicMock(side_effect=get_conn)
+
+    def test_top_up_is_pnl_neutral(self):
+        self.controller.config = self.controller.config.model_copy(update={
+            "fee_assets": FeeAssetConfig(
+                enabled=True, targets={"BNB": Decimal("0.05")}
+            )
+        })
+        self._setup_baseline()
+        self.controller._fee_assets_initial = {"BNB": Decimal("0.05")}
+        self.controller._fee_assets_mid_baseline = {"BNB": Decimal("1200")}
+        self.controller._fee_price_cache = {
+            "BNB-BRL": (Decimal("1200"), time.monotonic())
+        }
+        # Top-up: BRL caiu R$60, BNB subiu 0.05
+        self._patch_balances({
+            ("bybit", "BTC"): Decimal("0.1"),
+            ("binance", "BTC"): Decimal("0.1"),
+            ("bybit", "BRL"): Decimal("49970"),
+            ("binance", "BRL"): Decimal("49970"),
+            ("binance", "BNB"): Decimal("0.10"),
+        })
+        pnl = self.controller._compute_pnl_brl(Decimal("500000"))
+        # Net: -60 (BRL) + drift_fee=0.05×1200 − 0×1200 = +60 → 0
+        self.assertEqual(pnl, Decimal("0"))
+
+    def test_fee_asset_mtm_loss_reflected_in_pnl(self):
+        self.controller.config = self.controller.config.model_copy(update={
+            "fee_assets": FeeAssetConfig(
+                enabled=True, targets={"BNB": Decimal("0.05")}
+            )
+        })
+        self._setup_baseline()
+        self.controller._fee_assets_initial = {"BNB": Decimal("0.05")}
+        self.controller._fee_assets_mid_baseline = {"BNB": Decimal("1200")}
+        # Top-up aconteceu, e depois BNB cai 10%
+        self.controller._fee_price_cache = {
+            "BNB-BRL": (Decimal("1080"), time.monotonic())
+        }
+        self._patch_balances({
+            ("bybit", "BTC"): Decimal("0.1"),
+            ("binance", "BTC"): Decimal("0.1"),
+            ("bybit", "BRL"): Decimal("49970"),
+            ("binance", "BRL"): Decimal("49970"),
+            ("binance", "BNB"): Decimal("0.10"),
+        })
+        pnl = self.controller._compute_pnl_brl(Decimal("500000"))
+        # -60 + (0.05×1080 − 0×1200) = -60 + 54 = -6
+        self.assertEqual(pnl, Decimal("-6"))
+
+    def test_fee_asset_disabled_no_contribution(self):
+        # Default: fee_assets desabilitado
+        self._setup_baseline()
+        self._patch_balances({
+            ("bybit", "BTC"): Decimal("0.1"),
+            ("binance", "BTC"): Decimal("0.1"),
+            ("bybit", "BRL"): Decimal("50000"),
+            ("binance", "BRL"): Decimal("50000"),
+            ("binance", "BNB"): Decimal("0.10"),  # irrelevante
+        })
+        pnl = self.controller._compute_pnl_brl(Decimal("500000"))
+        self.assertEqual(pnl, Decimal("0"))
+
+
+class TestFeeAssetTopUpLoop(_BaseControllerTest):
+    """`_run_fee_asset_topup` — verifica gates e dispatch."""
+
+    def _enable_fee_assets(self, **overrides):
+        cfg_kwargs = dict(
+            enabled=True,
+            targets={"BNB": Decimal("0.05")},
+            min_topup_quote=Decimal("60"),
+            check_interval_sec=300.0,
+            topup_cooldown_sec=120.0,
+        )
+        cfg_kwargs.update(overrides)
+        self.controller.config = self.controller.config.model_copy(update={
+            "fee_assets": FeeAssetConfig(**cfg_kwargs)
+        })
+
+    def _wire_taker(self, bnb_balance="0.0", buy_return="order-123"):
+        taker = MagicMock()
+        rules = MagicMock()
+        rules.min_order_size = Decimal("0.001")
+        rules.min_notional_size = Decimal("50")
+        taker.trading_rules = {"BNB-BRL": rules}
+        taker.quantize_order_amount = lambda p, a: a
+        taker.buy = MagicMock(return_value=buy_return)
+        taker.get_balance = lambda asset: (
+            Decimal(bnb_balance) if asset == "BNB" else Decimal("0")
+        )
+        empty = MagicMock(get_balance=lambda a: Decimal("0"))
+        self.market_data_provider.get_connector = MagicMock(
+            side_effect=lambda name: taker if name == "binance" else empty
+        )
+        return taker
+
+    async def test_disabled_short_circuits(self):
+        taker = self._wire_taker(bnb_balance="0.0")
+        # cfg.enabled = False (default)
+        await self.controller._run_fee_asset_topup(now=1000.0)
+        taker.buy.assert_not_called()
+
+    async def test_buys_when_deficit_above_min_notional(self):
+        self._enable_fee_assets()
+        self.controller._fee_price_cache = {
+            "BNB-BRL": (Decimal("1200"), time.monotonic())
+        }
+        taker = self._wire_taker(bnb_balance="0.0")
+        await self.controller._run_fee_asset_topup(now=1000.0)
+        taker.buy.assert_called_once()
+        args, _ = taker.buy.call_args
+        pair, amount, otype, _price = args
+        self.assertEqual(pair, "BNB-BRL")
+        self.assertEqual(amount, Decimal("0.05"))
+        self.assertEqual(otype, OrderType.MARKET)
+        # Cooldown gravado
+        self.assertEqual(self.controller._fee_topup_last_time["BNB"], 1000.0)
+
+    async def test_skips_when_at_target(self):
+        self._enable_fee_assets()
+        self.controller._fee_price_cache = {
+            "BNB-BRL": (Decimal("1200"), time.monotonic())
+        }
+        taker = self._wire_taker(bnb_balance="0.05")  # exatamente no target
+        await self.controller._run_fee_asset_topup(now=1000.0)
+        taker.buy.assert_not_called()
+
+    async def test_skips_when_notional_below_min_topup_quote(self):
+        self._enable_fee_assets()
+        self.controller._fee_price_cache = {
+            "BNB-BRL": (Decimal("1200"), time.monotonic())
+        }
+        # deficit = 0.005 BNB × 1200 = R$6 < R$60
+        taker = self._wire_taker(bnb_balance="0.045")
+        await self.controller._run_fee_asset_topup(now=1000.0)
+        taker.buy.assert_not_called()
+
+    async def test_skips_during_cooldown(self):
+        self._enable_fee_assets()
+        self.controller._fee_price_cache = {
+            "BNB-BRL": (Decimal("1200"), time.monotonic())
+        }
+        self.controller._fee_topup_last_time = {"BNB": 990.0}  # 10s atrás
+        taker = self._wire_taker(bnb_balance="0.0")
+        await self.controller._run_fee_asset_topup(now=1000.0)
+        taker.buy.assert_not_called()
+
+    async def test_check_interval_gates_run(self):
+        self._enable_fee_assets()
+        self.controller._last_fee_topup_check = 999.0  # 1s atrás, < 300s
+        self.controller._fee_price_cache = {
+            "BNB-BRL": (Decimal("1200"), time.monotonic())
+        }
+        taker = self._wire_taker(bnb_balance="0.0")
+        await self.controller._run_fee_asset_topup(now=1000.0)
+        taker.buy.assert_not_called()
+
+    async def test_excessive_deficit_refused(self):
+        self._enable_fee_assets()
+        self.controller._fee_price_cache = {
+            "BNB-BRL": (Decimal("1200"), time.monotonic())
+        }
+        # actual = -0.10 BNB (defesa contra baseline bug): deficit = 0.05 - (-0.10) = 0.15 > 2× target
+        taker = self._wire_taker(bnb_balance="-0.10")
+        await self.controller._run_fee_asset_topup(now=1000.0)
+        taker.buy.assert_not_called()
+
+    async def test_no_price_in_cache_skips_silently(self):
+        self._enable_fee_assets()
+        # cache vazio (priming não rodou ainda)
+        taker = self._wire_taker(bnb_balance="0.0")
+        await self.controller._run_fee_asset_topup(now=1000.0)
+        taker.buy.assert_not_called()
+
+    async def test_self_dispatched_registered_after_buy(self):
+        self._enable_fee_assets()
+        self.controller._fee_price_cache = {
+            "BNB-BRL": (Decimal("1200"), time.monotonic())
+        }
+        self._wire_taker(bnb_balance="0.0", buy_return="bnb-order-1")
+        with patch.object(
+            self.controller, "register_self_dispatched_market_id"
+        ) as reg:
+            await self.controller._run_fee_asset_topup(now=1000.0)
+        reg.assert_called_once_with("bnb-order-1")
 
 

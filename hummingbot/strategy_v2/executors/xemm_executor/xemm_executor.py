@@ -482,6 +482,36 @@ class XEMMExecutor(ExecutorBase):
             )
             return
 
+        # Skip hedge if the executed notional is below the configured floor.
+        # Reason: a hedge below the taker's MIN_NOTIONAL fails outright; the
+        # framework's failure-retry path used to escalate to a full
+        # ``self.config.order_amount`` MARKET (over-hedge bug — see
+        # process_order_failed_event below). Letting the audit reconcile
+        # the small residual as drift is cheaper than risking a 2000x
+        # over-hedge. The threshold mirrors inventory_audit.max_drift_quote
+        # so audit's silent-band matches the executor's skip-band.
+        min_hedge_value = getattr(
+            self.config, "min_hedge_value_quote", Decimal("0")
+        )
+        if min_hedge_value > 0:
+            try:
+                taker_mid = self.get_price(
+                    self.taker_connector, self.taker_trading_pair,
+                    PriceType.MidPrice,
+                )
+            except Exception:
+                taker_mid = Decimal("0")
+            notional = executed * (taker_mid or Decimal("0"))
+            if notional > 0 and notional < min_hedge_value:
+                self.logger().info(
+                    f"[partial_hedge_skip] order_id={event.order_id} "
+                    f"executed={executed} mid={taker_mid} "
+                    f"notional={notional:.2f} < {min_hedge_value} — "
+                    f"skipping hedge, inventory_audit will absorb residual."
+                )
+                self._status = RunnableStatus.SHUTTING_DOWN
+                return
+
         self.logger().info(
             f"Maker order {event.order_id} cancelled after partial fill of "
             f"{executed} base. Placing taker hedge for the executed amount."
@@ -540,7 +570,20 @@ class XEMMExecutor(ExecutorBase):
         elif self.taker_order and self.taker_order.order_id == event.order_id:
             self.failed_orders.append(self.taker_order)
             self._current_retries += 1
-            self.place_taker_order()
+            # Do NOT retry place_taker_order() blindly — the previous code
+            # called it with no ``amount`` argument, which falls through to
+            # ``self.config.order_amount`` (full lot). When the original
+            # hedge was for a tiny partial fill rejected by Binance
+            # MIN_NOTIONAL, this retry placed a 2000x over-hedge. Real
+            # incident 2026-05-18 11:32 — see git log.
+            # Delegate to inventory_audit instead: drift surfaces in the
+            # next audit cycle and is corrected via auto_rebalance.
+            self.logger().error(
+                f"[hedge_failed] taker order {event.order_id} failed "
+                f"(MarketOrderFailureEvent); NOT retrying — "
+                f"inventory_audit will reconcile via auto_rebalance."
+            )
+            self._status = RunnableStatus.SHUTTING_DOWN
 
     def get_custom_info(self) -> Dict:
         # Since we can't make this method async, we'll skip the profitability calculation

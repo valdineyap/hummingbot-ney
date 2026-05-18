@@ -37,20 +37,41 @@ class LeadLagArbitrageExecutorConfig(ArbitrageExecutorConfig):
     # forcing cancel + handling partial / no fill via the unwind path.
     arb_aggressive_limit_timeout_sec: float = 3.0
 
-    # Leg ordering policy. Controls when each placement REST is dispatched.
-    # Role-based (maker/taker) for exchange-agnostic semantics — swapping
-    # connectors doesn't invalidate the configuration intent.
+    # Leg ordering policy. Controls when the second placement REST is
+    # dispatched. Role-based (maker/taker) for exchange-agnostic semantics
+    # — swapping connectors doesn't invalidate the configuration intent.
+    #
     #   "parallel"     — both legs placed concurrently (default). Lowest
     #                    exposure window; REST round-trips overlap on the
-    #                    event loop.
-    #   "maker_first"  — place the leg on the maker connector first; wait
-    #                    for its ACK (exchange_order_id assigned) before
-    #                    placing the taker leg. Useful when you want to
-    #                    ensure the slow side (typical for maker MARKET)
-    #                    accepted before sending the fast taker leg.
-    #   "taker_first"  — place the leg on the taker connector first; wait
-    #                    for its ACK before placing the maker leg. Useful
-    #                    to lock in the deeper-liquidity hedge price first.
+    #                    event loop. Highest unwind risk if one leg fails
+    #                    to fill (the failed-leg unwind path then fires).
+    #
+    #   "maker_first"  — place the leg on the maker connector first and
+    #                    **gate the taker placement on actual fill of the
+    #                    maker** (full OR partial). Concretely:
+    #                      1. Place maker leg at full ``order_amount``.
+    #                      2. Poll until ``executed_amount_base > 0`` OR
+    #                         the maker order reaches a terminal state.
+    #                      3. On first fill: cancel any remaining open
+    #                         portion of the maker order, then place the
+    #                         taker leg sized to the *realized* maker
+    #                         executed_amount (partial → smaller taker).
+    #                      4. If the maker reaches terminal state with
+    #                         zero fills (typically via the aggressive-
+    #                         limit watchdog cancel at timeout), the
+    #                         executor closes cleanly with no taker
+    #                         exposure — no unwind needed.
+    #                    Eliminates the 100%-failure unwind path observed
+    #                    when the maker book is thinner than the trigger
+    #                    quote suggested.
+    #
+    #   "taker_first"  — symmetric to maker_first: place taker leg first,
+    #                    wait for any fill, then place maker for matched
+    #                    amount. Less common in maker-led XEMM topologies
+    #                    (taker on Binance/Kraken is usually a guaranteed
+    #                    fill); included for symmetry and exchanges where
+    #                    the "taker" venue is the harder fill.
+    #
     # The maker/taker identification is provided by the controller via
     # ``maker_connector_name``. If absent and a non-parallel mode is
     # requested, the executor falls back to parallel with a warning.

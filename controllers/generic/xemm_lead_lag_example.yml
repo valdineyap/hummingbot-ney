@@ -46,6 +46,18 @@ total_amount_quote: "1000"
 order_amount: "0.0002"
 
 # ============================================================ #
+# Snap-to-top dynamic sizing                                   #
+# ============================================================ #
+# When the top of the taker book is thin but cheaper than the VWAP for the
+# full order_amount, shrink the maker order to hedge only that top layer
+# (tighter spread, smaller per-fill PnL). See controller docstring for the
+# full algorithm. Cap is always order_amount — snap only shrinks.
+snap_to_top_enabled: true
+snap_threshold_bps: "0.5"          # min edge gain (bps) to trigger
+min_dynamic_order_amount: "0.00005" # floor — respect exchange min_notional
+snap_safety_fraction: "0.8"        # take 80% of top layer to dodge races
+
+# ============================================================ #
 # Profitability (NET of fees — XEMMExecutor adds tx_cost_pct)  #
 # All values are decimals: 0.001 = 10 bps                      #
 # ============================================================ #
@@ -122,13 +134,18 @@ max_daily_loss_quote: "100"
 # 3. Peak-to-trough drawdown since process start. Catches "won early, gave
 #    it back" patterns. Resets only on bot restart.
 max_session_drawdown_quote: "50"
-# 4. Consecutive closed executors with net_pnl_quote < 0. Detects adverse
-#    selection clusters before daily limit fires.
-max_consecutive_losing_fills: 5
-# 5. Rolling 1h burn rate: sum of net_pnl over the last 3600s ≤ -limit.
-#    Catches slow bleeds that would not trip daily_loss until hours later.
+# NOTE (2026-05-18): LOSING_STREAK gate removed (redundant with MINUTE_BURN
+# + mis-fired due to sign bug in XEMMExecutor.get_net_pnl_quote on SELL
+# fills). Per-fill PnL accounting replaced with portfolio-value-derived
+# gates (V_now = balances × mid; gates measure deltas of V).
+#
+# 4a. Rolling 1min burn rate (V_now - V_60s_ago <= -limit). Catches acute
+#     drawdowns before the 1h window has time to accumulate.
+max_minute_burn_quote: "15"
+# 4b. Rolling 1h burn rate (V_now - V_3600s_ago <= -limit). Catches slow
+#     bleeds that wouldn't trip daily_loss for hours.
 max_hourly_burn_quote: "50"
-# 6. Sum across base assets of |drift| * mid_price. Defense-in-depth against
+# 5. Sum across base assets of |drift| * mid_price. Defense-in-depth against
 #    auto_rebalance failing to keep up with growing drift.
 max_unrealized_loss_quote: "100"
 
@@ -162,6 +179,24 @@ arb_unwind_strategy: "abort_and_alert"
 arb_failure_pause_sec: 1800.0
 arb_max_failures_per_day: 3
 arb_daily_loss_limit_quote: "100"
+
+# ============================================================ #
+# Fee assets (top-up unidirecional para pagamento de taxas)    #
+# ============================================================ #
+# Cobertura de assets pra fee discount (BNB no Binance, etc). Separado
+# de inventory_audit.base_targets porque o tratamento é diferente:
+#   * só BUY — saldo drena por fees, não acumula via trading.
+#   * sem subscrição de livro — preço via REST com cache curto.
+#   * top-up neutro no PnL — participa da fórmula drift-target, então
+#     R$60 saindo de BRL viram R$60 em BNB; não trip kill switches.
+fee_assets:
+  enabled: false
+  targets:
+    BNB: "0.05"
+  min_topup_quote: "60"        # min_notional do exchange (Binance BNB-BRL ≈ R$60)
+  check_interval_sec: 300.0
+  price_cache_ttl_sec: 60.0
+  topup_cooldown_sec: 120.0
 
 # ============================================================ #
 # Operational                                                  #
