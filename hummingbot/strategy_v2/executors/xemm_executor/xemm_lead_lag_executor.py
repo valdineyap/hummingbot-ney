@@ -171,7 +171,9 @@ class XEMMLeadLagExecutor(XEMMExecutor):
         leaving ~9.9 sats of residual drift per cycle. Observed in prod
         2026-05-11 19:41: cycle 4 left positive drift, auto_rebalance
         truncated again in the opposite direction, flipped sign, audit hit
-        HEDGE_FAILURES_3 → KILLED → bot stuck.
+        HEDGE_FAILURES_3 → KILLED → bot stuck. (The HEDGE_FAILURES_N strike
+        rule was later removed 2026-05-12 once barrier-pattern audit fixed
+        the underlying race; the quantization itself is still required.)
 
         Quantizing here makes the truncation explicit (logged) and
         deterministic (matches Binance's behaviour). The maker-side residual

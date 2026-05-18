@@ -2,7 +2,9 @@
 
 Foco: o que um agente (humano ou Claude) precisa para responder rápido a
 "o bot está OK?" e investigar quando algo deu errado. Para arquitetura,
-ver [`DEVELOPMENT_STATUS.md`](DEVELOPMENT_STATUS.md).
+ver [`DEVELOPMENT_STATUS.md`](DEVELOPMENT_STATUS.md). Para observabilidade
+de memória / hunt de leak / interpretação de `[mem]` e `[sbe_queue]`, ver
+[`docs/MEMORY_OBSERVABILITY.md`](docs/MEMORY_OBSERVABILITY.md).
 
 ---
 

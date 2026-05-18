@@ -113,10 +113,11 @@ warmup_seconds: 25.0
 # An EXTERNAL watchdog (tools/watchdog_pnl.sh, cron every 1 min) runs with
 # LOOSER thresholds as a redundancy layer if these gates ever fail.
 #
-# 1. Hedge failures (proxy via inventory_audit drift counter):
-#    N consecutive stuck audits on any base asset → KILL.
-max_consecutive_hedge_failures: 3
-# 2. Realized loss since UTC midnight.
+# NOTE: the HEDGE_FAILURES_N strike rule was removed 2026-05-12 — the
+# barrier-pattern audit eliminates the false-positive races it tried to
+# detect. Real hedge failures surface via UNREALIZED_LOSS / DAILY_LOSS.
+#
+# 1. Realized loss since UTC midnight.
 max_daily_loss_quote: "100"
 # 3. Peak-to-trough drawdown since process start. Catches "won early, gave
 #    it back" patterns. Resets only on bot restart.

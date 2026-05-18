@@ -131,6 +131,18 @@ class XEMMLeadLagConfig(ControllerConfigBase):
         default=Decimal("0.0002"),
         json_schema_extra={"prompt": "Order amount in base asset: ", "prompt_on_new": True})
 
+    # === Hard cap on per-order size (safety gate) ===
+    # Refuse ANY order whose base amount exceeds `order_amount *
+    # max_order_amount_multiplier`. Applies to: audit auto_rebalance,
+    # XEMM/arb spawn, boot-time rebalance — every path that places base.
+    # If this gate fires, something is wrong upstream (audit drift miscount,
+    # config mutation, etc). The order is blocked and logged CRITICAL —
+    # NOT silently truncated, so the bug surfaces. Persistent drift caused
+    # by repeated blocks gets caught by UNREALIZED_LOSS / DRIFT_STUCK gates.
+    # Default 2.0 allows e.g. one missed natural fill's worth of correction
+    # but blocks "rebalance my entire stack" sized mistakes.
+    max_order_amount_multiplier: Decimal = Field(default=Decimal("2.0"))
+
     # === Profitability (NET of fees — XEMMExecutor adds tx_cost_pct internally) ===
     min_profitability: Decimal = Field(default=Decimal("0.0007"))
     target_profitability: Decimal = Field(default=Decimal("0.0020"))
@@ -253,7 +265,10 @@ class XEMMLeadLagConfig(ControllerConfigBase):
     # === Circuit breakers (PnL-based) ===
     # All limits below are expressed in QUOTE currency (BRL for BTC-BRL pair).
     # They are positive numbers; the gate compares against -limit for losses.
-    max_consecutive_hedge_failures: int = Field(default=3)
+    # NOTE (2026-05-12): the HEDGE_FAILURES_N strike rule was removed (see
+    # _compute_regime comment). The previous `max_consecutive_hedge_failures`
+    # field was deleted with this change — real hedge failures surface via
+    # UNREALIZED_LOSS_QUOTE and DAILY_LOSS_LIMIT instead.
     max_daily_loss_quote: Decimal = Field(default=Decimal("100"))
     # Session drawdown: kill when (session_peak - current_session_pnl) >= this.
     # Captures "won early, gave it back" patterns that net daily PnL hides.
@@ -262,6 +277,15 @@ class XEMMLeadLagConfig(ControllerConfigBase):
     # Consecutive closed executors with net_pnl_quote < 0. Catches adverse-selection
     # clusters or signal inversion before total loss reaches daily limit.
     max_consecutive_losing_fills: int = Field(default=5)
+    # Time-decay for the losing-streak counter. If more than this many seconds
+    # elapse between consecutive losing fills, the streak resets to 0 before
+    # the new loss is counted. Without decay, an old loss from hours ago plus
+    # a fresh one count as 2 — even though they are uncorrelated events.
+    # Observed prod 2026-05-17 23:54: 2 losses at 14:05 + 3 losses at 23:42-54
+    # (9h37min gap between groups) tripped LOSING_STREAK_5 → bot shutdown.
+    # Default 1h matches the typical XEMM cycle cadence; longer idle periods
+    # imply something structural changed (inventory, market regime).
+    losing_streak_decay_sec: float = Field(default=3600.0)
     # Minimum |net_pnl| (BRL) a losing fill must have to advance the streak.
     # Below this, the loss is treated as noise (Binance taker fee dominating a
     # near-zero gross PnL) — neither advances nor resets the counter. Wins
@@ -269,6 +293,13 @@ class XEMMLeadLagConfig(ControllerConfigBase):
     # killed the bot 3× in 2026-05-13 from sequences of ~R$0.01-R$0.06 losses
     # whose total was <R$0.30 — well under the daily loss limit.
     min_loss_per_fill_quote_to_count: Decimal = Field(default=Decimal("0.10"))
+    # Rolling 1min burn rate: kill when sum(net_pnl) over last 60s <= -limit.
+    # Companion gate to max_hourly_burn_quote — pegs acute drawdowns
+    # (signal inversion, cascade of bad fills) without waiting for the 1h
+    # window to accumulate. Default 15 BRL/min is ~3× tighter than the
+    # implied per-minute rate of hourly_burn (50/60 ≈ 0.83 BRL/min) so the
+    # gate only fires on bursts, not steady bleed (which hourly_burn handles).
+    max_minute_burn_quote: Decimal = Field(default=Decimal("15"))
     # Rolling 1h burn rate: kill when sum(net_pnl) over last 3600s <= -limit.
     # Detects slow bleeds that would not trip daily_loss until hours later.
     max_hourly_burn_quote: Decimal = Field(default=Decimal("50"))
@@ -387,6 +418,9 @@ class XEMMLeadLagCSVLogger:
         # PnL-safety telemetry (drives circuit breakers and external watchdog)
         "daily_realized_pnl", "session_pnl_total", "session_pnl_peak",
         "session_drawdown", "consecutive_losing_fills", "hourly_burn",
+        "minute_burn",
+        # Max-lot guard counters (audit auto_rebalance / spawn-time guard)
+        "oversized_blocks_total", "last_oversized_block_source",
     ]
 
     def __init__(self, log_dir: str, controller_id: str):
@@ -475,6 +509,10 @@ class TradeLedger:
         self._pnl_today = Decimal("0")
         self._trades_today = 0
         self._today = self._utc_today()
+        # Safety snapshot (PnL gates) — updated by controller via
+        # write_safety_snapshot(); preserved across fills.
+        self._safety_snapshot: Optional[dict] = None
+        self._last_trade_record: Optional[dict] = None
 
     @staticmethod
     def _utc_today() -> str:
@@ -557,6 +595,7 @@ class TradeLedger:
                 "quote_asset": self._quote,
             }
             self._append_jsonl(record)
+            self._last_trade_record = record
             self._write_state(record)
             self._touch()
         except Exception as e:
@@ -668,6 +707,7 @@ class TradeLedger:
                 ),
             }
             self._append_jsonl(record)
+            self._last_trade_record = record
             self._write_state(record)
             self._touch()
         except Exception as e:
@@ -704,6 +744,10 @@ class TradeLedger:
             "quote_asset": self._quote,
             "last_trade": last_record,
         }
+        # Merge in the latest safety snapshot (if controller has provided one).
+        # Kept as a separate field so legacy readers keep working.
+        if getattr(self, "_safety_snapshot", None):
+            state["safety"] = self._safety_snapshot
         tmp = self._state_path + ".tmp"
         with open(tmp, "w") as f:
             json.dump(state, f, indent=2)
@@ -713,6 +757,40 @@ class TradeLedger:
             except Exception:
                 pass
         os.replace(tmp, self._state_path)
+
+    def write_safety_snapshot(self, safety: dict) -> None:
+        """Periodic safety snapshot — rewrites state.json with current safety
+        counters even when no fill happened.
+
+        Called by the controller on a coarse cadence (e.g. every 60s) so the
+        external monitor can read fresh values without waiting for the next
+        fill. The ``safety`` dict carries the same names as the CSV columns
+        (``daily_realized_pnl``, ``session_drawdown``, ``hourly_burn``,
+        ``minute_burn``, ``consecutive_losing_fills``, ``regime``,
+        ``kill_reason``) so any consumer can cross-reference.
+
+        Snapshot is cached on the ledger so ``_write_state`` (called from
+        fills) keeps producing a state file that includes it.
+        """
+        def _convert(v):
+            if isinstance(v, dict):
+                return {k: _convert(x) for k, x in v.items()}
+            if isinstance(v, list):
+                return [_convert(x) for x in v]
+            return self._to_jsonable(v)
+        try:
+            self._safety_snapshot = {k: _convert(v) for k, v in safety.items()}
+        except Exception:
+            self._safety_snapshot = None
+            return
+        # Reuse _write_state with the most recent trade if any (preserves
+        # ``last_trade`` across periodic snapshots).
+        last_trade = getattr(self, "_last_trade_record", None) or {}
+        try:
+            self._write_state(last_trade)
+        except Exception:
+            # Disk error must never crash the strategy — skip silently.
+            pass
 
     def _touch(self) -> None:
         # Empty file; only mtime matters. Idempotent.
@@ -774,8 +852,14 @@ class XEMMLeadLagController(ControllerBase):
         self._session_pnl_total: Decimal = Decimal("0")
         self._session_pnl_peak: Decimal = Decimal("0")
         # Counts how many closed executors in a row had net_pnl_quote < 0.
-        # Resets on the first non-loss fill.
+        # Resets on the first non-loss fill OR after `losing_streak_decay_sec`
+        # idle since the last losing fill (whichever happens first).
         self._consecutive_losing_fills: int = 0
+        # Timestamp of the last fill that ADVANCED the streak (i.e. a loss
+        # above the noise floor). Used by the time-decay logic in
+        # on_executors_update to expire stale streaks before counting a
+        # fresh loss against an unrelated old one.
+        self._last_losing_fill_time: float = 0.0
         # Sliding 1h history of (timestamp, net_pnl_quote) tuples used by the
         # hourly burn-rate gate. Trimmed lazily on each access in _hourly_burn.
         self._hourly_pnl_history: Deque[Tuple[float, Decimal]] = deque()
@@ -793,6 +877,13 @@ class XEMMLeadLagController(ControllerBase):
         self._last_signal_update: float = 0.0
         self._last_full_update: float = 0.0
         self._balance_version: int = 0  # incremented on fill events
+        # Cadence for periodic safety snapshot to state.json (lets the
+        # external monitor read PnL counters without waiting for a fill).
+        self._last_safety_snapshot: float = 0.0
+        self._safety_snapshot_interval: float = 60.0
+        # Max-lot guard counters (incremented by _check_max_lot on reject).
+        self._oversized_blocks_total: int = 0
+        self._last_oversized_block_source: str = ""
 
         # === Watchdog: detect event loop lag (e.g. MQTT-style asyncio blocking) ===
         # Tracks wall-clock time of last successful tick. If a tick observes a gap
@@ -896,6 +987,61 @@ class XEMMLeadLagController(ControllerBase):
         # Snapshot from the phase-1 audit that triggered the barrier. Kept
         # for log/forensic correlation with the post-barrier outcome.
         self._barrier_drift_snapshot: Dict[str, Dict[str, Decimal]] = {}
+
+        # === Memory observability (2026-05-16: 12:22Z OOM-driven event-loop
+        # lag incident) ===
+        # Periodic snapshot of process memory + internal data-structure sizes.
+        # Goal: detect leaks early. The 12:22Z incident saw RSS grow ~1.8 GB
+        # in 10 min before the kernel ran out of memory and stalled the event
+        # loop for 16.7 s. Without this snapshot we had to reconstruct from
+        # ``sar`` after the fact; now the curve is in our own log.
+        #
+        # tracemalloc is opt-in via XEMM_TRACEMALLOC=1: when enabled, we
+        # snapshot every ``_tracemalloc_interval_sec`` and log the top-N
+        # allocation deltas vs the prior snapshot. Off by default because
+        # tracemalloc itself adds ~15-25% memory overhead.
+        self._last_mem_metrics_time: float = 0.0
+        self._mem_metrics_interval_sec: float = 60.0
+        self._mem_psutil_proc = None  # lazy-init in _log_memory_metrics
+        self._tracemalloc_enabled: bool = os.environ.get("XEMM_TRACEMALLOC", "") == "1"
+        self._tracemalloc_started: bool = False
+        self._last_tracemalloc_time: float = 0.0
+        self._tracemalloc_interval_sec: float = 300.0  # 5 min
+        self._tracemalloc_prev_snapshot = None
+        self._tracemalloc_top_n: int = 10
+        # Task-age tracking: maps id(task) → first-seen monotonic timestamp.
+        # We don't have task creation time from asyncio, so we approximate by
+        # remembering when we first saw each task in ``asyncio.all_tasks()``.
+        # ``oldest_task_age_sec`` rises when a coroutine gets stuck in I/O
+        # without a timeout — the classic asyncio leak shape.
+        self._task_first_seen: Dict[int, float] = {}
+        # ``gc.get_objects()`` walks the entire GC tracked-object set —
+        # expensive on a large heap. Gate it to ``_gc_objects_interval_sec``
+        # OR force a sample whenever RSS jumps >100 MB since the previous
+        # gc sample (so a leak event triggers a fresh snapshot immediately).
+        self._last_gc_objects_time: float = 0.0
+        self._gc_objects_interval_sec: float = 300.0
+        self._mem_last_rss_for_gc: float = 0.0
+
+        # === Self-dispatched MARKET registry (orphan_hedge suppression) ===
+        # Tracks order_ids of MARKET orders that the controller/executors
+        # placed for self-corrective reasons (rebalance, arb-unwind). When
+        # the resulting fill event arrives, ``_maybe_dispatch_orphan_hedge``
+        # MUST NOT fire a taker hedge against it — those orders already
+        # close a one-sided exposure and hedging them would re-open it.
+        #
+        # Without this registry, the 2026-05-16 11:36:01Z (and 10:32:48Z)
+        # incidents observed:
+        #   1. unwind MARKET BUY on maker → fills
+        #   2. orphan_hedge sees no live owner → MARKET SELL on taker
+        #   3. inventory short again; audit fires again → MARKET BUY again
+        #   4. orphan_hedge MARKET SELL again → death loop until cooldown
+        #
+        # Stored as {order_id: registered_at_ts}. Entries are pruned after
+        # ``_self_dispatched_ttl_sec`` because we only need to suppress
+        # the orphan_hedge for the fill that follows our own dispatch.
+        self._self_dispatched_market_ids: Dict[str, float] = {}
+        self._self_dispatched_ttl_sec: float = 60.0
 
         # === Orphan order reconciliation ===
         # Periodic check (every _orphan_check_interval_sec) that compares the
@@ -1382,6 +1528,300 @@ class XEMMLeadLagController(ControllerBase):
         except (TypeError, ValueError):
             return None
 
+    def _log_memory_metrics(self, now: float) -> None:
+        """Periodic snapshot of process memory + internal data-structure
+        sizes. Logged every ``_mem_metrics_interval_sec`` (60 s default).
+
+        Why we need this — 2026-05-16 12:22Z incident: the bot's RSS grew
+        from ~900 MB at 12:10 to ~2.7 GB at 12:20 (verified post-mortem
+        via ``sar -r``). At 12:22 the kernel ran out of memory, entered
+        direct reclaim, and stalled the event loop for 16.7 s — long
+        enough to trip our watchdog kill switch. The OOM-killer then took
+        out unrelated processes (snapd) before the user rebooted the
+        host. We had to reconstruct the growth curve from system tools
+        because the bot itself was silent on memory. This log fixes that.
+
+        The line is INFO so it's captured by the standard log feed but
+        can be grepped/aggregated easily:
+
+            [mem] rss=346.2MB pss=340.1MB vms=1024.5MB uss=298.7MB \
+                hwm=412.0MB swap=0kB fd=18 threads=4 \
+                asyncio_tasks=42 oldest_task_age=12s \
+                top_coro=update_processed_data:1,_safe_listen:1 \
+                gc=(412,11,3) gc_objects=152000 gc_collections=(120,12,3) \
+                tm_cur=0.0MB tm_peak=0.0MB \
+                executors=2 pending_rebalances=0 self_dispatched=0 \
+                redis_us_sm=258 redis_us_orphans=256
+
+        Field meanings (and why each one is in the line):
+        - rss/pss/vms/uss/hwm/swap: separate dimensions of process memory.
+          PSS is the most honest single number (RSS counts shared pages,
+          which inflates it). HWM is the all-time peak, useful to know
+          whether RSS shrank or just plateaued.
+        - fd/threads: detect socket/file/thread leaks.
+        - asyncio_tasks/oldest_task_age/top_coro: a coroutine count that
+          keeps growing OR an "oldest age" that keeps growing is the
+          classic asyncio leak (task stuck in I/O without timeout).
+        - gc_objects/gc_collections: real heap size (count of GC-tracked
+          objects) and how often each generation actually ran. Far more
+          useful than ``gc.get_count()`` alone, which is just the
+          allocation counters since the last gen-0 collection.
+        - tm_cur/tm_peak: how much of the Python heap tracemalloc has
+          actually accounted for (set when PYTHONTRACEMALLOC is exported
+          at startup).
+
+        Safe to call every tick: short-circuits on the time gate. On any
+        unexpected failure we log a warning once and skip subsequent
+        snapshots within the interval (don't let observability break the
+        bot).
+        """
+        if (now - self._last_mem_metrics_time) < self._mem_metrics_interval_sec:
+            return
+        self._last_mem_metrics_time = now
+
+        try:
+            if self._mem_psutil_proc is None:
+                import psutil
+                self._mem_psutil_proc = psutil.Process()
+            proc = self._mem_psutil_proc
+            mi = proc.memory_info()
+            rss_mb = mi.rss / (1024 * 1024)
+            vms_mb = mi.vms / (1024 * 1024)
+            # USS = unique set size (memory that would be freed if proc died).
+            # Only available on Linux/macOS via memory_full_info; falls back
+            # to 0.0 silently.
+            try:
+                uss_mb = proc.memory_full_info().uss / (1024 * 1024)
+            except Exception:
+                uss_mb = 0.0
+
+            # Linux-only /proc reads — silent fallback on macOS / restricted
+            # environments. The kernel-reported numbers are authoritative
+            # (psutil derives RSS/VMS from the same /proc/PID/status file).
+            pss_mb = 0.0
+            try:
+                with open("/proc/self/smaps_rollup") as f:
+                    for line in f:
+                        if line.startswith("Pss:"):
+                            pss_mb = int(line.split()[1]) / 1024.0
+                            break
+            except Exception:
+                pass
+            vmhwm_mb = 0.0
+            swap_kb = 0
+            try:
+                with open("/proc/self/status") as f:
+                    for line in f:
+                        if line.startswith("VmHWM:"):
+                            vmhwm_mb = int(line.split()[1]) / 1024.0
+                        elif line.startswith("VmSwap:"):
+                            swap_kb = int(line.split()[1])
+            except Exception:
+                pass
+
+            # File descriptors and threads — both are common leak surfaces
+            # outside the Python heap. ``os.listdir('/proc/self/fd')`` is
+            # cheap (one directory read).
+            fd_count = -1
+            try:
+                fd_count = len(os.listdir("/proc/self/fd"))
+            except Exception:
+                pass
+            try:
+                threads_n = proc.num_threads()
+            except Exception:
+                threads_n = -1
+
+            # asyncio task census. ``all_tasks()`` may raise RuntimeError if
+            # called from outside an event loop (e.g. in a synchronous test).
+            asyncio_tasks_n = -1
+            oldest_task_age = -1.0
+            top_coro_str = "-"
+            try:
+                import asyncio
+                from collections import Counter
+                try:
+                    tasks = asyncio.all_tasks()
+                except RuntimeError:
+                    tasks = set()
+                asyncio_tasks_n = len(tasks)
+                # Refresh first-seen registry; drop ids that no longer exist.
+                current_ids = set()
+                for t in tasks:
+                    tid = id(t)
+                    current_ids.add(tid)
+                    if tid not in self._task_first_seen:
+                        self._task_first_seen[tid] = now
+                self._task_first_seen = {
+                    tid: ts
+                    for tid, ts in self._task_first_seen.items()
+                    if tid in current_ids
+                }
+                if self._task_first_seen:
+                    oldest_task_age = now - min(self._task_first_seen.values())
+                # Top-3 coroutines by name — identifies which kind of task is
+                # accumulating without dumping all task names every minute.
+                names: List[str] = []
+                for t in tasks:
+                    try:
+                        c = t.get_coro()
+                        names.append(getattr(c, "__qualname__", None) or repr(c))
+                    except Exception:
+                        pass
+                top = Counter(names).most_common(3)
+                if top:
+                    top_coro_str = ",".join(f"{n}:{c}" for n, c in top)
+            except Exception:
+                pass
+
+            import gc
+            gc_counts = gc.get_count()
+            try:
+                stats = gc.get_stats()
+                gc_collections = tuple(
+                    s.get("collections", 0) for s in stats[:3]
+                )
+            except Exception:
+                gc_collections = (0, 0, 0)
+
+            # gc.get_objects() walks the entire GC tracked-object set —
+            # expensive on a large heap. Run it on the 5-min gate OR force a
+            # sample when RSS just jumped (catches the leak event when it
+            # happens, not 5 min later).
+            gc_objects_n = -1
+            rss_jumped = (rss_mb - self._mem_last_rss_for_gc) > 100.0
+            gc_due = (now - self._last_gc_objects_time) >= self._gc_objects_interval_sec
+            if gc_due or rss_jumped:
+                try:
+                    gc_objects_n = len(gc.get_objects())
+                    self._last_gc_objects_time = now
+                    self._mem_last_rss_for_gc = rss_mb
+                except Exception:
+                    pass
+
+            # Tracemalloc current/peak — populated when tracing is active,
+            # whether started by us (XEMM_TRACEMALLOC) or by PYTHONTRACEMALLOC.
+            tm_cur_mb = 0.0
+            tm_peak_mb = 0.0
+            try:
+                import tracemalloc
+                if tracemalloc.is_tracing():
+                    cur, peak = tracemalloc.get_traced_memory()
+                    tm_cur_mb = cur / (1024 * 1024)
+                    tm_peak_mb = peak / (1024 * 1024)
+            except Exception:
+                pass
+
+            # Internal data structures most likely to leak unbounded
+            pending_rebalances_n = len(self._pending_rebalances)
+            executors_info_n = len(self.executors_info or [])
+            self_dispatched_n = len(self._self_dispatched_market_ids)
+
+            # Redis user-stream state-machine sizes (if accessible)
+            redis_us_sm = -1
+            redis_us_orphans = -1
+            try:
+                maker = self.market_data_provider.get_connector(
+                    self.config.maker_connector
+                )
+                us_ds = getattr(maker, "_user_stream_tracker", None)
+                if us_ds is not None:
+                    ds = getattr(us_ds, "data_source", None) or getattr(us_ds, "_data_source", None)
+                    if ds is not None:
+                        redis_us_sm = len(getattr(ds, "_state_machine", {}) or {})
+                        redis_us_orphans = len(getattr(ds, "_orphan_buffer", {}) or {})
+            except Exception:
+                pass
+
+            self.logger().info(
+                f"[mem] rss={rss_mb:.1f}MB pss={pss_mb:.1f}MB vms={vms_mb:.1f}MB uss={uss_mb:.1f}MB "
+                f"hwm={vmhwm_mb:.1f}MB swap={swap_kb}kB "
+                f"fd={fd_count} threads={threads_n} "
+                f"asyncio_tasks={asyncio_tasks_n} oldest_task_age={oldest_task_age:.0f}s "
+                f"top_coro={top_coro_str} "
+                f"gc={gc_counts} gc_objects={gc_objects_n} gc_collections={gc_collections} "
+                f"tm_cur={tm_cur_mb:.1f}MB tm_peak={tm_peak_mb:.1f}MB "
+                f"executors={executors_info_n} pending_rebalances={pending_rebalances_n} "
+                f"self_dispatched={self_dispatched_n} "
+                f"redis_us_sm={redis_us_sm} redis_us_orphans={redis_us_orphans}"
+            )
+        except Exception as e:
+            # Suppress further attempts for the rest of the interval; reset on
+            # the next due time so a transient error doesn't kill the logger.
+            self.logger().warning(
+                f"[mem] failed to collect metrics: {type(e).__name__}: {e}"
+            )
+
+        # tracemalloc snapshot diffs — opt-in via XEMM_TRACEMALLOC=1
+        if self._tracemalloc_enabled:
+            self._maybe_log_tracemalloc(now)
+
+    def _maybe_log_tracemalloc(self, now: float) -> None:
+        """Snapshot Python allocations and log the top deltas since the
+        previous snapshot. Activated only when ``XEMM_TRACEMALLOC=1`` is
+        set in the environment — tracemalloc itself adds 15-25 % memory
+        overhead, so we don't pay it by default. Useful for identifying
+        the source of a leak observed via ``[mem]`` growth.
+
+        Tracing can be started two ways:
+
+        - ``XEMM_TRACEMALLOC=1`` only: this method calls ``tracemalloc.start()``
+          on the first invocation. Allocations made before that first call are
+          NOT captured (tracemalloc only sees allocations after start). Fine
+          if you want to study growth from a known baseline.
+        - ``PYTHONTRACEMALLOC=N`` exported before the Python process starts:
+          tracing is active from the very first allocation. This method then
+          skips the ``start()`` call and goes straight to diff snapshots. This
+          is the recommended setup for hunting an unknown leak — you don't
+          miss the early allocations that may turn out to be the long-lived
+          ones causing the growth.
+        """
+        if (now - self._last_tracemalloc_time) < self._tracemalloc_interval_sec:
+            return
+        self._last_tracemalloc_time = now
+        try:
+            import tracemalloc
+            # If PYTHONTRACEMALLOC was set, tracing is already on — don't
+            # call start() again (would raise). If not, start now with a
+            # conservative default of 10 frames (cheaper than 25; usually
+            # enough to localise the call site to a single source line).
+            if not tracemalloc.is_tracing():
+                tracemalloc.start(10)
+                self._tracemalloc_started = True
+                self.logger().info(
+                    "[mem/tracemalloc] started (frames=10); deltas will appear "
+                    "on the next snapshot interval"
+                )
+                return
+            if not self._tracemalloc_started:
+                # First time we observe tracing active (likely started by
+                # PYTHONTRACEMALLOC). Record state and take the baseline
+                # snapshot; diff will start on the next interval.
+                self._tracemalloc_started = True
+                self.logger().info(
+                    "[mem/tracemalloc] tracing already active "
+                    "(likely PYTHONTRACEMALLOC); baseline snapshot taken"
+                )
+                self._tracemalloc_prev_snapshot = tracemalloc.take_snapshot()
+                return
+            snapshot = tracemalloc.take_snapshot()
+            if self._tracemalloc_prev_snapshot is not None:
+                diff = snapshot.compare_to(
+                    self._tracemalloc_prev_snapshot, "lineno"
+                )
+                top = diff[: self._tracemalloc_top_n]
+                self.logger().info(
+                    f"[mem/tracemalloc] top {len(top)} deltas vs prev "
+                    f"(interval={self._tracemalloc_interval_sec:.0f}s):"
+                )
+                for stat in top:
+                    self.logger().info(f"[mem/tracemalloc]   {stat}")
+            self._tracemalloc_prev_snapshot = snapshot
+        except Exception as e:
+            self.logger().warning(
+                f"[mem/tracemalloc] snapshot failed: {type(e).__name__}: {e}"
+            )
+
     async def _run_orphan_check(self, now: float) -> None:
         """
         Periodic reconciliation with two race-resistance guards:
@@ -1715,12 +2155,49 @@ class XEMMLeadLagController(ControllerBase):
                 continue
         return None
 
+    def register_self_dispatched_market_id(self, order_id: Optional[str]) -> None:
+        """Tag a MARKET order placed by the controller or one of its
+        executors for a self-corrective purpose (rebalance, arb-unwind).
+
+        The resulting fill MUST be ignored by ``_maybe_dispatch_orphan_hedge``
+        — those orders close a one-sided exposure by design; firing a
+        taker hedge against them re-opens it and creates a drift→rebalance
+        loop (observed 2026-05-16 11:36:01Z and 10:32:48Z).
+
+        Safe to call multiple times with the same id (idempotent). Stale
+        entries are pruned lazily on the next orphan_hedge dispatch.
+        """
+        if not order_id:
+            return
+        try:
+            now = self.market_data_provider.time()
+        except Exception:
+            now = time.time()
+        self._self_dispatched_market_ids[order_id] = now
+
+    def _prune_self_dispatched_market_ids(self, now: Optional[float] = None) -> None:
+        """Drop registry entries older than ``_self_dispatched_ttl_sec``.
+        Keeps the dict bounded without needing a periodic task."""
+        if not self._self_dispatched_market_ids:
+            return
+        if now is None:
+            try:
+                now = self.market_data_provider.time()
+            except Exception:
+                now = time.time()
+        ttl = self._self_dispatched_ttl_sec
+        stale = [k for k, ts in self._self_dispatched_market_ids.items() if (now - ts) > ttl]
+        for k in stale:
+            self._self_dispatched_market_ids.pop(k, None)
+
     def _maybe_dispatch_orphan_hedge(self, event, source_connector: str) -> None:
         """Fire a MARKET taker hedge if this maker fill has no live owner.
 
         Called from ``_on_fill`` synchronously when an OrderFilled event
         fires on the maker connector. Returns silently when:
           * a live executor owns the order_id (it will hedge),
+          * the order was self-dispatched by us (rebalance / arb-unwind):
+            those are corrective MARKETs that must NOT be hedged,
           * the event payload is malformed (no order_id / non-positive amount),
           * the taker connector cannot be resolved (logs ERROR; audit
             remains as a slower fallback).
@@ -1730,6 +2207,19 @@ class XEMMLeadLagController(ControllerBase):
             return
         if self._find_live_executor_owning_maker(order_id) is not None:
             return  # alive executor will hedge in its own listener
+
+        # Skip self-dispatched corrective MARKETs (rebalance, arb-unwind).
+        # See ``register_self_dispatched_market_id`` for the failure mode
+        # this guards against.
+        self._prune_self_dispatched_market_ids()
+        if order_id in self._self_dispatched_market_ids:
+            self.logger().info(
+                f"[orphan_hedge] {order_id}: skipping — self-dispatched "
+                f"corrective MARKET (rebalance or arb-unwind); hedging it "
+                f"would re-open the one-sided exposure."
+            )
+            self._self_dispatched_market_ids.pop(order_id, None)
+            return
 
         # No live owner. Dispatch the cross-exchange MARKET hedge.
         try:
@@ -1944,13 +2434,34 @@ class XEMMLeadLagController(ControllerBase):
 
         results, any_drift = self._compute_drift_per_asset(cfg, mid_price)
         results["_drift_active"] = any_drift
-        results["_inflight_active"] = self._has_inflight_activity()
+        inflight_active = self._has_inflight_activity()
+        results["_inflight_active"] = inflight_active
         self._last_audit_results = results
 
         if source == "boot":
             self._log_side_imbalance_if_any(results, source)
 
         if not any_drift:
+            return False
+
+        # Inflight gate (2026-05-16 fix): defer the barrier when an arb
+        # leg is in flight or a fill happened in the last 10s. Drift
+        # detected during these windows is BY DESIGN (arb leg-1 filled,
+        # leg-2 pending; or hedge order still on the wire) — not real
+        # drift. Without this gate, the barrier kills the live XEMM
+        # executors AND queues a rebalance that paths through
+        # orphan_hedge, undoing both legs. Observed 2026-05-16 11:36:01Z:
+        # arb leg-1 fill → audit at 11:35:59 → barrier stopped 3
+        # executors → drift "confirmed" → rebalance MARKET fired in
+        # parallel with the arb's own unwind on bitpreco, with both
+        # fills triggering orphan_hedge MARKETs on binance_sbe. See
+        # ``_has_inflight_activity`` docstring for the intended contract.
+        if inflight_active:
+            self.logger().info(
+                f"[audit/{source}] drift suspected but inflight activity "
+                f"in progress (arb leg pending or recent fill) — deferring "
+                f"barrier. {self._format_drift_summary(results)}"
+            )
             return False
 
         # Enter barrier
@@ -2375,12 +2886,29 @@ class XEMMLeadLagController(ControllerBase):
                     f"proceeding with unquantized {amount:.8f}."
                 )
 
+            # Max-lot safety gate (refuse > order_amount × multiplier).
+            # Drift can be arbitrarily large after, e.g., a missed hedge or
+            # mis-counted balance; without this we could MARKET-rebalance a
+            # huge chunk and 10× the intended exposure. Drift remains and
+            # will surface via UNREALIZED_LOSS / DRIFT_STUCK if persistent.
+            if not self._check_max_lot(
+                amount, source=f"audit_rebalance:{asset}@{conn_name}"
+            ):
+                continue
+
             # Place MARKET order
             try:
                 if is_sell:
                     order_id = connector.sell(pair, amount, OrderType.MARKET, Decimal("0"))
                 else:
                     order_id = connector.buy(pair, amount, OrderType.MARKET, Decimal("0"))
+
+                # Suppress ``_maybe_dispatch_orphan_hedge`` on the resulting
+                # fill: a rebalance is by design a one-sided correction;
+                # hedging it on the taker would undo the fix and re-trigger
+                # the audit (drift→rebalance→orphan-hedge death loop seen
+                # in prod on 2026-05-16 10:32-10:34Z).
+                self.register_self_dispatched_market_id(order_id)
 
                 direction = "SELL" if is_sell else "BUY"
                 other_candidates = [c for c in candidates if c[0] != conn_name]
@@ -2739,10 +3267,30 @@ class XEMMLeadLagController(ControllerBase):
                     # advance the streak. Sub-threshold losses (Binance taker
                     # fee dominating a near-zero gross capture) are treated
                     # as noise — neither advance nor reset.
+                    #
+                    # Time-decay: before incrementing, expire the streak if
+                    # the previous losing fill was too long ago. Old losses
+                    # are uncorrelated with current ones; counting them
+                    # together produces false-positive KILL (observed prod
+                    # 2026-05-17: 2 losses at 14:05 + 3 at 23:42 → streak=5).
                     if net_pnl >= Decimal("0"):
                         self._consecutive_losing_fills = 0
                     elif abs(net_pnl) >= self.config.min_loss_per_fill_quote_to_count:
+                        now_ts = time.time()
+                        if (self._consecutive_losing_fills > 0
+                                and self._last_losing_fill_time > 0
+                                and (now_ts - self._last_losing_fill_time)
+                                > self.config.losing_streak_decay_sec):
+                            self.logger().info(
+                                f"[streak_decay] resetting losing_streak "
+                                f"{self._consecutive_losing_fills}→0 after "
+                                f"{now_ts - self._last_losing_fill_time:.0f}s "
+                                f"idle (> decay_sec="
+                                f"{self.config.losing_streak_decay_sec:.0f})"
+                            )
+                            self._consecutive_losing_fills = 0
                         self._consecutive_losing_fills += 1
+                        self._last_losing_fill_time = now_ts
                     # else: noise loss, no change
                     self._hourly_pnl_history.append((time.time(), net_pnl))
                     # Per-executor-type accounting for arb circuit breakers.
@@ -2860,6 +3408,11 @@ class XEMMLeadLagController(ControllerBase):
                 await self._run_orphan_check(now)
             except Exception as e:
                 self.logger().error(f"[orphan_check] unexpected failure: {e}", exc_info=True)
+
+        # === Memory observability (every _mem_metrics_interval_sec) ===
+        # Cheap on idle ticks (time-gated). See ``_log_memory_metrics`` for
+        # the why (2026-05-16 12:22Z OOM/event-loop-lag incident).
+        self._log_memory_metrics(now)
 
         # === Execute pending auto-rebalance orders ===
         if self._pending_rebalances:
@@ -3119,6 +3672,9 @@ class XEMMLeadLagController(ControllerBase):
             "session_drawdown": self._session_pnl_peak - self._session_pnl_total,
             "consecutive_losing_fills": self._consecutive_losing_fills,
             "hourly_burn": self._hourly_burn(now),
+            "minute_burn": self._minute_burn(now),
+            "oversized_blocks_total": self._oversized_blocks_total,
+            "last_oversized_block_source": self._last_oversized_block_source,
         }
 
         # Tier 3 throttling: CSV write at most once per second, even when running
@@ -3129,9 +3685,95 @@ class XEMMLeadLagController(ControllerBase):
                 self._csv.log(self.processed_data)
             self._last_full_update = now
 
+        # Periodic safety snapshot to state.json (every 60s by default).
+        # Lets the external monitor (tools/monitor_heartbeat.sh) read PnL
+        # gate counters without waiting for the next fill — critical when
+        # the bot is slowly bleeding without trading much.
+        if (self._trade_ledger is not None
+                and (now - self._last_safety_snapshot)
+                >= self._safety_snapshot_interval):
+            try:
+                self._trade_ledger.write_safety_snapshot({
+                    "regime": regime,
+                    "kill_reason": self._kill_reason or "",
+                    "daily_realized_pnl": self._daily_realized_pnl,
+                    "session_pnl_total": self._session_pnl_total,
+                    "session_pnl_peak": self._session_pnl_peak,
+                    "session_drawdown": (
+                        self._session_pnl_peak - self._session_pnl_total
+                    ),
+                    "consecutive_losing_fills": self._consecutive_losing_fills,
+                    "hourly_burn": self._hourly_burn(now),
+                    "minute_burn": self._minute_burn(now),
+                    # Limits embedded so the monitor never drifts from the
+                    # bot's configured thresholds.
+                    "limits": {
+                        "max_daily_loss_quote": self.config.max_daily_loss_quote,
+                        "max_session_drawdown_quote": (
+                            self.config.max_session_drawdown_quote
+                        ),
+                        "max_consecutive_losing_fills": (
+                            self.config.max_consecutive_losing_fills
+                        ),
+                        "max_minute_burn_quote": (
+                            self.config.max_minute_burn_quote
+                        ),
+                        "max_hourly_burn_quote": (
+                            self.config.max_hourly_burn_quote
+                        ),
+                    },
+                })
+            except Exception as e:
+                self.logger().warning(
+                    f"[safety_snapshot] write failed: {type(e).__name__}: {e}"
+                )
+            self._last_safety_snapshot = now
+
     # ------------------------------------------------------------------ #
     # Regime / risk gates                                                #
     # ------------------------------------------------------------------ #
+    def _check_max_lot(self, amount: Decimal, source: str) -> bool:
+        """Reject orders whose base amount exceeds the configured hard cap.
+
+        Limit = ``order_amount * max_order_amount_multiplier``. Returns True
+        if the order is allowed, False if it must be skipped.
+
+        On reject: logs CRITICAL (so it surfaces in the heartbeat anomaly
+        scan and external monitor) and bumps the cumulative counter.
+        Does NOT silently truncate — silent truncation would hide the bug
+        the gate is designed to catch. Persistent drift caused by repeated
+        rejects is caught by UNREALIZED_LOSS / DRIFT_STUCK downstream.
+
+        ``source`` is a short label (e.g. ``"audit_rebalance:BTC@binance"``)
+        that goes into the log line and the CSV counter — lets us tell
+        which path tried the oversized order.
+        """
+        try:
+            limit = self.config.order_amount * self.config.max_order_amount_multiplier
+        except Exception:
+            # If config is malformed, fail-open with a warning so we don't
+            # silently brick all order placement.
+            self.logger().warning(
+                "[max_lot_guard] could not compute limit "
+                f"(order_amount={self.config.order_amount!r}, "
+                f"mult={self.config.max_order_amount_multiplier!r}); "
+                "allowing order through."
+            )
+            return True
+        if amount <= limit:
+            return True
+        self._oversized_blocks_total += 1
+        self._last_oversized_block_source = source
+        self.logger().critical(
+            f"[max_lot_guard] BLOCKED oversized order: "
+            f"amount={amount} > limit={limit} "
+            f"(order_amount={self.config.order_amount} × "
+            f"max_order_amount_multiplier={self.config.max_order_amount_multiplier}) "
+            f"source={source}. This indicates an upstream bug — "
+            f"order NOT placed. Cumulative blocks: {self._oversized_blocks_total}."
+        )
+        return False
+
     def _is_kill_switch_active(self) -> bool:
         ks = self.config.kill_switch_file
         if not ks:
@@ -3155,6 +3797,25 @@ class XEMMLeadLagController(ControllerBase):
             return Decimal("0")
         total = Decimal("0")
         for _, pnl in self._hourly_pnl_history:
+            total += pnl
+        return total
+
+    def _minute_burn(self, now: float) -> Decimal:
+        """Return the net PnL sum across the last 60 seconds.
+
+        Reuses the same `_hourly_pnl_history` deque used by `_hourly_burn`;
+        no separate state. Iterates from the right (newest first) and stops
+        as soon as it crosses the 60s cutoff — O(k) where k is the count of
+        entries in the last minute (usually 0-3). Does NOT trim the deque,
+        since the 1h window still needs older entries; trimming is owned by
+        `_hourly_burn`.
+        """
+        cutoff = now - 60.0
+        total = Decimal("0")
+        # reversed() over a deque is O(1) per step
+        for ts, pnl in reversed(self._hourly_pnl_history):
+            if ts < cutoff:
+                break
             total += pnl
         return total
 
@@ -3205,7 +3866,16 @@ class XEMMLeadLagController(ControllerBase):
             self._kill_reason = f"LOSING_STREAK_{self._consecutive_losing_fills}"
             return Regime.KILLED, self._kill_reason
 
-        # 3e. HOURLY_BURN — sum of net_pnl over the last 3600s.
+        # 3e1. MINUTE_BURN — sum of net_pnl over the last 60s.
+        # Catches acute drawdowns (signal inversion, cascade of bad fills)
+        # before the 1h window has time to accumulate. Companion to
+        # HOURLY_BURN, not a replacement.
+        minute_burn = self._minute_burn(now)
+        if minute_burn <= -self.config.max_minute_burn_quote:
+            self._kill_reason = f"MINUTE_BURN_{minute_burn:.2f}"
+            return Regime.KILLED, self._kill_reason
+
+        # 3e2. HOURLY_BURN — sum of net_pnl over the last 3600s.
         # Detects slow bleeds before daily_loss bites (e.g. consistent ~5 BRL
         # losses across an hour adds to 50 BRL — half the daily limit, but a
         # clear signal something is broken).
@@ -3418,13 +4088,17 @@ class XEMMLeadLagController(ControllerBase):
         _warn_balance = False
         if len(active_buys) == 0:
             if taker_base >= min_base_required:
-                actions.append(self._make_create_action(TradeType.BUY, target_buy, now))
+                act = self._make_create_action(TradeType.BUY, target_buy, now)
+                if act is not None:
+                    actions.append(act)
             else:
                 _warn_balance = True
 
         if len(active_sells) == 0:
             if min_quote_required > 0 and taker_quote >= min_quote_required:
-                actions.append(self._make_create_action(TradeType.SELL, target_sell, now))
+                act = self._make_create_action(TradeType.SELL, target_sell, now)
+                if act is not None:
+                    actions.append(act)
             else:
                 _warn_balance = True
 
@@ -3450,7 +4124,15 @@ class XEMMLeadLagController(ControllerBase):
 
     def _make_create_action(
         self, maker_side: TradeType, target_profitability: Decimal, now: float,
-    ) -> CreateExecutorAction:
+    ) -> Optional[CreateExecutorAction]:
+        # Defensive max-lot gate. ``order_amount`` is config-fixed so this
+        # should never trip in normal operation — fires only if config got
+        # mutated at runtime or `max_order_amount_multiplier` was set < 1.
+        if not self._check_max_lot(
+            self.config.order_amount,
+            source=f"xemm_spawn:{maker_side.name}",
+        ):
+            return None
         if maker_side == TradeType.BUY:
             buying = ConnectorPair(
                 connector_name=self.config.maker_connector,
@@ -3710,7 +4392,16 @@ class XEMMLeadLagController(ControllerBase):
 
     def _make_arb_action(
         self, side: str, edge_bps: Decimal, now: float,
-    ) -> CreateExecutorAction:
+    ) -> Optional[CreateExecutorAction]:
+        # Defensive max-lot gate. arb_order_amount is config-fixed but the
+        # multiplier is keyed off `order_amount` — if an operator sets
+        # `arb_order_amount > 2 * order_amount` this gate refuses spawn
+        # instead of silently sending a 3-5× sized hedge to the taker.
+        if not self._check_max_lot(
+            self.config.arb_order_amount,
+            source=f"arb_spawn:{side}",
+        ):
+            return None
         if side == "long":
             buying = ConnectorPair(
                 connector_name=self.config.taker_connector,

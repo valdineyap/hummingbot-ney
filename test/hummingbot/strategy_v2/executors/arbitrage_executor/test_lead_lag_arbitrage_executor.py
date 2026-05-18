@@ -33,6 +33,10 @@ class TestLeadLagArbitrageExecutor(IsolatedAsyncioWrapperTestCase, LoggerMixinFo
             arb_unwind_strategy="abort_and_alert",
         )
         self.executor = LeadLagArbitrageExecutor(self.strategy, self.config, update_interval=0.5)
+        # Default touch-price stub: ``_unwind_position`` multiplies slip x touch
+        # to compare absolute exec price cross-venue. Tests that exercise routing
+        # override this; everything else just needs a finite, non-zero value.
+        self.executor._get_touch_price = MagicMock(return_value=Decimal("100"))
         self.set_loggers(loggers=[self.executor.logger()])
 
     @staticmethod
@@ -158,6 +162,68 @@ class TestLeadLagArbitrageExecutor(IsolatedAsyncioWrapperTestCase, LoggerMixinFo
                     )
         self.assertEqual(mock_place.call_args.kwargs["price"], Decimal("0"))
         self.assertEqual(mock_place.call_args.kwargs["order_type"], OrderType.MARKET)
+
+    async def test_unwind_routes_by_absolute_price_not_just_slip(self):
+        """Regression (2026-05-16 11:36:01Z): when both venues estimate
+        slip=0 (small qty, deep books), the old ``slip_buy <= slip_sell``
+        tie-break always picked ``buying_market``. In production this
+        sent a BUY unwind to BitPreco @ 396712 while Binance was at
+        396570 = 36 bps cheaper on the same side. The fix compares
+        expected absolute exec price (touch * (1 +/- slip_bps/10000))
+        across venues."""
+        # Both venues estimate slip=0
+        with patch.object(self.executor, "_estimate_unwind_slippage",
+                          new=AsyncMock(return_value=Decimal("0"))):
+            # BUT touch prices differ: selling_market (bybit) is cheaper for BUY
+            def touch_side_effect(market, side):
+                if market.connector_name == "binance":
+                    return Decimal("396712")
+                return Decimal("396570")  # bybit cheaper
+            self.executor._get_touch_price = MagicMock(side_effect=touch_side_effect)
+            with patch.object(self.executor, "place_order", return_value="OID-ABS") as mock_place:
+                with patch.object(self.executor, "stop"):
+                    # executed_side=SELL -> inverse BUY -> pick cheaper venue
+                    await self.executor._unwind_position(
+                        executed_side=TradeType.SELL,
+                        executed_amount=Decimal("0.0002"),
+                    )
+        # Even with equal slip, routing must pick bybit (lower absolute exec)
+        self.assertEqual(mock_place.call_args.kwargs["connector_name"], "bybit")
+
+    async def test_unwind_notifies_controller_of_self_dispatched_market(self):
+        """Regression (Fix #1, 2026-05-16): the unwind MARKET fill must
+        be tagged on the controller so ``_maybe_dispatch_orphan_hedge``
+        does NOT fire a taker hedge against it (the unwind already
+        flattens the leg-1 exposure)."""
+        fake_controller = MagicMock()
+        # Strategy.controllers exposes the registry method
+        self.strategy.controllers = {"xemm_ll": fake_controller}
+        with patch.object(self.executor, "_estimate_unwind_slippage",
+                          new=AsyncMock(return_value=Decimal("5"))):
+            with patch.object(self.executor, "place_order", return_value="UNWIND-OID-7"):
+                with patch.object(self.executor, "stop"):
+                    await self.executor._unwind_position(
+                        executed_side=TradeType.BUY,
+                        executed_amount=Decimal("0.0002"),
+                    )
+        fake_controller.register_self_dispatched_market_id.assert_called_once_with("UNWIND-OID-7")
+
+    async def test_unwind_controller_notify_failure_is_non_fatal(self):
+        """If the controller registry call raises (e.g. test fakes), the
+        unwind itself must still complete and set ``UNWOUND``. The miss
+        only re-enables the old (buggy) orphan_hedge behaviour."""
+        broken_ctrl = MagicMock()
+        broken_ctrl.register_self_dispatched_market_id.side_effect = RuntimeError("boom")
+        self.strategy.controllers = {"xemm_ll": broken_ctrl}
+        with patch.object(self.executor, "_estimate_unwind_slippage",
+                          new=AsyncMock(return_value=Decimal("5"))):
+            with patch.object(self.executor, "place_order", return_value="UNWIND-OID-8"):
+                with patch.object(self.executor, "stop"):
+                    await self.executor._unwind_position(
+                        executed_side=TradeType.BUY,
+                        executed_amount=Decimal("0.0002"),
+                    )
+        self.assertEqual(self.executor.close_type, CloseType.UNWOUND)
 
     async def test_unwind_aborts_if_slippage_estimation_fails(self):
         """If we can't estimate slippage on either leg, abort safely."""
@@ -289,6 +355,10 @@ class TestAggressiveLimitPlacement(IsolatedAsyncioWrapperTestCase, LoggerMixinFo
             maker_connector_name="bitpreco",
         )
         self.executor = LeadLagArbitrageExecutor(self.strategy, self.config, update_interval=0.5)
+        # Default touch-price stub: ``_unwind_position`` multiplies slip x touch
+        # to compare absolute exec price cross-venue. Tests that exercise routing
+        # override this; everything else just needs a finite, non-zero value.
+        self.executor._get_touch_price = MagicMock(return_value=Decimal("100"))
         self.set_loggers(loggers=[self.executor.logger()])
 
     def _make_strategy(self):
@@ -393,6 +463,10 @@ class TestAggressiveLimitWatchdog(IsolatedAsyncioWrapperTestCase, LoggerMixinFor
             maker_connector_name="bitpreco",
         )
         self.executor = LeadLagArbitrageExecutor(self.strategy, self.config, update_interval=0.5)
+        # Default touch-price stub: ``_unwind_position`` multiplies slip x touch
+        # to compare absolute exec price cross-venue. Tests that exercise routing
+        # override this; everything else just needs a finite, non-zero value.
+        self.executor._get_touch_price = MagicMock(return_value=Decimal("100"))
         self.set_loggers(loggers=[self.executor.logger()])
 
     async def test_fully_filled_in_window_skips_unwind(self):

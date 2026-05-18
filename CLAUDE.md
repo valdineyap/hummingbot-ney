@@ -13,6 +13,9 @@ sintético. Branch ativa: `claude/xemm-leadlag`.
 - **Operação e debug em runtime** → [`OPERATIONS.md`](OPERATIONS.md)
   Monitoramento rápido (`state.json`, `trades.jsonl`, `last_fill.touch`),
   troubleshooting, ciclo de vida do bot, safety mechanisms.
+- **Observabilidade de memória** → [`docs/MEMORY_OBSERVABILITY.md`](docs/MEMORY_OBSERVABILITY.md)
+  Legenda de `[mem]` / `[sbe_queue]` / memory guard L1-L2, steady-state esperado,
+  cheat sheet de diagnóstico, gotchas (tracemalloc bloqueia event loop).
 - **Arquitetura e estado do projeto** → [`DEVELOPMENT_STATUS.md`](DEVELOPMENT_STATUS.md)
 - **Histórico do swap Bybit→BitPreco** → [`HANDOFF_BITPRECO_SWAP.md`](HANDOFF_BITPRECO_SWAP.md)
 

@@ -386,15 +386,24 @@ class LeadLagArbitrageExecutor(ArbitrageExecutor):
         executed_amount: Decimal,
     ):
         """
-        Execute MARKET inverse on the exchange with lower slippage to flatten
-        the residual exposure. Honours `arb_max_unwind_slippage_bps` gate.
+        Execute MARKET inverse on the exchange with the cheapest absolute
+        expected price to flatten the residual exposure. Honours
+        `arb_max_unwind_slippage_bps` gate.
+
+        Routing (fix 2026-05-16): pick by **expected absolute exec price**
+        (touch × slip), not by per-venue slip alone. The previous
+        ``slip_buy <= slip_sell`` tie-break was blind to cross-venue
+        spread — observed 2026-05-16 11:36:01Z, both venues estimated
+        slip=0 (small qty, deep books) and the tie-break routed to
+        ``buying_market`` (BitPreco) at 396712 while Binance was at
+        396570 = 36 bps cheaper on the same side.
         """
         # Inverse side to flatten exposure
         inverse_side = (
             TradeType.SELL if executed_side == TradeType.BUY else TradeType.BUY
         )
 
-        # Fetch live prices on both connectors for the inverse trade
+        # Fetch slip + touch on both connectors for the inverse trade
         try:
             slip_buy_market = await self._estimate_unwind_slippage(
                 self.buying_market, inverse_side, executed_amount,
@@ -402,6 +411,8 @@ class LeadLagArbitrageExecutor(ArbitrageExecutor):
             slip_sell_market = await self._estimate_unwind_slippage(
                 self.selling_market, inverse_side, executed_amount,
             )
+            touch_buy_market = self._get_touch_price(self.buying_market, inverse_side)
+            touch_sell_market = self._get_touch_price(self.selling_market, inverse_side)
         except Exception as e:
             self.logger().critical(
                 f"UNWIND FAILED to fetch slippage estimates: {e}. "
@@ -411,11 +422,39 @@ class LeadLagArbitrageExecutor(ArbitrageExecutor):
             self.stop()
             return
 
-        best_market, best_slip = (
-            (self.buying_market, slip_buy_market)
-            if slip_buy_market <= slip_sell_market
-            else (self.selling_market, slip_sell_market)
-        )
+        # Expected absolute exec price = touch × (1 + slip_bps/10000) for BUY
+        # (paying up the ask), touch × (1 − slip_bps/10000) for SELL (selling
+        # down the bid). Lower is better for BUY (less paid); higher is
+        # better for SELL (more received).
+        sign = Decimal("1") if inverse_side == TradeType.BUY else Decimal("-1")
+        bps = Decimal("10000")
+        exec_buy_market = touch_buy_market * (Decimal("1") + sign * slip_buy_market / bps)
+        exec_sell_market = touch_sell_market * (Decimal("1") + sign * slip_sell_market / bps)
+
+        if inverse_side == TradeType.BUY:
+            # Pay less: pick lower expected exec price
+            if exec_buy_market <= exec_sell_market:
+                best_market, best_slip, best_exec = (
+                    self.buying_market, slip_buy_market, exec_buy_market,
+                )
+                alt_market, alt_exec = self.selling_market, exec_sell_market
+            else:
+                best_market, best_slip, best_exec = (
+                    self.selling_market, slip_sell_market, exec_sell_market,
+                )
+                alt_market, alt_exec = self.buying_market, exec_buy_market
+        else:
+            # Receive more: pick higher expected exec price
+            if exec_buy_market >= exec_sell_market:
+                best_market, best_slip, best_exec = (
+                    self.buying_market, slip_buy_market, exec_buy_market,
+                )
+                alt_market, alt_exec = self.selling_market, exec_sell_market
+            else:
+                best_market, best_slip, best_exec = (
+                    self.selling_market, slip_sell_market, exec_sell_market,
+                )
+                alt_market, alt_exec = self.buying_market, exec_buy_market
 
         gate = self.config.arb_max_unwind_slippage_bps
 
@@ -451,9 +490,19 @@ class LeadLagArbitrageExecutor(ArbitrageExecutor):
             )
             self.logger().info(
                 f"Unwind MARKET {inverse_side.name} {executed_amount} on "
-                f"{best_market.connector_name} (estimated slip {best_slip:.2f} bps), "
+                f"{best_market.connector_name} "
+                f"(slip {best_slip:.2f} bps, exec~{best_exec:.2f}; "
+                f"alt {alt_market.connector_name} exec~{alt_exec:.2f}), "
                 f"order_id={order_id}"
             )
+            # Suppress controller-level orphan_hedge dispatch on the
+            # resulting fill: the unwind is a one-sided correction by
+            # design (it flattens the leg-1 fill we already have on the
+            # other venue); hedging it again on the taker would re-open
+            # the exposure and create a drift→rebalance loop. The
+            # controller-side counterpart of this fix lives in
+            # ``XEMMLeadLag.register_self_dispatched_market_id``.
+            self._notify_controller_self_dispatched_market(order_id)
             self.close_type = CloseType.UNWOUND
             self.stop()
         except Exception as e:
@@ -463,6 +512,30 @@ class LeadLagArbitrageExecutor(ArbitrageExecutor):
             )
             self.close_type = CloseType.UNWIND_ABORTED
             self.stop()
+
+    def _notify_controller_self_dispatched_market(self, order_id: Optional[str]) -> None:
+        """Register a self-dispatched MARKET (unwind) on any controller
+        that exposes ``register_self_dispatched_market_id``. Best-effort:
+        we discover controllers via ``self._strategy.controllers`` and
+        ignore strategies that don't expose them (e.g. tests that mock
+        the strategy with MagicMock). Silently no-op on any failure —
+        the absence of this notification only re-enables the prior
+        (buggy) orphan_hedge behaviour on the unwind fill, but never
+        breaks the unwind itself.
+        """
+        if not order_id:
+            return
+        try:
+            controllers = getattr(self._strategy, "controllers", None) or {}
+            for ctrl in controllers.values():
+                register = getattr(ctrl, "register_self_dispatched_market_id", None)
+                if callable(register):
+                    register(order_id)
+        except Exception as e:
+            self.logger().debug(
+                f"[unwind] controller notify failed (non-fatal): "
+                f"{type(e).__name__}: {e}"
+            )
 
     async def _estimate_unwind_slippage(
         self,
@@ -504,3 +577,18 @@ class LeadLagArbitrageExecutor(ArbitrageExecutor):
             # selling: VWAP lower = worse
             slip_bps = (reference - vwap_price) / reference * Decimal("10000")
         return max(slip_bps, Decimal("0"))
+
+    def _get_touch_price(self, market, side: TradeType) -> Decimal:
+        """Best bid/ask on ``market`` for ``side``. Used by the unwind
+        router to compute expected absolute exec price across venues
+        (touch × slip). Raises if the order book is missing or returns
+        a non-positive price."""
+        connector = self.connectors[market.connector_name]
+        ob = connector.get_order_book(market.trading_pair)
+        if side == TradeType.BUY:
+            reference = Decimal(str(ob.get_price(True)))   # best ask
+        else:
+            reference = Decimal(str(ob.get_price(False)))  # best bid
+        if reference is None or reference <= 0 or reference.is_nan():
+            raise ValueError(f"invalid touch price for {market.trading_pair}")
+        return reference

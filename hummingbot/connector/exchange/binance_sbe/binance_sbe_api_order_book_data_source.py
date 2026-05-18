@@ -65,6 +65,18 @@ class BinanceSbeAPIOrderBookDataSource(BinanceAPIOrderBookDataSource):
         # level — operator's positive signal that decode is working end
         # to end (vs. silent connection that never produces events).
         self._first_frame_logged: bool = False
+        # ---- Queue-size telemetry (2026-05-16 memory-leak hunt) ----
+        # ``self._message_queue`` is inherited from OrderBookTrackerDataSource
+        # as ``defaultdict(asyncio.Queue)`` — unbounded. If a consumer task
+        # stalls (backpressure, blocking work in an awaited callback, etc.),
+        # the queue grows without limit and is a prime suspect for the OOM
+        # incident on 2026-05-16 12:22Z. We emit a ``[sbe_queue]`` line at
+        # most every ``_queue_log_interval_sec`` so the runtime backlog
+        # appears in the same log feed as ``[mem]`` and the two curves can
+        # be correlated by a grep + plot. Time-gated to avoid spam — the
+        # frame-processing path runs at ~25 ms cadence.
+        self._last_queue_log_time: float = 0.0
+        self._queue_log_interval_sec: float = 60.0
 
     # ------------------------------------------------------------------
     # Stream-name helpers — used by every subscribe/unsubscribe path.
@@ -306,6 +318,54 @@ class BinanceSbeAPIOrderBookDataSource(BinanceAPIOrderBookDataSource):
                 f"events_in_frame={len(events)})"
             )
             self._first_frame_logged = True
+
+        # Time-gated queue-backlog telemetry. Cheap on the common path —
+        # one ``time.monotonic`` call and an int comparison — but emits a
+        # ``[sbe_queue]`` line every ``_queue_log_interval_sec`` so we can
+        # plot backlog vs RSS. See ``_maybe_log_queue_sizes``.
+        self._maybe_log_queue_sizes()
+
+    def _maybe_log_queue_sizes(self) -> None:
+        """Emit a ``[sbe_queue]`` line with the current per-channel queue
+        backlog if the time gate has elapsed.
+
+        Why this lives in the connector and not in the controller: the
+        controller's ``[mem]`` line tries to reach the queue via attribute
+        walks (``maker._user_stream_tracker.data_source._state_machine``)
+        which is fragile and connector-specific. The connector itself
+        always has direct access to ``self._message_queue``, so logging
+        here is the simplest and most reliable place.
+
+        Format::
+
+            [sbe_queue] total=<sum> max=<max> n_channels=<n> top=<{ch: q}>
+
+        ``top`` shows up to the 3 largest channels so we can tell which
+        stream (trade/depth/bookTicker) is backing up. The whole line is
+        designed to be one grep-friendly INFO message per minute.
+        """
+        try:
+            now = time.monotonic()
+            if (now - self._last_queue_log_time) < self._queue_log_interval_sec:
+                return
+            self._last_queue_log_time = now
+            queues = self._message_queue
+            if not queues:
+                return
+            sizes = {ch: q.qsize() for ch, q in queues.items()}
+            total = sum(sizes.values())
+            mx = max(sizes.values())
+            top3 = sorted(sizes.items(), key=lambda kv: -kv[1])[:3]
+            top_str = ",".join(f"{ch}:{q}" for ch, q in top3)
+            self.logger().info(
+                f"[sbe_queue] total={total} max={mx} "
+                f"n_channels={len(sizes)} top={top_str}"
+            )
+        except Exception as e:
+            # Telemetry must never break the data path.
+            self.logger().debug(
+                f"[sbe_queue] log failed: {type(e).__name__}: {e}"
+            )
 
     def _handle_subscription_ack(self, data: Dict[str, Any]) -> None:
         """Acknowledge a JSON subscribe/unsubscribe response.

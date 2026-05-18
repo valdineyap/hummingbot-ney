@@ -463,6 +463,83 @@ class TestPnlSafetyGates(_BaseControllerTest):
         # Hourly burn helper should have purged everything.
         self.assertEqual(self.controller._hourly_burn(now), Decimal("0"))
 
+    async def test_minute_burn_trips_killed(self):
+        await self._warm()
+        self.market_data_provider.time.return_value = 1700000050.0
+        now = self.market_data_provider.time.return_value
+        # Default max_minute_burn_quote = 15 BRL.
+        # Inject 2 losses totalling -20 BRL within the last 60s → trips.
+        from collections import deque
+        self.controller._hourly_pnl_history = deque([
+            (now - 30, Decimal("-12")),
+            (now - 5, Decimal("-8")),
+        ])
+        await self.controller.update_processed_data()
+        self.assertEqual(self.controller.processed_data["regime"], Regime.KILLED)
+        self.assertTrue(
+            self.controller.processed_data["cancel_reason"].startswith(
+                "MINUTE_BURN_"
+            )
+        )
+
+    async def test_minute_burn_ignores_older_than_60s(self):
+        await self._warm()
+        self.market_data_provider.time.return_value = 1700000050.0
+        now = self.market_data_provider.time.return_value
+        # All losses are 90-150s old → outside the 1min window → does NOT
+        # trip MINUTE_BURN (but their sum is -40 ≤ -hourly limit? No, hourly
+        # default 50, sum is -40, also safe).
+        from collections import deque
+        self.controller._hourly_pnl_history = deque([
+            (now - 150, Decimal("-15")),
+            (now - 120, Decimal("-15")),
+            (now - 90, Decimal("-10")),
+        ])
+        await self.controller.update_processed_data()
+        self.assertNotEqual(
+            self.controller.processed_data["regime"], Regime.KILLED
+        )
+        # Helper returns 0 — nothing in the last 60s.
+        self.assertEqual(self.controller._minute_burn(now), Decimal("0"))
+
+    async def test_minute_burn_does_not_trim_hourly_deque(self):
+        """`_minute_burn` must not pop entries — `_hourly_burn` owns trimming."""
+        await self._warm()
+        now = 1700000050.0
+        from collections import deque
+        entries = [
+            (now - 30, Decimal("-5")),
+            (now - 90, Decimal("-5")),
+            (now - 1800, Decimal("-5")),
+        ]
+        self.controller._hourly_pnl_history = deque(entries)
+        self.controller._minute_burn(now)
+        # Length unchanged after _minute_burn — all 3 entries preserved.
+        self.assertEqual(len(self.controller._hourly_pnl_history), 3)
+
+    async def test_safety_snapshot_written_to_state_json(self):
+        """Periodic snapshot must include all PnL safety fields + limits."""
+        import json
+        await self._warm()
+        # Force snapshot cadence to fire on next tick.
+        self.controller._last_safety_snapshot = 0.0
+        self.market_data_provider.time.return_value = 1700000050.0
+        await self.controller.update_processed_data()
+        # Read state.json the controller's TradeLedger wrote.
+        state_path = self.controller._trade_ledger._state_path
+        with open(state_path) as f:
+            state = json.load(f)
+        self.assertIn("safety", state)
+        safety = state["safety"]
+        for key in ("regime", "kill_reason", "daily_realized_pnl",
+                    "session_drawdown", "hourly_burn", "minute_burn",
+                    "consecutive_losing_fills", "limits"):
+            self.assertIn(key, safety)
+        for key in ("max_daily_loss_quote", "max_minute_burn_quote",
+                    "max_hourly_burn_quote", "max_session_drawdown_quote",
+                    "max_consecutive_losing_fills"):
+            self.assertIn(key, safety["limits"])
+
     async def test_unrealized_loss_trips_killed(self):
         await self._warm()
         # max_unrealized_loss_quote default = 100 BRL.
@@ -506,6 +583,87 @@ class TestPnlSafetyGates(_BaseControllerTest):
         self.market_data_provider.time.return_value = 1700000060.0
         await self.controller.update_processed_data()
         self.assertEqual(self.controller.processed_data["regime"], Regime.KILLED)
+
+
+# ===================================================================== #
+# Group C2 — Max-lot guard (refuse oversized orders)                    #
+# ===================================================================== #
+class TestMaxLotGuard(_BaseControllerTest):
+    """Verifies ``_check_max_lot`` and its integration at all order
+    placement chokepoints (audit auto_rebalance, XEMM spawn, arb spawn).
+
+    The guard refuses orders whose base amount exceeds
+    ``order_amount × max_order_amount_multiplier`` and logs CRITICAL.
+    """
+
+    def _limit(self) -> Decimal:
+        return (self.controller.config.order_amount
+                * self.controller.config.max_order_amount_multiplier)
+
+    def test_check_max_lot_allows_at_limit(self):
+        # Exactly at limit must pass.
+        self.assertTrue(
+            self.controller._check_max_lot(self._limit(), source="t")
+        )
+        self.assertEqual(self.controller._oversized_blocks_total, 0)
+
+    def test_check_max_lot_blocks_above_limit(self):
+        # 1 sat over the limit → blocked.
+        self.assertFalse(
+            self.controller._check_max_lot(
+                self._limit() + Decimal("0.00000001"),
+                source="audit:BTC@binance",
+            )
+        )
+        self.assertEqual(self.controller._oversized_blocks_total, 1)
+        self.assertEqual(
+            self.controller._last_oversized_block_source,
+            "audit:BTC@binance",
+        )
+
+    def test_check_max_lot_counter_increments_on_each_block(self):
+        for _ in range(3):
+            self.controller._check_max_lot(Decimal("1"), source="t")
+        self.assertEqual(self.controller._oversized_blocks_total, 3)
+
+    def test_check_max_lot_normal_xemm_amount_passes(self):
+        # The bot's normal order size is well under the cap.
+        self.assertTrue(
+            self.controller._check_max_lot(
+                self.controller.config.order_amount, source="xemm_spawn:BUY"
+            )
+        )
+
+    def test_check_max_lot_multiplier_one_blocks_anything_above_order_amount(self):
+        # Tight setting: multiplier=1.0 means the cap == order_amount.
+        self.controller.config.max_order_amount_multiplier = Decimal("1.0")
+        self.assertTrue(
+            self.controller._check_max_lot(
+                self.controller.config.order_amount, source="t"
+            )
+        )
+        self.assertFalse(
+            self.controller._check_max_lot(
+                self.controller.config.order_amount + Decimal("0.00001"),
+                source="t",
+            )
+        )
+
+    def test_make_create_action_returns_none_if_order_amount_above_cap(self):
+        """Defensive: if order_amount itself was mutated above the cap,
+        the spawn path refuses to emit a CreateExecutorAction."""
+        # Force a violation by tightening the multiplier below 1.0.
+        self.controller.config.max_order_amount_multiplier = Decimal("0.5")
+        action = self.controller._make_create_action(
+            TradeType.BUY, Decimal("0.0003"), now=1700000000.0,
+        )
+        self.assertIsNone(action)
+        self.assertEqual(self.controller._oversized_blocks_total, 1)
+        self.assertTrue(
+            self.controller._last_oversized_block_source.startswith(
+                "xemm_spawn:"
+            )
+        )
 
 
 # ===================================================================== #
@@ -1499,6 +1657,112 @@ class TestLosingStreakNoiseFloor(_ArbBaseTest):
         self.assertEqual(self.controller._consecutive_losing_fills, 1)
 
 
+class TestLosingStreakTimeDecay(_ArbBaseTest):
+    """Regression pin (2026-05-17 23:54 LOSING_STREAK_5 shutdown):
+    losses separated by a long idle period must not accumulate into the
+    streak. After `losing_streak_decay_sec` of idle, the next losing
+    fill resets the counter to 0 BEFORE counting itself.
+    """
+
+    def _make_xemm_closed_executor(self, executor_id: str, net_pnl: Decimal):
+        ex = MagicMock()
+        ex.id = executor_id
+        ex.is_done = True
+        ex.close_type = None
+        ex.net_pnl_quote = net_pnl
+        ex.cum_fees_quote = Decimal("0.024")
+        ex.filled_amount_quote = Decimal("80")
+        ex.custom_info = {}
+        ex.config = MagicMock()
+        ex.config.type = "xemm_executor"
+        ex.config.id = executor_id
+        ex.timestamp = self.market_data_provider.time.return_value - 5.0
+        return ex
+
+    async def _drive_with_executor(self, ex):
+        self.controller.executors_info = [ex]
+        self.controller._last_fingerprint = None
+        self.controller._last_full_update = 0.0
+        from datetime import datetime as _dt
+        now_ts = self.market_data_provider.time.return_value
+        self.controller._arb_last_reset_day = _dt.utcfromtimestamp(now_ts).strftime("%Y-%m-%d")
+        self.controller._daily_pnl_last_reset_day = self.controller._arb_last_reset_day
+        await self.controller.update_processed_data()
+
+    async def test_streak_decays_after_idle_window(self):
+        """Streak was 4; idle gap > decay; new loss → counter=1, not 5."""
+        self.controller.config.min_loss_per_fill_quote_to_count = Decimal("0.10")
+        self.controller.config.losing_streak_decay_sec = 100.0
+        self.controller._consecutive_losing_fills = 4
+        # Last losing fill timestamp is far in the past (1.0 epoch).
+        # time.time() at test runtime is ~10^9, so gap is enormous.
+        self.controller._last_losing_fill_time = 1.0
+        ex = self._make_xemm_closed_executor("X-DECAY", Decimal("-0.50"))
+        await self._drive_with_executor(ex)
+        # 4 → decayed to 0 → incremented to 1.
+        self.assertEqual(self.controller._consecutive_losing_fills, 1)
+        # _last_losing_fill_time should be updated to ~now.
+        import time
+        self.assertAlmostEqual(
+            self.controller._last_losing_fill_time, time.time(), delta=5.0,
+        )
+
+    async def test_streak_does_not_decay_within_window(self):
+        """Fresh consecutive losses (gap < decay) still accumulate."""
+        import time
+        self.controller.config.min_loss_per_fill_quote_to_count = Decimal("0.10")
+        self.controller.config.losing_streak_decay_sec = 3600.0  # 1h
+        self.controller._consecutive_losing_fills = 4
+        # Last loss 10s ago → well within decay window.
+        self.controller._last_losing_fill_time = time.time() - 10.0
+        ex = self._make_xemm_closed_executor("X-NODECAY", Decimal("-0.50"))
+        await self._drive_with_executor(ex)
+        # No decay; counter advances to 5.
+        self.assertEqual(self.controller._consecutive_losing_fills, 5)
+
+    async def test_first_loss_sets_last_losing_fill_time(self):
+        """When streak starts from 0, `_last_losing_fill_time` is stamped
+        so future decay checks have an anchor."""
+        import time
+        self.controller.config.min_loss_per_fill_quote_to_count = Decimal("0.10")
+        self.controller._consecutive_losing_fills = 0
+        self.controller._last_losing_fill_time = 0.0
+        ex = self._make_xemm_closed_executor("X-FIRST", Decimal("-0.50"))
+        await self._drive_with_executor(ex)
+        self.assertEqual(self.controller._consecutive_losing_fills, 1)
+        self.assertGreater(self.controller._last_losing_fill_time, 0.0)
+        self.assertAlmostEqual(
+            self.controller._last_losing_fill_time, time.time(), delta=5.0,
+        )
+
+    async def test_decay_does_not_apply_when_streak_already_zero(self):
+        """If streak is already 0, decay path is a no-op; loss starts a
+        fresh streak (counter = 1). Sanity check: the decay log line
+        should not fire."""
+        self.controller.config.min_loss_per_fill_quote_to_count = Decimal("0.10")
+        self.controller.config.losing_streak_decay_sec = 100.0
+        self.controller._consecutive_losing_fills = 0
+        self.controller._last_losing_fill_time = 1.0  # ancient
+        ex = self._make_xemm_closed_executor("X-NOOP", Decimal("-0.50"))
+        await self._drive_with_executor(ex)
+        # 0 → 1 (no decay log because streak was 0).
+        self.assertEqual(self.controller._consecutive_losing_fills, 1)
+
+    async def test_decay_prevents_2026_05_17_regression(self):
+        """Reproduces the prod incident: 4 old losses + 1 fresh = should
+        be 1 (not 5). Without decay this would trip KILL."""
+        import time
+        self.controller.config.min_loss_per_fill_quote_to_count = Decimal("0.10")
+        self.controller.config.losing_streak_decay_sec = 3600.0
+        # 4 losses accumulated more than 1h ago.
+        self.controller._consecutive_losing_fills = 4
+        self.controller._last_losing_fill_time = time.time() - 9 * 3600  # 9h ago
+        ex = self._make_xemm_closed_executor("X-PROD", Decimal("-2.02"))
+        await self._drive_with_executor(ex)
+        # Old streak expired; fresh loss → streak = 1.
+        self.assertEqual(self.controller._consecutive_losing_fills, 1)
+
+
 # ===================================================================== #
 # Group H — Inventory audit & boot-paused mode                          #
 # ===================================================================== #
@@ -1895,8 +2159,10 @@ class TestAuditPassiveModeWhenKilled(_AuditBaseTest):
     The auto_terminate gate reads ``_last_audit_results["_drift_active"]``.
     Before this fix, the audit early-returned the moment ``_kill_reason``
     was set — which froze ``_drift_active`` at its last pre-kill value.
-    HEDGE_FAILURES_3 trip → audit stopped → a later natural fill resolved
-    the drift but the flag stayed True forever → auto_terminate deadlock.
+    HEDGE_FAILURES_3 trip (since-removed gate) → audit stopped → a later
+    natural fill resolved the drift but the flag stayed True forever →
+    auto_terminate deadlock. The fix below still applies for current KILL
+    reasons (DAILY_LOSS_LIMIT, UNREALIZED_LOSS, etc.).
 
     Fixed by switching to passive mode in killed state: still refresh
     ``_last_audit_results`` so the gate sees current reality, but skip
@@ -1907,7 +2173,7 @@ class TestAuditPassiveModeWhenKilled(_AuditBaseTest):
     async def test_killed_audit_still_updates_drift_active_on_refresh(self):
         """Drift cleared after kill → audit must flip _drift_active to False."""
         # Setup: bot is KILLED with drift previously detected.
-        self.controller._kill_reason = "HEDGE_FAILURES_3"
+        self.controller._kill_reason = "DAILY_LOSS_LIMIT"  # any KILL reason works
         self.controller._last_audit_results = {"_drift_active": True}
         # Balances now perfectly match target (natural fill resolved drift).
         self._mock_total_balance(
@@ -1921,7 +2187,7 @@ class TestAuditPassiveModeWhenKilled(_AuditBaseTest):
 
     async def test_killed_audit_still_flags_drift_when_present(self):
         """If drift persists post-kill, gate stays BLOCKED."""
-        self.controller._kill_reason = "HEDGE_FAILURES_3"
+        self.controller._kill_reason = "DAILY_LOSS_LIMIT"  # any KILL reason works
         self.controller._last_audit_results = {"_drift_active": False}
         # Drift large enough to exceed tolerance (target 0.002, max_drift_quote=3
         # BRL with mid≈300050 → tolerance ~1e-5 BTC; we set delta ~0.0002).
@@ -1948,7 +2214,7 @@ class TestAuditPassiveModeWhenKilled(_AuditBaseTest):
         (drift_consecutive increment, kill_reason re-trip, CRITICAL spam).
         """
         self.config.inventory_audit.on_drift_action = "auto_rebalance"
-        self.controller._kill_reason = "HEDGE_FAILURES_3"
+        self.controller._kill_reason = "DAILY_LOSS_LIMIT"  # any KILL reason works
         self.controller._last_audit_results = {"_drift_active": True}
         self._mock_total_balance(Decimal("0.001"), Decimal("0.0008"))
         self.controller._has_inflight_activity = MagicMock(return_value=False)
@@ -1963,7 +2229,7 @@ class TestAuditPassiveModeWhenKilled(_AuditBaseTest):
         """In killed mode the cooldown still applies — we don't want to
         spam rebalance orders if a previous one is still in flight."""
         self.config.inventory_audit.on_drift_action = "auto_rebalance"
-        self.controller._kill_reason = "HEDGE_FAILURES_3"
+        self.controller._kill_reason = "DAILY_LOSS_LIMIT"  # any KILL reason works
         self.controller._last_audit_results = {"_drift_active": True}
         self._mock_total_balance(Decimal("0.001"), Decimal("0.0008"))
         self.controller._has_inflight_activity = MagicMock(return_value=False)
@@ -1981,16 +2247,16 @@ class TestAuditPassiveModeWhenKilled(_AuditBaseTest):
         """Existing kill_reason preserved — we don't overwrite it with
         a DRIFT_STUCK or INVENTORY_DRIFT during shutdown."""
         self.config.inventory_audit.on_drift_action = "pause"
-        self.controller._kill_reason = "HEDGE_FAILURES_3"
+        self.controller._kill_reason = "DAILY_LOSS_LIMIT"  # any KILL reason works
         self._mock_total_balance(Decimal("0.001"), Decimal("0.0008"))
         self.controller._has_inflight_activity = MagicMock(return_value=False)
         await self.controller._run_inventory_audit(now=1700000000.0, source="periodic")
-        self.assertEqual(self.controller._kill_reason, "HEDGE_FAILURES_3")
+        self.assertEqual(self.controller._kill_reason, "DAILY_LOSS_LIMIT")
 
     async def test_killed_audit_does_not_increment_drift_consecutive(self):
         """Drift counter freezes at kill time — we're not actively
         managing the asset anymore."""
-        self.controller._kill_reason = "HEDGE_FAILURES_3"
+        self.controller._kill_reason = "DAILY_LOSS_LIMIT"  # any KILL reason works
         self.controller._drift_consecutive_audits = {"BTC": 3}
         self._mock_total_balance(Decimal("0.001"), Decimal("0.0008"))
         self.controller._has_inflight_activity = MagicMock(return_value=False)
@@ -2038,6 +2304,25 @@ class TestAuditBarrier(_AuditBaseTest):
         self.assertEqual(self.controller._barrier_state, "IDLE")
         # Rebalance queued for the confirmed drift.
         self.assertIn("BTC", self.controller._pending_rebalances)
+
+    async def test_drift_during_arb_inflight_defers_barrier(self):
+        """Regression (2026-05-16 11:35:59Z): when an arb executor has
+        leg-1 filled and leg-2 still pending, the inventory IS skewed
+        BY DESIGN (the arb's own unwind path will reconcile it). Without
+        this gate, the barrier fires, kills the live XEMM executors,
+        and queues a rebalance MARKET that races the arb's own unwind on
+        the same venue — observed loss ~150 BRL/BTC per double-buy."""
+        self.config.inventory_audit.on_drift_action = "auto_rebalance"
+        self._mock_total_balance(Decimal("0.0012"), Decimal("0.001"))  # drift visible
+        # Mock inflight activity True (e.g. arb leg-1 just filled)
+        self.controller._has_inflight_activity = MagicMock(return_value=True)
+        await self.controller._run_inventory_audit(now=1700000000.0, source="periodic")
+        # Barrier NOT entered (still IDLE), no rebalance queued.
+        self.assertEqual(self.controller._barrier_state, "IDLE")
+        self.assertNotIn("BTC", self.controller._pending_rebalances)
+        # Drift flag is still recorded for observability.
+        self.assertTrue(self.controller._last_audit_results["_drift_active"])
+        self.assertTrue(self.controller._last_audit_results["_inflight_active"])
 
     async def test_idle_with_drift_but_active_executor_stays_cancelling(self):
         """When an active executor exists, barrier enters CANCELLING and waits."""
@@ -2797,4 +3082,263 @@ class TestOrphanHedgeIncidentRegression(_OrphanHedgeBaseTest):
         taker.buy.assert_called_once()
         self.assertEqual(taker.buy.call_args.args[1], Decimal("0.0002"))
         self.assertEqual(taker.buy.call_args.args[2], OrderType.MARKET)
+
+
+class TestOrphanHedgeSelfDispatchedRegistry(_OrphanHedgeBaseTest):
+    """Regression (2026-05-16 11:36:01Z and 10:32:48Z).
+
+    Without this guard, the controller's orphan_hedge fired on EVERY
+    maker fill that no live XEMM executor owned — including:
+      * unwind MARKET fills from ``LeadLagArbitrageExecutor._unwind_position``
+      * rebalance MARKET fills from ``_execute_pending_rebalances``
+
+    Both are by design one-sided corrections. Hedging them on the taker
+    re-opens the exposure and creates a drift -> rebalance -> orphan_hedge
+    death loop (observed 10:32-10:34Z, 13 consecutive audit cycles).
+    """
+
+    def test_register_self_dispatched_marks_id_for_skip(self):
+        """A registered id is recognised by ``_maybe_dispatch_orphan_hedge``
+        and the dispatch is skipped."""
+        self._install_executors_info([])
+        taker = self._mock_taker_connector()
+        self.controller.register_self_dispatched_market_id("UNWIND-XYZ-1")
+        event = self._fill_event(
+            "UNWIND-XYZ-1", side=TradeType.BUY, amount=Decimal("0.0002"),
+        )
+        self.controller._maybe_dispatch_orphan_hedge(event, "bitpreco")
+        taker.buy.assert_not_called()
+        taker.sell.assert_not_called()
+        # Entry consumed on use to avoid suppressing a future un-related
+        # fill that happens to reuse this id.
+        self.assertNotIn(
+            "UNWIND-XYZ-1", self.controller._self_dispatched_market_ids,
+        )
+
+    def test_register_empty_or_none_is_noop(self):
+        """``register_self_dispatched_market_id(None)`` and ``("")`` must
+        not pollute the registry."""
+        self.controller.register_self_dispatched_market_id(None)
+        self.controller.register_self_dispatched_market_id("")
+        self.assertEqual(self.controller._self_dispatched_market_ids, {})
+
+    def test_stale_entries_pruned_on_check(self):
+        """Entries older than ``_self_dispatched_ttl_sec`` are pruned the
+        next time orphan_hedge runs, so the dict stays bounded."""
+        # Force a stale timestamp in the past
+        self.controller._self_dispatched_market_ids["OLD-1"] = 0.0
+        self.controller._self_dispatched_ttl_sec = 60.0
+        # Time provider returns "now" far past the TTL
+        self.controller.market_data_provider.time = MagicMock(return_value=1_000_000.0)
+        self._install_executors_info([])
+        taker = self._mock_taker_connector()
+        event = self._fill_event(
+            "FRESH-99", side=TradeType.BUY, amount=Decimal("0.0002"),
+        )
+        # The fresh id is NOT registered; this fill should still dispatch
+        self.controller._maybe_dispatch_orphan_hedge(event, "bitpreco")
+        taker.sell.assert_called_once()
+        # And the stale entry was cleared during pruning
+        self.assertNotIn("OLD-1", self.controller._self_dispatched_market_ids)
+
+    def test_registry_is_idempotent(self):
+        """Registering the same id twice is allowed and only suppresses
+        one fill (consumption pop)."""
+        self._install_executors_info([])
+        taker = self._mock_taker_connector()
+        self.controller.register_self_dispatched_market_id("DUP-1")
+        self.controller.register_self_dispatched_market_id("DUP-1")
+        event = self._fill_event(
+            "DUP-1", side=TradeType.BUY, amount=Decimal("0.0002"),
+        )
+        self.controller._maybe_dispatch_orphan_hedge(event, "bitpreco")
+        taker.sell.assert_not_called()
+        # After one consumption the entry is gone
+        self.assertNotIn("DUP-1", self.controller._self_dispatched_market_ids)
+
+
+class TestMemoryMetricsLogging(_BaseControllerTest):
+    """Observability shim added 2026-05-16 after the 12:22Z incident.
+
+    During the incident the bot's RSS grew ~1.8 GB in 10 min before the
+    kernel exhausted memory and stalled the event loop for 16.7 s. We
+    had no in-process memory log, so we had to reconstruct the curve
+    from ``sar`` after the host reboot. ``_log_memory_metrics`` writes
+    an INFO line every minute so the next leak is visible from grep.
+    """
+
+    def test_logs_one_line_per_interval(self):
+        """Two calls within the interval -> only one log line."""
+        self.controller._mem_metrics_interval_sec = 60.0
+        self.controller._last_mem_metrics_time = 0.0
+        with self.assertLogs(self.controller.logger().name, level="INFO") as cm:
+            self.controller._log_memory_metrics(now=100.0)
+            self.controller._log_memory_metrics(now=120.0)  # within interval
+        mem_lines = [r for r in cm.output if "[mem]" in r]
+        self.assertEqual(len(mem_lines), 1)
+        # Second call should still have updated the gate
+        self.assertEqual(self.controller._last_mem_metrics_time, 100.0)
+
+    def test_logs_again_after_interval_elapsed(self):
+        self.controller._mem_metrics_interval_sec = 60.0
+        self.controller._last_mem_metrics_time = 0.0
+        with self.assertLogs(self.controller.logger().name, level="INFO") as cm:
+            self.controller._log_memory_metrics(now=100.0)
+            self.controller._log_memory_metrics(now=200.0)  # past interval
+        mem_lines = [r for r in cm.output if "[mem]" in r]
+        self.assertEqual(len(mem_lines), 2)
+
+    def test_log_line_contains_required_fields(self):
+        """The line must be greppable for the keys we care about.
+
+        Includes the leak-hunt extension fields (2026-05-16 v3 plan):
+        pss/hwm/swap/fd/threads/asyncio_tasks/oldest_task_age/top_coro/
+        gc_objects/gc_collections/tm_cur/tm_peak.
+        """
+        self.controller._last_mem_metrics_time = 0.0
+        with self.assertLogs(self.controller.logger().name, level="INFO") as cm:
+            self.controller._log_memory_metrics(now=999.0)
+        line = next((r for r in cm.output if "[mem]" in r), "")
+        for token in (
+            # v1 fields (original instrumentation)
+            "rss=", "vms=", "uss=", "gc=",
+            "executors=", "pending_rebalances=",
+            "self_dispatched=", "redis_us_sm=", "redis_us_orphans=",
+            # v3 extension fields (leak-hunt observability)
+            "pss=", "hwm=", "swap=", "fd=", "threads=",
+            "asyncio_tasks=", "oldest_task_age=", "top_coro=",
+            "gc_objects=", "gc_collections=",
+            "tm_cur=", "tm_peak=",
+        ):
+            self.assertIn(token, line, f"missing {token!r} in log line: {line}")
+
+    def test_metric_failure_does_not_raise(self):
+        """A broken psutil call (or any unexpected error) must NOT
+        crash the tick. The shim warns and moves on; the time gate is
+        still advanced so we don't retry tightly."""
+        # Force the lazy psutil path to raise
+        self.controller._mem_psutil_proc = MagicMock()
+        self.controller._mem_psutil_proc.memory_info.side_effect = RuntimeError("nope")
+        self.controller._last_mem_metrics_time = 0.0
+        # Must not raise. Use now > interval so the gate lets us through.
+        now = self.controller._mem_metrics_interval_sec + 1.0
+        self.controller._log_memory_metrics(now=now)
+        # Time gate advanced so the next tick won't re-attempt within the interval
+        self.assertEqual(self.controller._last_mem_metrics_time, now)
+
+    # ---- v3 extension tests (2026-05-16 leak-hunt instrumentation) ----
+
+    def test_gc_objects_gate_skips_within_interval(self):
+        """``gc.get_objects()`` is expensive on a large heap. Within the
+        5-min interval AND with no RSS jump, the line should record
+        ``gc_objects=-1`` (sentinel = skipped this tick)."""
+        self.controller._mem_metrics_interval_sec = 60.0
+        self.controller._gc_objects_interval_sec = 300.0
+        self.controller._last_mem_metrics_time = 0.0
+        self.controller._last_gc_objects_time = 100.0
+        self.controller._mem_last_rss_for_gc = 10_000.0  # so no jump triggers
+        with self.assertLogs(self.controller.logger().name, level="INFO") as cm:
+            self.controller._log_memory_metrics(now=150.0)  # within 300s gate
+        line = next((r for r in cm.output if "[mem]" in r), "")
+        self.assertIn("gc_objects=-1", line)
+
+    def test_gc_objects_runs_after_interval(self):
+        """After the 5-min gate elapses, the call should fire and produce
+        a real positive count."""
+        self.controller._mem_metrics_interval_sec = 60.0
+        self.controller._gc_objects_interval_sec = 300.0
+        self.controller._last_mem_metrics_time = 0.0
+        self.controller._last_gc_objects_time = 0.0  # never sampled
+        self.controller._mem_last_rss_for_gc = 0.0
+        with self.assertLogs(self.controller.logger().name, level="INFO") as cm:
+            self.controller._log_memory_metrics(now=400.0)
+        line = next((r for r in cm.output if "[mem]" in r), "")
+        # Real gc.get_objects() always returns a positive integer for a
+        # live Python process.
+        self.assertNotIn("gc_objects=-1", line)
+        self.assertIn("gc_objects=", line)
+        # Gate anchor was updated.
+        self.assertEqual(self.controller._last_gc_objects_time, 400.0)
+
+    def test_oldest_task_age_tracks_first_seen_registry(self):
+        """The controller doesn't get task creation times from asyncio;
+        it remembers the first time each task id was seen and uses that
+        as the age anchor. This test seeds the registry with an old id
+        and checks the value appears."""
+        # Seed registry with a synthetic task that we "first saw" 30s ago.
+        self.controller._task_first_seen = {12345: 970.0}
+        self.controller._last_mem_metrics_time = 0.0
+
+        # Replace asyncio.all_tasks with something that returns a fake
+        # task whose id matches the registry entry.
+        fake_task = MagicMock()
+        fake_task.get_coro.return_value.__qualname__ = "fake_coro"
+        # Force id(fake_task) to be 12345 by monkey-patching the asyncio
+        # module's all_tasks. The actual id of the mock won't be 12345,
+        # so we patch all_tasks to return [fake_task] AND patch id() at
+        # the call site via a stub class.
+
+        class _IdStableTask:
+            def get_coro(self_inner):
+                c = MagicMock()
+                c.__qualname__ = "fake_coro"
+                return c
+        stable = _IdStableTask()
+        # Seed the registry with the actual id of the stable object so the
+        # "first seen" lookup will hit.
+        self.controller._task_first_seen = {id(stable): 970.0}
+
+        with patch("asyncio.all_tasks", return_value=[stable]):
+            with self.assertLogs(self.controller.logger().name, level="INFO") as cm:
+                self.controller._log_memory_metrics(now=1000.0)
+        line = next((r for r in cm.output if "[mem]" in r), "")
+        # oldest_task_age = 1000 - 970 = 30s
+        self.assertIn("oldest_task_age=30s", line)
+        self.assertIn("top_coro=fake_coro:1", line)
+
+    def test_smaps_rollup_unavailable_does_not_break_line(self):
+        """On non-Linux hosts (or in restricted environments) the
+        ``/proc/self/smaps_rollup`` read fails. The line must still emit
+        with pss=0.0 (and the rest of the fields)."""
+        self.controller._last_mem_metrics_time = 0.0
+        # Patch built-in open only for the smaps path
+        real_open = open
+
+        def _fake_open(path, *a, **kw):
+            if "smaps_rollup" in str(path) or "/proc/self/status" in str(path):
+                raise FileNotFoundError(path)
+            return real_open(path, *a, **kw)
+
+        with patch("builtins.open", side_effect=_fake_open):
+            with self.assertLogs(self.controller.logger().name, level="INFO") as cm:
+                self.controller._log_memory_metrics(now=999.0)
+        line = next((r for r in cm.output if "[mem]" in r), "")
+        self.assertIn("pss=0.0MB", line)
+        self.assertIn("hwm=0.0MB", line)
+        self.assertIn("swap=0kB", line)
+
+    def test_tracemalloc_handles_already_tracing(self):
+        """When ``PYTHONTRACEMALLOC=N`` is exported at startup, tracing
+        is already active before ``_maybe_log_tracemalloc`` runs. The
+        method must NOT call ``tracemalloc.start()`` again (that raises);
+        instead it takes a baseline snapshot and waits for the next
+        interval to diff."""
+        self.controller._tracemalloc_enabled = True
+        self.controller._tracemalloc_started = False
+        self.controller._tracemalloc_prev_snapshot = None
+        self.controller._last_tracemalloc_time = 0.0
+        self.controller._tracemalloc_interval_sec = 1.0
+
+        import tracemalloc as real_tm
+        with patch.object(real_tm, "is_tracing", return_value=True), \
+             patch.object(real_tm, "start") as start_mock, \
+             patch.object(real_tm, "take_snapshot", return_value=MagicMock()) as snap_mock:
+            self.controller._maybe_log_tracemalloc(now=100.0)
+        # Must NOT call start() — that would raise on an already-tracing process.
+        start_mock.assert_not_called()
+        # Must take a baseline snapshot.
+        snap_mock.assert_called_once()
+        self.assertTrue(self.controller._tracemalloc_started)
+        self.assertIsNotNone(self.controller._tracemalloc_prev_snapshot)
+
 

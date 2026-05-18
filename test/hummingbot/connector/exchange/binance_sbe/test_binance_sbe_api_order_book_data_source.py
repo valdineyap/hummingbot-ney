@@ -413,5 +413,87 @@ class InheritanceSmokeTest(unittest.TestCase):
         )
 
 
+# ---------------------------------------------------------------------------
+# Queue-backlog telemetry (2026-05-16 leak-hunt instrumentation)
+# ---------------------------------------------------------------------------
+
+
+class QueueBacklogLoggingTest(IsolatedAsyncioWrapperTestCase):
+    """``_message_queue`` is unbounded (``defaultdict(asyncio.Queue)``).
+    During the 2026-05-16 12:22Z OOM incident, this was the prime
+    suspect: if the consumer stalls, the queue grows without limit and
+    pulls RSS up with it. ``_maybe_log_queue_sizes`` emits a periodic
+    ``[sbe_queue]`` line so the runtime backlog is visible alongside the
+    controller's ``[mem]`` curve.
+    """
+
+    async def asyncSetUp(self):
+        await super().asyncSetUp()
+        self.ds = _make_data_source()
+
+    def _seed_queues(self, sizes):
+        """Pre-fill ``_message_queue`` so qsize() returns the given values."""
+        for ch, n in sizes.items():
+            q = asyncio.Queue()
+            for _ in range(n):
+                q.put_nowait(object())
+            self.ds._message_queue[ch] = q
+
+    def test_logs_after_interval_elapsed(self):
+        # First call sets _last_queue_log_time to ~now; we then force a
+        # past timestamp so the next call passes the gate.
+        self._seed_queues({"trade": 3, "diff": 5})
+        self.ds._last_queue_log_time = 0.0  # very old → gate opens
+        with self.assertLogs(self.ds.logger().name, level="INFO") as cm:
+            self.ds._maybe_log_queue_sizes()
+        lines = [r for r in cm.output if "[sbe_queue]" in r]
+        self.assertEqual(len(lines), 1)
+        self.assertIn("total=8", lines[0])
+        self.assertIn("max=5", lines[0])
+        self.assertIn("n_channels=2", lines[0])
+
+    def test_does_not_log_within_interval(self):
+        import time as _time
+        self._seed_queues({"trade": 1})
+        # Just logged — well within the 60s interval.
+        self.ds._last_queue_log_time = _time.monotonic()
+        with self.assertLogs(self.ds.logger().name, level="INFO") as cm:
+            self.ds._maybe_log_queue_sizes()
+            # Make sure assertLogs has SOMETHING to capture so it doesn't raise
+            self.ds.logger().info("[sentinel] ok")
+        sbe_lines = [r for r in cm.output if "[sbe_queue]" in r]
+        self.assertEqual(sbe_lines, [])
+
+    def test_log_line_contains_top3_largest_channels(self):
+        self._seed_queues({"a": 10, "b": 20, "c": 30, "d": 5})
+        self.ds._last_queue_log_time = 0.0
+        with self.assertLogs(self.ds.logger().name, level="INFO") as cm:
+            self.ds._maybe_log_queue_sizes()
+        line = next((r for r in cm.output if "[sbe_queue]" in r), "")
+        # top= must list the 3 largest channels in size order; d (5) is excluded.
+        self.assertIn("top=c:30,b:20,a:10", line)
+        # The smallest channel is NOT in the top list.
+        self.assertNotIn("d:5", line)
+
+    def test_empty_queues_silently_skipped(self):
+        # No channels at all -> nothing to report; should not log a noisy line.
+        self.ds._last_queue_log_time = 0.0
+        with self.assertLogs(self.ds.logger().name, level="INFO") as cm:
+            self.ds._maybe_log_queue_sizes()
+            self.ds.logger().info("[sentinel] ok")
+        sbe_lines = [r for r in cm.output if "[sbe_queue]" in r]
+        self.assertEqual(sbe_lines, [])
+
+    def test_telemetry_failure_does_not_break_data_path(self):
+        # If qsize() blows up on some custom Queue subclass, the log
+        # method must swallow the error (telemetry is best-effort).
+        bad_q = MagicMock()
+        bad_q.qsize.side_effect = RuntimeError("boom")
+        self.ds._message_queue["broken"] = bad_q
+        self.ds._last_queue_log_time = 0.0
+        # Must not raise.
+        self.ds._maybe_log_queue_sizes()
+
+
 if __name__ == "__main__":
     unittest.main()
