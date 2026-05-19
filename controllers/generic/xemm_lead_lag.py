@@ -3334,8 +3334,18 @@ class XEMMLeadLagController(ControllerBase):
                 amount = deficit
 
             try:
+                # Passa o preço REST cacheado (não Decimal("0")) para evitar
+                # que `ExchangePyBase._create_order` chame `self.get_price()`
+                # — que exige o OrderBook subscrito (que NÃO temos, por
+                # design: fee_assets usam REST on-demand). Para MARKET, esse
+                # `price` é usado APENAS no check local de `min_notional`;
+                # `BinanceExchange._place_order` NÃO envia `price` no payload
+                # para MARKET (vide binance_exchange.py:189 — só LIMIT/
+                # LIMIT_MAKER incluem `price` no REST). Fonte do preço:
+                # `_fee_price_cache` populado por `_prime_fee_asset_prices`
+                # via `get_last_traded_prices` (TTL 60s).
                 order_id = connector.buy(
-                    pair, amount, OrderType.MARKET, Decimal("0"))
+                    pair, amount, OrderType.MARKET, price)
                 # Suprimir orphan-hedge — fee top-up é uma compra
                 # one-sided por design; não tem nada pra hedgear.
                 self.register_self_dispatched_market_id(order_id)

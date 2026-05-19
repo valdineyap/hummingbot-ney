@@ -3774,10 +3774,17 @@ class TestFeeAssetTopUpLoop(_BaseControllerTest):
         await self.controller._run_fee_asset_topup(now=1000.0)
         taker.buy.assert_called_once()
         args, _ = taker.buy.call_args
-        pair, amount, otype, _price = args
+        pair, amount, otype, price = args
         self.assertEqual(pair, "BNB-BRL")
         self.assertEqual(amount, Decimal("0.05"))
         self.assertEqual(otype, OrderType.MARKET)
+        # Regression: o price passado para buy() deve ser o preço REST
+        # cacheado (não Decimal("0")) — caso contrário, ExchangePyBase.
+        # _create_order chama get_price() que exige OrderBook subscrito
+        # (que NÃO temos por design em fee_assets). Para MARKET, esse
+        # price é usado APENAS no check local de min_notional; o
+        # Binance _place_order não envia price no payload REST.
+        self.assertEqual(price, Decimal("1200"))
         # Cooldown gravado
         self.assertEqual(self.controller._fee_topup_last_time["BNB"], 1000.0)
 
