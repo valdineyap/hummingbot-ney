@@ -63,9 +63,22 @@ class FeeAssetConfig(BaseModel):
       * Top-up **unidirecional** — só BUY quando saldo cair abaixo do target
         por margem >= `min_topup_quote`. Nunca SELL: o saldo só drena via
         consumo de taxas, não acumulamos por trading.
-      * **Sem subscrição de livro** — preço via REST on-demand com cache
-        (`price_cache_ttl_sec`). Evita banda/CPU permanente de WS pra moeda
-        raramente negociada.
+      * **Sem subscrição de livro (decisão arquitetural)** — preço via REST
+        on-demand com cache (`price_cache_ttl_sec`). Evita banda/CPU
+        permanente de WS pra moeda raramente negociada.
+
+        **NÃO adicionar fee_asset pairs ao `update_markets`** mesmo se
+        parecer que `connector.buy(pair, ...)` precisa. NÃO precisa:
+        o connector Binance carrega trading_rules + symbol_map de TODOS
+        os pares listados pelo exchange via `/exchangeInfo` no boot
+        (ver binance_exchange.py:533 e :253-261). REST direto resolve
+        ``get_last_traded_prices`` (lista plural — API pública herdada
+        de ``ExchangeBase`` em exchange_base.pyx:110) e ``buy`` (REST
+        `/api/v3/order`); fill chega via user_stream WS (por account,
+        não por symbol). Subscrição de order book é APENAS pra streaming
+        de ``depthUpdate`` — irrelevante pra compra MARKET pontual.
+        Decisão validada 2026-05-19 após reconfirmar os caminhos REST.
+
       * **Par implícito**: assume `taker_connector + ASSET-BRL` (convenção;
         não precisa configurar nada se o exchange listar nessa convenção).
       * **Valoração**: o saldo participa do PnL via a MESMA fórmula drift-
@@ -86,6 +99,39 @@ class FeeAssetConfig(BaseModel):
     # Cooldown entre top-ups do mesmo asset (segundos). Evita rajada se
     # uma compra parcial ou rejeitada deixou o saldo ainda abaixo do target.
     topup_cooldown_sec: float = 120.0
+
+
+class DashboardAPIConfig(BaseModel):
+    """Configuration for the bitbots-v1-compatible Dashboard API plugin.
+
+    Activated in ``on_start`` via ``maybe_start_dashboard(self,
+    adapter_cls=XEMMLeadLagDashboardAdapter)``. See
+    ``hummingbot/dashboard_api/`` for the reusable plugin layer.
+
+    **Invariante**: a API é estritamente passiva. Falha de bind, dashboard
+    desconectado, ou exceção no adapter NUNCA afeta o tick do controller.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: bool = Field(default=True, json_schema_extra={"is_updatable": False})
+    """Whether to start the HTTP server at all."""
+
+    host: str = Field(default="127.0.0.1")
+    """Bind address. Default localhost-only; use VPN/SSH-tunnel for remote
+    dashboards. Setting ``0.0.0.0`` requires ``auth_token`` to be set."""
+
+    port: int = Field(default=7117)
+    """TCP port. Avoid 7017 (collides with bitbots-js default)."""
+
+    required: bool = Field(default=False)
+    """If True, controller fails at boot when the port is busy. If False,
+    the controller continues without the API (logged at WARNING)."""
+
+    auth_token: Optional[str] = Field(default=None)
+    """If set, all endpoints except ``/health`` require ``Authorization:
+    Bearer <token>``. Note: the current bitbots-dashboard does not send
+    this header — only enable when you also add a proxy or interceptor
+    on the dashboard side."""
 
 
 class InventoryAuditConfig(BaseModel):
@@ -386,6 +432,11 @@ class XEMMLeadLagConfig(ControllerConfigBase):
     shadow_mode: bool = Field(default=True)
     log_dir: str = Field(default="logs/xemm_lead_lag")
     kill_switch_file: Optional[str] = Field(default=None)
+
+    # === Dashboard API (plugin, bitbots-v1-compat) ===
+    # Started in on_start via maybe_start_dashboard(...). Strictly passive:
+    # trading does not depend on the dashboard being connected.
+    dashboard_api: DashboardAPIConfig = Field(default_factory=DashboardAPIConfig)
 
     @field_validator("lead_windows_seconds", mode="before")
     @classmethod
@@ -878,6 +929,9 @@ class XEMMLeadLagController(ControllerBase):
         if "update_interval" not in kwargs:
             kwargs["update_interval"] = 0.2
         super().__init__(config, *args, **kwargs)
+        # Dashboard API plugin lifecycle handle. None when disabled or
+        # when port acquisition failed and required=False.
+        self._dashboard_runner = None
         self._signal = LeadLagSignalProvider(
             lead_windows_sec=config.lead_windows_seconds,
             ema_alpha_fx=config.ema_alpha_fx,
@@ -1076,6 +1130,10 @@ class XEMMLeadLagController(ControllerBase):
         # `_get_spot_price_rest` when expired (TTL from FeeAssetConfig).
         # Não usa WS — pares de fee asset são consultados raramente.
         self._fee_price_cache: Dict[str, Tuple[Decimal, float]] = {}
+        # Throttle de warning de [fee_price]. Sem isso, falha persistente de
+        # REST loga a cada tick (200ms) e enche o disco. Key = (pair, code)
+        # → last_ts. 60s entre warnings idênticos.
+        self._fee_price_last_warn_at: Dict[str, float] = {}
         # Último timestamp de top-up por asset (cooldown anti-rajada).
         self._fee_topup_last_time: Dict[str, float] = {}
         # Última vez que rodamos o loop de top-up (gate por check_interval_sec).
@@ -2191,11 +2249,14 @@ class XEMMLeadLagController(ControllerBase):
 
         Estratégia:
           1. Se cache válido (idade < ttl_sec) → retorna do cache.
-          2. Senão, pede ao connector ``get_last_traded_price`` (REST call
-             leve, ~50 bytes payload no Binance).
+          2. Senão, pede ao connector ``get_last_traded_prices`` (API
+             pública herdada de ``ExchangeBase`` em exchange_base.pyx:110;
+             recebe lista, retorna Dict[pair → float]; chama
+             ``_get_last_traded_price`` internamente, REST leve no Binance).
           3. Em caso de erro, retorna o último preço cacheado (mesmo stale)
              para não bloquear decisões; só retorna None se nunca houve
-             cache válido (boot).
+             cache válido (boot). Warnings throttled a 1× por 60 s para
+             não spammar logs em falhas persistentes.
         """
         now = time.monotonic()
         cached = self._fee_price_cache.get(pair)
@@ -2204,34 +2265,51 @@ class XEMMLeadLagController(ControllerBase):
             if (now - fetched_at) < ttl_sec:
                 return price
 
+        def _warn_throttled(key: str, msg: str, throttle_sec: float = 60.0) -> None:
+            last = self._fee_price_last_warn_at.get(key, 0.0)
+            if (now - last) >= throttle_sec:
+                self.logger().warning(msg)
+                self._fee_price_last_warn_at[key] = now
+
         try:
             conn = self.market_data_provider.get_connector(connector_name)
         except Exception as e:
-            self.logger().warning(
+            _warn_throttled(
+                f"conn_unavail:{connector_name}",
                 f"[fee_price] connector {connector_name} unavailable: "
-                f"{type(e).__name__}: {e}"
+                f"{type(e).__name__}: {e}",
             )
             return cached[0] if cached else None
 
-        get_last = getattr(conn, "get_last_traded_price", None)
-        if get_last is None:
-            self.logger().warning(
+        # API pública: ``get_last_traded_prices(List[str]) -> Dict[str, float]``
+        # (plural). Internamente chama ``_get_last_traded_price`` (singular,
+        # privado). NÃO existe ``get_last_traded_price`` público no
+        # connector — bug observado 2026-05-19 09:48Z (log spam contínuo
+        # do priming até essa correção).
+        get_prices = getattr(conn, "get_last_traded_prices", None)
+        if get_prices is None:
+            _warn_throttled(
+                f"no_method:{connector_name}",
                 f"[fee_price] connector {connector_name} has no "
-                f"get_last_traded_price method"
+                f"get_last_traded_prices method",
             )
             return cached[0] if cached else None
 
         try:
-            raw = await get_last(pair)
+            prices = await get_prices([pair])
+            raw = prices.get(pair) if isinstance(prices, dict) else None
+            if raw is None:
+                raise ValueError(f"no price returned for {pair}")
             price = Decimal(str(raw))
             if price <= 0:
                 raise ValueError(f"non-positive price {raw}")
             self._fee_price_cache[pair] = (price, now)
             return price
         except Exception as e:
-            self.logger().warning(
+            _warn_throttled(
+                f"fetch_fail:{connector_name}:{pair}",
                 f"[fee_price] REST fetch failed for {connector_name}/{pair}: "
-                f"{type(e).__name__}: {e}"
+                f"{type(e).__name__}: {e}",
             )
             return cached[0] if cached else None
 
@@ -5349,8 +5427,59 @@ class XEMMLeadLagController(ControllerBase):
                 return str(v)
         return str(v)
 
+    # ------------------------------------------------------------------ #
+    # Lifecycle hooks — Dashboard API plugin                             #
+    # ------------------------------------------------------------------ #
+    #
+    # The dashboard is a strictly passive plugin: if maybe_start_dashboard
+    # fails to bind (port busy, etc.) and `required=False`, the controller
+    # continues without it. Trading does NOT depend on the dashboard.
+    #
+    # See hummingbot/dashboard_api/ for the reusable plugin layer.
+    #
+    async def on_start(self):
+        await super().on_start()
+        try:
+            from controllers.generic.xemm_lead_lag_dashboard import (
+                XEMMLeadLagDashboardAdapter,
+            )
+            from hummingbot.dashboard_api import maybe_start_dashboard
+
+            self._dashboard_runner = await maybe_start_dashboard(
+                self, adapter_cls=XEMMLeadLagDashboardAdapter,
+            )
+            if self._dashboard_runner is not None:
+                cfg = self.config.dashboard_api
+                self.logger().info(
+                    f"Dashboard API listening on http://{cfg.host}:{cfg.port}"
+                )
+        except Exception as e:
+            # Plugin must NEVER block controller startup. Required=True
+            # propagates to maybe_start_dashboard which re-raises before
+            # reaching here, so anything that lands in this except is
+            # genuinely unexpected.
+            self.logger().error(
+                f"Dashboard API failed to start: {e}; continuing without it.",
+                exc_info=True,
+            )
+            self._dashboard_runner = None
+
     def on_stop(self):
+        # Existing teardown: flush CSV.
         if self._csv is not None:
             self._csv.close()
+        # Dashboard runner cleanup is best-effort — on_stop is sync and the
+        # event loop may already be tearing down. We schedule cleanup but
+        # do not block.
+        if self._dashboard_runner is not None:
+            try:
+                from hummingbot.dashboard_api import stop_server
+                asyncio.create_task(stop_server(self._dashboard_runner))
+            except RuntimeError:
+                # No running loop — process is exiting, nothing to clean.
+                pass
+            except Exception as e:
+                self.logger().warning(f"Dashboard API cleanup failed: {e}")
+            self._dashboard_runner = None
 
 

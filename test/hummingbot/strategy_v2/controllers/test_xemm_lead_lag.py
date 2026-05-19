@@ -3545,20 +3545,26 @@ class TestMemoryMetricsLogging(_BaseControllerTest):
 
 
 class TestFeeAssetPriceCache(_BaseControllerTest):
-    """REST cache helper para preço de fee assets (BNB, etc)."""
+    """REST cache helper para preço de fee assets (BNB, etc).
+
+    API real do connector: ``get_last_traded_prices(List[str]) -> Dict[str, float]``
+    (plural). Confirmado em ``exchange_base.pyx:110`` — singular
+    ``get_last_traded_price`` NÃO existe e foi a causa do log spam
+    observado em prod 2026-05-19 09:48Z."""
 
     async def test_cache_miss_fetches_via_rest(self):
         conn = MagicMock()
-        conn.get_last_traded_price = AsyncMock(return_value="1234.5")
+        conn.get_last_traded_prices = AsyncMock(return_value={"BNB-BRL": 1234.5})
         self.market_data_provider.get_connector = MagicMock(return_value=conn)
 
         price = await self.controller._get_spot_price_rest("binance", "BNB-BRL")
         self.assertEqual(price, Decimal("1234.5"))
         self.assertIn("BNB-BRL", self.controller._fee_price_cache)
+        conn.get_last_traded_prices.assert_awaited_once_with(["BNB-BRL"])
 
     async def test_cache_hit_skips_rest(self):
         conn = MagicMock()
-        conn.get_last_traded_price = AsyncMock(return_value="9999")
+        conn.get_last_traded_prices = AsyncMock(return_value={"BNB-BRL": 9999})
         self.market_data_provider.get_connector = MagicMock(return_value=conn)
 
         # Pre-populate cache with fresh entry
@@ -3569,11 +3575,11 @@ class TestFeeAssetPriceCache(_BaseControllerTest):
             "binance", "BNB-BRL", ttl_sec=60.0
         )
         self.assertEqual(price, Decimal("1200"))
-        conn.get_last_traded_price.assert_not_called()
+        conn.get_last_traded_prices.assert_not_called()
 
     async def test_cache_expired_refetches(self):
         conn = MagicMock()
-        conn.get_last_traded_price = AsyncMock(return_value="9999")
+        conn.get_last_traded_prices = AsyncMock(return_value={"BNB-BRL": 9999})
         self.market_data_provider.get_connector = MagicMock(return_value=conn)
 
         # Stale entry (older than TTL)
@@ -3587,7 +3593,7 @@ class TestFeeAssetPriceCache(_BaseControllerTest):
 
     async def test_rest_error_falls_back_to_stale_cache(self):
         conn = MagicMock()
-        conn.get_last_traded_price = AsyncMock(side_effect=Exception("boom"))
+        conn.get_last_traded_prices = AsyncMock(side_effect=Exception("boom"))
         self.market_data_provider.get_connector = MagicMock(return_value=conn)
 
         self.controller._fee_price_cache["BNB-BRL"] = (
@@ -3601,10 +3607,43 @@ class TestFeeAssetPriceCache(_BaseControllerTest):
 
     async def test_rest_error_with_no_cache_returns_none(self):
         conn = MagicMock()
-        conn.get_last_traded_price = AsyncMock(side_effect=Exception("boom"))
+        conn.get_last_traded_prices = AsyncMock(side_effect=Exception("boom"))
         self.market_data_provider.get_connector = MagicMock(return_value=conn)
         price = await self.controller._get_spot_price_rest("binance", "BNB-BRL")
         self.assertIsNone(price)
+
+    async def test_connector_missing_method_logs_once(self):
+        """Regression: spam de [fee_price] no log antes do fix.
+
+        Antes corretivo: connector sem ``get_last_traded_prices`` levava
+        a 1 warning por tick (200 ms) durante todo o uptime. Agora deve
+        logar 1× e silenciar até throttle window (60 s). Observada em
+        prod 2026-05-19 09:48Z."""
+        conn = MagicMock(spec=[])  # vazio: sem ``get_last_traded_prices``
+        self.market_data_provider.get_connector = MagicMock(return_value=conn)
+        captured = []
+        self.controller.logger().warning = lambda msg: captured.append(msg)
+
+        for _ in range(10):
+            await self.controller._get_spot_price_rest("binance", "BNB-BRL")
+
+        # 1 warning total (throttled), não 10.
+        self.assertEqual(len(captured), 1)
+        self.assertIn("get_last_traded_prices", captured[0])
+
+    async def test_dict_missing_pair_falls_back(self):
+        """If ``get_last_traded_prices`` returns a dict that doesn't
+        contain our pair, fall back to cache (or None)."""
+        conn = MagicMock()
+        conn.get_last_traded_prices = AsyncMock(return_value={})  # missing pair
+        self.market_data_provider.get_connector = MagicMock(return_value=conn)
+        self.controller._fee_price_cache["BNB-BRL"] = (
+            Decimal("700"), time.monotonic() - 100
+        )
+        price = await self.controller._get_spot_price_rest(
+            "binance", "BNB-BRL", ttl_sec=60.0
+        )
+        self.assertEqual(price, Decimal("700"))
 
 
 class TestFeeAssetPnLContribution(_BaseControllerTest):
