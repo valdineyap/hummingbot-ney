@@ -480,6 +480,35 @@ class XEMMExecutor(ExecutorBase):
                 f"Maker order {event.order_id} cancelled with no fills — "
                 f"no hedge needed."
             )
+            # Liberar o slot imediatamente. Sem isto, ``control_maker_order``
+            # depende de ``self.maker_order.order.is_done`` flipar — o que
+            # acontece de forma assíncrona via ``_process_order_update``
+            # (``safe_ensure_future``). Em races observadas em produção
+            # (2026-05-20T16:29:59Z, ordem SBCBL652424e6733416, xid=2069204127),
+            # ``is_done`` ficou False mesmo depois do ``OrderCancelledEvent``
+            # ter sido emitido com sucesso — prendendo o executor no branch
+            # ``elif self._cancel_requested:`` por 27 minutos (324 retries
+            # de ``cancel_stale``) até o próximo SIGTERM.
+            #
+            # Limpar aqui é determinístico e seguro:
+            #   * ``executed == 0`` → não há fill, então nem PnL nem fees
+            #     dependem do objeto. ``get_net_pnl_quote`` /
+            #     ``get_cum_fees_quote`` só são chamados em ``is_closed``,
+            #     que requer fill+hedge — não acessado neste caminho.
+            #   * Todos os outros readers de ``self.maker_order`` ou guardam
+            #     contra ``None`` (linhas 380, 403, 421, 462, 566, 635, 652,
+            #     658) ou são overrides da subclasse que tratam ``None``
+            #     explicitamente (``XEMMLeadLagExecutor.control_shutdown_process``
+            #     em ``xemm_lead_lag_executor.py:159``).
+            #   * Um ``OrderFilledEvent`` atrasado (improvável após cancel
+            #     com executed=0, mas defensivo) cai como orphan-fill na
+            #     malha do controller (``xemm_lead_lag.py:_find_live_executor_for_order``
+            #     + ``_hedged_maker_order_ids``), mesmo safety net que cobre
+            #     o caso de executor já terminado.
+            self.maker_order = None
+            self._cancel_requested = False
+            self._cancel_requested_ts = 0.0
+            self._last_stale_cancel_log_ts = 0.0
             return
 
         # Skip hedge if the executed notional is below the configured floor.

@@ -449,7 +449,9 @@ class TestXEMMExecutor(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest):
         self.assertEqual(self.strategy.sell.call_args.args[2], Decimal("50"))
 
     def test_process_order_canceled_no_fill_no_hedge(self):
-        """Cancel with zero executed amount must not place a hedge."""
+        """Cancel with zero executed amount must not place a hedge,
+        AND must clear executor state eagerly so the next tick can
+        spawn a fresh maker order without waiting for is_done to flip."""
         self.executor._status = RunnableStatus.RUNNING
         self.executor.maker_order = TrackedOrder(order_id="OID-BUY-1")
         in_flight = MagicMock()
@@ -464,6 +466,50 @@ class TestXEMMExecutor(IsolatedAsyncioWrapperTestCase, LoggerMixinForTest):
         self.strategy.sell.assert_not_called()
         # Status stays RUNNING — control_maker_order will create a fresh
         # maker order on the next tick.
+        self.assertEqual(self.executor.status, RunnableStatus.RUNNING)
+        # State must be cleared so control_maker_order's `is None` branch
+        # fires immediately — does NOT depend on is_done flipping later.
+        self.assertIsNone(self.executor.maker_order)
+        self.assertFalse(self.executor._cancel_requested)
+        self.assertEqual(self.executor._cancel_requested_ts, 0.0)
+        self.assertEqual(self.executor._last_stale_cancel_log_ts, 0.0)
+
+    def test_process_order_canceled_no_fill_recovers_from_pending_cancel(self):
+        """Regression: cancel-confirmed must clear the executor state even
+        when ``_cancel_requested`` was True and the underlying InFlightOrder
+        still reports ``is_done=False``.
+
+        Reproduces the zombie observed 2026-05-20T16:29:59Z (order
+        SBCBL652424e6733416, exchange_order_id=2069204127): the OrderCancelled
+        event landed but a race in ``_process_order_update`` left
+        ``current_state`` at OPEN; ``control_maker_order`` then looped on
+        ``elif self._cancel_requested:`` for 27 minutes (324 retries) until
+        SIGTERM. Fix: ``process_order_canceled_event`` clears the slot
+        unconditionally on executed=0 so recovery does not depend on
+        ``is_done`` flipping in a later tick."""
+        self.executor._status = RunnableStatus.RUNNING
+        self.executor.maker_order = TrackedOrder(order_id="OID-BUY-1")
+        in_flight = MagicMock()
+        in_flight.executed_amount_base = Decimal("0")
+        # Simulate the race: cancel event landed but is_done still False.
+        in_flight.is_done = False
+        self.executor.maker_order.order = in_flight
+        # control_update_maker_order set these before the event arrived.
+        self.executor._cancel_requested = True
+        self.executor._cancel_requested_ts = 100.0
+        self.executor._last_stale_cancel_log_ts = 105.0
+
+        cancel_event = OrderCancelledEvent(timestamp=1234, order_id="OID-BUY-1",
+                                           exchange_order_id="ex-OID-BUY-1")
+        self.executor.process_order_canceled_event(1, MagicMock(), cancel_event)
+
+        # Slot must be free regardless of is_done.
+        self.assertIsNone(self.executor.maker_order)
+        self.assertFalse(self.executor._cancel_requested)
+        self.assertEqual(self.executor._cancel_requested_ts, 0.0)
+        self.assertEqual(self.executor._last_stale_cancel_log_ts, 0.0)
+        # Still RUNNING — executor is ready to place a new maker, not shutting
+        # down.
         self.assertEqual(self.executor.status, RunnableStatus.RUNNING)
 
     def test_process_order_canceled_does_not_double_hedge(self):
