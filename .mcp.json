@@ -1,0 +1,14 @@
+{
+  "mcpServers": {
+    "sqlite-xemm": {
+      "type": "stdio",
+      "command": "/home/ubuntu/miniconda3/envs/hummingbot/bin/uvx",
+      "args": [
+        "mcp-server-sqlite",
+        "--db-path",
+        "/home/ubuntu/hummingbot-ney/data/conf_xemm_lead_lag_sbe.sqlite"
+      ],
+      "env": {}
+    }
+  }
+}

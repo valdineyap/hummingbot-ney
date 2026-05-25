@@ -1,0 +1,36 @@
+[Unit]
+Description=Hummingbot XEMM Lead-Lag BTC/BRL (SBE)
+Documentation=file:///home/ubuntu/hummingbot-ney/OPERATIONS.md
+After=network-online.target
+Wants=network-online.target
+
+[Service]
+Type=simple
+User=ubuntu
+WorkingDirectory=/home/ubuntu/hummingbot-ney
+# Hardcoded conda interpreter; avoid `bash -lc` so the systemd-tracked
+# PID is the python process (so KillSignal=SIGTERM hits it directly).
+ExecStart=/home/ubuntu/miniconda3/envs/hummingbot/bin/python bin/hummingbot_quickstart.py -f conf_xemm_lead_lag_sbe.yml
+
+# kill/reset via Dashboard API issues SIGTERM to itself; systemd treats
+# it as a normal exit and relaunches per Restart=always.
+KillSignal=SIGTERM
+TimeoutStopSec=30
+
+Restart=always
+RestartSec=5
+# Anti-loop: if the bot crashes >5 times in 600s, systemd gives up.
+# Tune for your tolerance; operator must `systemctl reset-failed` to retry.
+StartLimitIntervalSec=600
+StartLimitBurst=5
+
+# Standard logs (Hummingbot also writes to logs/ via its own logger).
+StandardOutput=append:/home/ubuntu/hummingbot-ney/logs/systemd_xemm.log
+StandardError=append:/home/ubuntu/hummingbot-ney/logs/systemd_xemm.err
+
+# Conservative resource caps. Adjust if you observe legitimate use above these.
+# LimitNOFILE=8192
+# MemoryMax=3G
+
+[Install]
+WantedBy=multi-user.target

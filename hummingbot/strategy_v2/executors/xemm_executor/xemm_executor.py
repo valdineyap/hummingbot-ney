@@ -1,7 +1,8 @@
 import asyncio
 import logging
+import time
 from decimal import Decimal
-from typing import Dict
+from typing import Dict, Optional
 
 from hummingbot.connector.connector_base import ConnectorBase, Union
 from hummingbot.connector.utils import split_hb_trading_pair
@@ -99,6 +100,55 @@ class XEMMExecutor(ExecutorBase):
         self.maker_order = None
         self.taker_order = None
         self.failed_orders = []
+        # Tracks whether a cancel has already been issued for the current
+        # maker_order. While True, control_update_maker_order skips further
+        # profitability checks (no double-cancel) and control_maker_order
+        # waits for is_done before clearing maker_order and creating a new one.
+        # This prevents the race where the executor used to cancel + null-out
+        # the maker_order in the same tick, then immediately place a new one
+        # before the cancel was confirmed — leaving multiple orders open
+        # simultaneously on the exchange.
+        self._cancel_requested = False
+        # Timestamp (time.time()) when ``_cancel_requested`` flipped to True.
+        # Used by ``control_maker_order`` to detect a stale cancel — when the
+        # connector + framework retries have collectively been unable to
+        # confirm cancellation for too long, we surface a CRITICAL log so
+        # monitoring can flag the situation. We deliberately do NOT
+        # auto-clear ``maker_order`` here: that would risk placing a second
+        # same-side order while the original is still alive on exchange. The
+        # orphan_check (controller-side) is the safety net for that case.
+        self._cancel_requested_ts: float = 0.0
+        # If a cancel stays unconfirmed for longer than this, take action.
+        # 5s sits just above the connector's internal retry budget
+        # (≤ 1.5s PENDING_CREATE wait + 3 × 0.5s backoff ≈ 3s), so by the
+        # time we reach 5s the connector has already exhausted its retries
+        # and the only remaining cause for the cancel still being pending
+        # is either (a) the framework dropped the cancel intent, or (b) the
+        # underlying ``_strategy.cancel`` is sitting in a dedup bucket
+        # waiting for a state transition that never came. Either way the
+        # right move is to re-issue ``_strategy.cancel`` to force a fresh
+        # ``_place_cancel`` round-trip.
+        self._cancel_stale_warn_after_sec: float = 5.0
+        # Last time we re-issued the cancel — used to throttle so we don't
+        # hammer the connector with the same cancel every tick. 5s window
+        # mirrors the connector's full retry budget so each re-issue gets
+        # a full set of attempts before we try again.
+        self._last_stale_cancel_log_ts: float = 0.0
+        # ----- Fill-to-hedge latency (Task 3.4) -----
+        # When the maker-side order (partial or full) emits its first fill,
+        # we stamp ``_first_fill_ts``. When ``place_taker_order`` runs, we
+        # compute and log the latency. Surfaced as ``fill_to_hedge_latency_ms``
+        # in custom_info so the monitor digest can chart it. Stamped once per
+        # executor lifecycle — additional fills on the same order don't reset
+        # it (the first fill is what actually exposed us).
+        self._first_fill_ts: float = 0.0
+        self._hedge_placed_ts: float = 0.0
+        self._fill_to_hedge_latency_ms: Optional[int] = None
+        # Task 4.3: snapshot the taker_result_price at the moment we placed
+        # the hedge — the price the executor *expected* the taker MARKET to
+        # fill at. After settlement we compare against the actual taker
+        # fill price to compute slippage_bps for the trade ledger.
+        self._taker_expected_price: Optional[Decimal] = None
         super().__init__(strategy=strategy,
                          connectors=[config.buying_market.connector_name, config.selling_market.connector_name],
                          config=config, update_interval=update_interval, max_retries=max_retries)
@@ -135,8 +185,80 @@ class XEMMExecutor(ExecutorBase):
             await self.control_shutdown_process()
 
     async def control_maker_order(self):
+        # State machine for the single maker order:
+        #   None              → place a new one
+        #   tracked & is_done → previous cancel/fill confirmed; clear and
+        #                       let next tick place a new one
+        #   tracked & live    → run profitability checks (may issue cancel)
+        #   tracked & cancel-already-requested but not yet done → wait
+        #
+        # The wait branch is critical: previously this method called
+        # create_maker_order() the moment maker_order was None, but the
+        # cancel path used to set maker_order=None synchronously *before*
+        # the cancel had been confirmed by the exchange. That caused the
+        # executor to stack multiple live orders on the maker side while the
+        # cancel was still in flight. Now we keep the reference until the
+        # cancel actually clears (is_done == True).
         if self.maker_order is None:
+            self._cancel_requested = False
+            self._cancel_requested_ts = 0.0
+            self._last_stale_cancel_log_ts = 0.0
             await self.create_maker_order()
+        elif self.maker_order.is_done:
+            # Cancel or fill confirmed by the exchange. Clear the slot — the
+            # next tick will create a new order (cancel case) or the executor
+            # will already be in SHUTTING_DOWN status (fill case, handled by
+            # control_task before reaching here).
+            self.maker_order = None
+            self._cancel_requested = False
+            self._cancel_requested_ts = 0.0
+            self._last_stale_cancel_log_ts = 0.0
+        elif self._cancel_requested:
+            # Cancel already issued; we're waiting for the exchange to
+            # confirm. The connector's ``_place_cancel`` does its own retry
+            # with backoff (Task 2.1) — 3 attempts × 0.5s ≈ 3s — but if
+            # those exhaust without confirmation we have no recovery: the
+            # original ``self._strategy.cancel`` call returned False inside
+            # the framework, the order tracker did not transition state,
+            # and nothing else re-pokes the cancel. Production logs (Sprint 5
+            # analysis) showed cases where an order sat alive for 3min46s
+            # after a single failed cancel, eventually filling unhedged.
+            #
+            # Once age ≥ ``_cancel_stale_warn_after_sec`` (= 5s — connector
+            # retries had time to land) we re-issue ``_strategy.cancel``.
+            # Re-issuance is throttled to once per stale-window so each
+            # attempt gets a full connector retry budget before the next.
+            if (self._cancel_requested_ts > 0
+                    and self.maker_order is not None
+                    and self.maker_order.order is not None):
+                age = time.time() - self._cancel_requested_ts
+                window = self._cancel_stale_warn_after_sec
+                if (age >= window
+                        and (time.time() - self._last_stale_cancel_log_ts) >= window):
+                    self._last_stale_cancel_log_ts = time.time()
+                    eoid = self.maker_order.order.exchange_order_id
+                    self.logger().warning(
+                        f"[cancel_stale] Cancel request for maker_order "
+                        f"{self.maker_order.order_id} "
+                        f"(exchange_order_id={eoid}) has been pending for "
+                        f"{age:.1f}s — re-issuing _strategy.cancel."
+                    )
+                    # Re-issue. The framework's tracker dedup keys on state
+                    # transitions, not on call count: if the prior cancel
+                    # already returned False, the order is back in OPEN (not
+                    # PENDING_CANCEL), so this call lands as a fresh cancel.
+                    try:
+                        self._strategy.cancel(
+                            self.maker_connector,
+                            self.maker_trading_pair,
+                            self.maker_order.order_id,
+                        )
+                    except Exception as e:
+                        self.logger().error(
+                            f"[cancel_stale] re-issue raised "
+                            f"{type(e).__name__}: {e} — leaving for orphan_check"
+                        )
+            return
         else:
             await self.control_update_maker_order()
 
@@ -229,14 +351,29 @@ class XEMMExecutor(ExecutorBase):
 
     async def control_update_maker_order(self):
         await self.update_current_trade_profitability()
-        if self._current_trade_profitability - self._tx_cost_pct < self.config.min_profitability:
-            self.logger().info(f"Order {self.maker_order.order_id} profitability {self._current_trade_profitability - self._tx_cost_pct} is below minimum profitability {self.config.min_profitability}. Cancelling order.")
+        net_profitability = self._current_trade_profitability - self._tx_cost_pct
+        if net_profitability < self.config.min_profitability:
+            self.logger().info(
+                f"Order {self.maker_order.order_id} profitability "
+                f"{net_profitability * Decimal('10000'):.2f} bps "
+                f"< min {self.config.min_profitability * Decimal('10000'):.2f} bps. "
+                f"Cancelling order."
+            )
             self._strategy.cancel(self.maker_connector, self.maker_trading_pair, self.maker_order.order_id)
-            self.maker_order = None
-        elif self._current_trade_profitability - self._tx_cost_pct > self.config.max_profitability:
-            self.logger().info(f"Order {self.maker_order.order_id} profitability {self._current_trade_profitability - self._tx_cost_pct} is above maximum profitability {self.config.max_profitability}. Cancelling order.")
+            # Mark cancel-in-flight; do NOT clear maker_order. control_maker_order
+            # will hold off on creating a new order until is_done flips True.
+            self._cancel_requested = True
+            self._cancel_requested_ts = time.time()
+        elif net_profitability > self.config.max_profitability:
+            self.logger().info(
+                f"Order {self.maker_order.order_id} profitability "
+                f"{net_profitability * Decimal('10000'):.2f} bps "
+                f"> max {self.config.max_profitability * Decimal('10000'):.2f} bps. "
+                f"Cancelling order."
+            )
             self._strategy.cancel(self.maker_connector, self.maker_trading_pair, self.maker_order.order_id)
-            self.maker_order = None
+            self._cancel_requested = True
+            self._cancel_requested_ts = time.time()
 
     async def update_current_trade_profitability(self):
         trade_profitability = Decimal("0")
@@ -270,6 +407,21 @@ class XEMMExecutor(ExecutorBase):
             self.logger().info(f"Taker order {event.order_id} created.")
             self.taker_order.order = self.get_in_flight_order(self.taker_connector, event.order_id)
 
+    def process_order_filled_event(self,
+                                   event_tag: int,
+                                   market: ConnectorBase,
+                                   event):
+        """Stamp the first fill timestamp on the maker side (Task 3.4).
+
+        ``fill_to_hedge_latency_ms`` is the wall-clock time between this
+        event and the moment ``place_taker_order`` actually issues the
+        taker hedge. The metric drives the digest's ``fill_to_hedge_p99``
+        which is how we'll spot regressions in Task 2.2 / 2.3 / 3.3.
+        """
+        if self.maker_order and event.order_id == self.maker_order.order_id:
+            if self._first_fill_ts == 0.0:
+                self._first_fill_ts = time.time()
+
     def process_order_completed_event(self,
                                       event_tag: int,
                                       market: ConnectorBase,
@@ -279,14 +431,165 @@ class XEMMExecutor(ExecutorBase):
             self.place_taker_order()
             self._status = RunnableStatus.SHUTTING_DOWN
 
-    def place_taker_order(self):
+    def process_order_canceled_event(self,
+                                     event_tag: int,
+                                     market: ConnectorBase,
+                                     event):
+        """Handle the cancel-with-partial-fill case (Task 3.3).
+
+        When BitPreco partially fills a maker order and then we cancel it
+        (because profitability moved out of band, or the executor decided
+        to refresh), the framework fires:
+
+          1. ``OrderFilledEvent`` with the partial executed amount
+          2. ``OrderCancelledEvent`` for the remainder
+
+        Without this override, neither event triggers a taker hedge:
+        ``process_order_completed_event`` only fires for *full* fills, so
+        the partial inventory stays on BitPreco and the slow inventory_audit
+        path eventually corrects it via a MARKET dump (with slippage).
+
+        Here we detect cancel-with-partial-fill and immediately place a
+        taker MARKET for the executed amount. We guard against:
+
+          * double-hedging (if a completed event already fired for this
+            order, ``self.taker_order`` is set — abort);
+          * tiny residuals (some venues reject orders below a min size — we
+            log and let inventory_audit pick those up);
+          * ordering: the cancelled event can race the filled event. If
+            ``executed_amount_base == 0`` at cancel time we just clean up.
+        """
+        if not (self.maker_order and event.order_id == self.maker_order.order_id):
+            return  # not our maker order — nothing to do
+
+        if self.taker_order is not None:
+            # Already hedged via the completed-event path or a prior cancel
+            # event (defensive — the framework can fire cancel after fill).
+            return
+
+        # ``executed_amount_base`` is updated by the connector's
+        # client_order_tracker as TradeUpdates flow in. In the partial-fill-
+        # then-cancel race, the OrderFilledEvent that produces the
+        # exec_amount usually lands a few ms before OrderCancelledEvent.
+        executed = Decimal("0")
+        if self.maker_order.order is not None:
+            executed = self.maker_order.order.executed_amount_base or Decimal("0")
+
+        if executed <= 0:
+            self.logger().info(
+                f"Maker order {event.order_id} cancelled with no fills — "
+                f"no hedge needed."
+            )
+            # Liberar o slot imediatamente. Sem isto, ``control_maker_order``
+            # depende de ``self.maker_order.order.is_done`` flipar — o que
+            # acontece de forma assíncrona via ``_process_order_update``
+            # (``safe_ensure_future``). Em races observadas em produção
+            # (2026-05-20T16:29:59Z, ordem SBCBL652424e6733416, xid=2069204127),
+            # ``is_done`` ficou False mesmo depois do ``OrderCancelledEvent``
+            # ter sido emitido com sucesso — prendendo o executor no branch
+            # ``elif self._cancel_requested:`` por 27 minutos (324 retries
+            # de ``cancel_stale``) até o próximo SIGTERM.
+            #
+            # Limpar aqui é determinístico e seguro:
+            #   * ``executed == 0`` → não há fill, então nem PnL nem fees
+            #     dependem do objeto. ``get_net_pnl_quote`` /
+            #     ``get_cum_fees_quote`` só são chamados em ``is_closed``,
+            #     que requer fill+hedge — não acessado neste caminho.
+            #   * Todos os outros readers de ``self.maker_order`` ou guardam
+            #     contra ``None`` (linhas 380, 403, 421, 462, 566, 635, 652,
+            #     658) ou são overrides da subclasse que tratam ``None``
+            #     explicitamente (``XEMMLeadLagExecutor.control_shutdown_process``
+            #     em ``xemm_lead_lag_executor.py:159``).
+            #   * Um ``OrderFilledEvent`` atrasado (improvável após cancel
+            #     com executed=0, mas defensivo) cai como orphan-fill na
+            #     malha do controller (``xemm_lead_lag.py:_find_live_executor_for_order``
+            #     + ``_hedged_maker_order_ids``), mesmo safety net que cobre
+            #     o caso de executor já terminado.
+            self.maker_order = None
+            self._cancel_requested = False
+            self._cancel_requested_ts = 0.0
+            self._last_stale_cancel_log_ts = 0.0
+            return
+
+        # Skip hedge if the executed notional is below the configured floor.
+        # Reason: a hedge below the taker's MIN_NOTIONAL fails outright; the
+        # framework's failure-retry path used to escalate to a full
+        # ``self.config.order_amount`` MARKET (over-hedge bug — see
+        # process_order_failed_event below). Letting the audit reconcile
+        # the small residual as drift is cheaper than risking a 2000x
+        # over-hedge. The threshold mirrors inventory_audit.max_drift_quote
+        # so audit's silent-band matches the executor's skip-band.
+        min_hedge_value = getattr(
+            self.config, "min_hedge_value_quote", Decimal("0")
+        )
+        if min_hedge_value > 0:
+            try:
+                taker_mid = self.get_price(
+                    self.taker_connector, self.taker_trading_pair,
+                    PriceType.MidPrice,
+                )
+            except Exception:
+                taker_mid = Decimal("0")
+            notional = executed * (taker_mid or Decimal("0"))
+            if notional > 0 and notional < min_hedge_value:
+                self.logger().info(
+                    f"[partial_hedge_skip] order_id={event.order_id} "
+                    f"executed={executed} mid={taker_mid} "
+                    f"notional={notional:.2f} < {min_hedge_value} — "
+                    f"skipping hedge, inventory_audit will absorb residual."
+                )
+                self._status = RunnableStatus.SHUTTING_DOWN
+                return
+
+        self.logger().info(
+            f"Maker order {event.order_id} cancelled after partial fill of "
+            f"{executed} base. Placing taker hedge for the executed amount."
+        )
+        try:
+            self.place_taker_order(amount=executed)
+        except Exception as e:
+            # Don't let a hedge placement failure crash the executor —
+            # inventory_audit is the safety net. Log loudly so we can see
+            # this in the digest's recent ERRORs.
+            self.logger().error(
+                f"[partial_hedge] Failed to place taker hedge for "
+                f"{executed} base on order {event.order_id}: "
+                f"{type(e).__name__}: {e}. inventory_audit will reconcile."
+            )
+            return
+        self._status = RunnableStatus.SHUTTING_DOWN
+
+    def place_taker_order(self, amount: Optional[Decimal] = None):
+        """Place the taker MARKET hedge.
+
+        :param amount: The base-asset amount to hedge. Defaults to the
+            executor's configured ``order_amount`` (full XEMM cycle); pass
+            an explicit value when hedging a partial fill so we don't
+            over-hedge.
+        """
+        order_amount = amount if amount is not None else self.config.order_amount
         taker_order_id = self.place_order(
             connector_name=self.taker_connector,
             trading_pair=self.taker_trading_pair,
             order_type=OrderType.MARKET,
             side=self.taker_order_side,
-            amount=self.config.order_amount)
+            amount=order_amount)
         self.taker_order = TrackedOrder(order_id=taker_order_id)
+        # Task 3.4: capture fill-to-hedge latency (only stamp once).
+        if self._hedge_placed_ts == 0.0:
+            self._hedge_placed_ts = time.time()
+            if self._first_fill_ts > 0.0:
+                self._fill_to_hedge_latency_ms = int(
+                    (self._hedge_placed_ts - self._first_fill_ts) * 1000
+                )
+                self.logger().info(
+                    f"[fill_to_hedge] maker_order={self.maker_order.order_id if self.maker_order else 'n/a'} "
+                    f"first_fill_ts={self._first_fill_ts:.3f} hedge_ts={self._hedge_placed_ts:.3f} "
+                    f"latency_ms={self._fill_to_hedge_latency_ms}"
+                )
+        # Task 4.3: snapshot the expected taker price for later slippage calc.
+        if self._taker_expected_price is None and self._taker_result_price > 0:
+            self._taker_expected_price = self._taker_result_price
 
     def process_order_failed_event(self, _, market, event: MarketOrderFailureEvent):
         if self.maker_order and self.maker_order.order_id == event.order_id:
@@ -296,7 +599,20 @@ class XEMMExecutor(ExecutorBase):
         elif self.taker_order and self.taker_order.order_id == event.order_id:
             self.failed_orders.append(self.taker_order)
             self._current_retries += 1
-            self.place_taker_order()
+            # Do NOT retry place_taker_order() blindly — the previous code
+            # called it with no ``amount`` argument, which falls through to
+            # ``self.config.order_amount`` (full lot). When the original
+            # hedge was for a tiny partial fill rejected by Binance
+            # MIN_NOTIONAL, this retry placed a 2000x over-hedge. Real
+            # incident 2026-05-18 11:32 — see git log.
+            # Delegate to inventory_audit instead: drift surfaces in the
+            # next audit cycle and is corrected via auto_rebalance.
+            self.logger().error(
+                f"[hedge_failed] taker order {event.order_id} failed "
+                f"(MarketOrderFailureEvent); NOT retrying — "
+                f"inventory_audit will reconcile via auto_rebalance."
+            )
+            self._status = RunnableStatus.SHUTTING_DOWN
 
     def get_custom_info(self) -> Dict:
         # Since we can't make this method async, we'll skip the profitability calculation
@@ -317,12 +633,47 @@ class XEMMExecutor(ExecutorBase):
             "maker_target_price": self._maker_target_price,
             "net_profitability": self._current_trade_profitability - self._tx_cost_pct,
             "order_amount": self.config.order_amount,
+            # Task 3.4: surface fill→hedge latency so the trade ledger can
+            # persist it (and the digest can compute p99 across sessions).
+            "fill_to_hedge_latency_ms": self._fill_to_hedge_latency_ms,
+            # Task 4.3: expected taker price at hedge placement — used by
+            # the trade ledger to compute slippage_bps post-settlement.
+            "taker_expected_price": self._taker_expected_price,
         }
 
     def early_stop(self, keep_position: bool = False):
-        if self.maker_order and self.maker_order.order and self.maker_order.order.is_open:
-            self.logger().info(f"Cancelling maker order {self.maker_order.order_id}.")
-            self._strategy.cancel(self.maker_connector, self.maker_trading_pair, self.maker_order.order_id)
+        # Cancel maker order whenever we have an order_id, regardless of
+        # whether the BuyOrderCreated/SellOrderCreated event has been
+        # observed yet. The previous gate (``self.maker_order.order`` set
+        # AND ``is_open``) missed the race window between ``place_order``
+        # returning the client_order_id synchronously and the Created event
+        # firing after the REST POST returns (~50–100 ms on BitPreco). A
+        # cancel-gate (LEAD_SIGNAL_STRONG / EVENT_LOOP_LAG / barrier) that
+        # fired in this window would skip the cancel and leave the maker
+        # alive on the exchange book — see 2026-05-16 07:13:21Z incident:
+        # gate fired 58 ms after place, order remained on book and filled
+        # 30 s later as an orphan, rebalance panic-unwound via MARKET on
+        # the same exchange at adverse price (loss = R$0.089 per orphan,
+        # 5 occurrences across 2 sessions).
+        #
+        # ``ExchangePyBase._execute_cancel`` awaits ``get_exchange_order_id()``
+        # before issuing the cancel REST, so calling cancel before the
+        # place REST has returned is safe — the cancel queues until the
+        # exchange_order_id is known. This mirrors the unconditional cancel
+        # pattern already used in ``control_update_maker_order``.
+        if self.maker_order and self.maker_order.order_id:
+            already_done = (
+                self.maker_order.order is not None
+                and self.maker_order.order.is_done
+            )
+            if not already_done:
+                state = "pending_create" if self.maker_order.order is None else "tracked"
+                self.logger().info(
+                    f"Cancelling maker order {self.maker_order.order_id} (state={state})."
+                )
+                self._strategy.cancel(
+                    self.maker_connector, self.maker_trading_pair, self.maker_order.order_id
+                )
         self.close_type = CloseType.POSITION_HOLD if keep_position else CloseType.EARLY_STOP
         self.stop()
 

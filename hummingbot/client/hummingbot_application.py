@@ -219,23 +219,24 @@ class HummingbotApplication(*commands):
             await self.app.run()
 
     async def run_headless(self):
-        """Run in headless mode - just keep alive for MQTT/strategy execution."""
+        """Run in headless mode - just keep alive for strategy execution.
+
+        NOTE: MQTT was previously required here, but commlib's retry loop runs
+        as asyncio coroutines and blocks the main event loop for ~26s every 35s
+        when no broker is reachable, causing progressive backlog and collapse.
+        The bot is controlled via the kill switch file (controller.kill_switch_file)
+        and observed via log files / CSV — MQTT is optional, not required.
+        """
         try:
             self.logger().info("Starting Hummingbot in headless mode...")
 
-            # Validate MQTT is enabled for headless mode
-            if not self.client_config_map.mqtt_bridge.mqtt_autostart:
-                error_msg = (
-                    "ERROR: MQTT must be enabled for headless mode!\n"
-                    "Without MQTT, there would be no way to control the bot.\n"
-                    "Please enable MQTT by setting 'mqtt_autostart: true' in your config file.\n"
-                    "You can also start it manually with 'mqtt start' before switching to headless mode."
+            if self.client_config_map.mqtt_bridge.mqtt_autostart:
+                self.logger().info("MQTT enabled - waiting for MQTT commands...")
+            else:
+                self.logger().info(
+                    "MQTT disabled. Bot controlled via kill switch file. "
+                    "Set 'mqtt_autostart: true' in conf/conf_client.yml to enable MQTT."
                 )
-                self.logger().error(error_msg)
-                raise RuntimeError("MQTT is required for headless mode")
-
-            self.logger().info("MQTT enabled - waiting for MQTT commands...")
-            self.logger().info("Bot is ready to receive commands via MQTT")
 
             # Keep running until shutdown
             while True:

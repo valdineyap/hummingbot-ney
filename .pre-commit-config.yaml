@@ -6,10 +6,13 @@ repos:
     - id: end-of-file-fixer
     - id: check-yaml
     - id: check-added-large-files
-    - id: flake8
-      types: ['file']
-      files: \.(py|pyx|pxd)$
     - id: detect-private-key
+-   repo: https://github.com/astral-sh/ruff-pre-commit
+    rev: v0.15.13
+    hooks:
+    -   id: ruff
+        args: ["--fix"]
+        types_or: [python]
 -   repo: https://github.com/hhatto/autopep8
     rev: v2.3.2
     hooks:

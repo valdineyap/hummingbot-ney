@@ -1,0 +1,165 @@
+"""Exchange class for the ``binance_sbe`` connector.
+
+Inherits the entire :class:`BinanceExchange` — REST trading, user stream,
+auth, rate limits, fees, exchange-info, etc. The only override is the
+order-book data source factory: we substitute the SBE binary variant.
+
+Optional credentials model:
+  - ``binance_sbe_api_key`` is REQUIRED — the Ed25519 API key string used
+    for the public SBE market data WebSocket.
+  - ``binance_api_key`` / ``binance_api_secret`` are OPTIONAL — only
+    needed when this connector is used in a trading role. We validate
+    their presence early (fail-loud at boot) when ``trading_required``
+    is set, so the operator gets an actionable error rather than a
+    silent auth failure at first order submission.
+"""
+from __future__ import annotations
+
+import logging
+import os
+from decimal import Decimal
+from typing import Dict, List, Optional
+
+from hummingbot.connector.exchange.binance import binance_constants as CONSTANTS
+from hummingbot.connector.exchange.binance.binance_exchange import BinanceExchange
+from hummingbot.connector.exchange.binance_sbe.binance_sbe_api_order_book_data_source import (
+    BinanceSbeAPIOrderBookDataSource,
+)
+from hummingbot.core.data_type.order_book_tracker_data_source import OrderBookTrackerDataSource
+
+_logger = logging.getLogger(__name__)
+
+
+# Env var consulted as a fallback when the constructor's ``binance_sbe_api_key``
+# is empty. The shadow tools and the start script already source ``.env``
+# (see :mod:`tools.binance_sbe_shadow` and ``start_xemm_lead_lag.sh``), so by
+# the time the Hummingbot framework instantiates this connector this variable
+# is already in ``os.environ``. Falling back to it here means a deployment
+# can choose between two credential paths:
+#
+#   1. Hummingbot's encrypted ``conf/connectors/binance_sbe.yml`` (via
+#      ``connect binance_sbe`` on the CLI). The framework reads it and
+#      passes ``binance_sbe_api_key`` as a constructor kwarg — same path
+#      used by every other connector.
+#
+#   2. A plaintext ``.env`` file at the repo root (gitignored). Simpler
+#      for headless deployments where running the interactive ``connect``
+#      flow is awkward. Lower security guarantees than the encrypted path
+#      because the file isn't password-protected — operator's choice.
+_SBE_API_KEY_ENV_VAR = "BINANCE_SBE_API_KEY"
+
+
+class BinanceSbeExchange(BinanceExchange):
+    """Binance Spot connector that consumes the SBE market data stream.
+
+    Trading paths remain on the public REST/JSON connector — SBE on the
+    Binance side covers only public market data (trade/depth/bestBidAsk),
+    not order placement.
+    """
+
+    def __init__(self,
+                 binance_sbe_api_key: str = "",
+                 binance_api_key: Optional[str] = None,
+                 binance_api_secret: Optional[str] = None,
+                 balance_asset_limit: Optional[Dict[str, Dict[str, Decimal]]] = None,
+                 rate_limits_share_pct: Decimal = Decimal("100"),
+                 trading_pairs: Optional[List[str]] = None,
+                 trading_required: bool = True,
+                 domain: str = CONSTANTS.DEFAULT_DOMAIN,
+                 ):
+        # ``trading_required=True`` is what Hummingbot's framework passes
+        # uniformly to every connector — including signal-only roles.
+        # We respect it. The parent ``BinanceExchange`` issues signed
+        # REST calls (``/api/v3/account``, ``/api/v3/exchangeInfo`` with
+        # auth header, listen-key for user data stream) during startup
+        # regardless of whether the controller intends to trade on this
+        # connector; without valid HMAC those calls return HTTP 401
+        # ``API-key format invalid`` and the connector never reaches
+        # ``ready=True``. ``BinanceSbeConfigMap`` therefore *requires*
+        # HMAC creds (alongside the SBE-specific key) and
+        # ``binance_sbe_register.py`` populates them by copying from the
+        # existing ``binance.yml`` so the operator doesn't need to type
+        # the same secrets twice.
+
+        # Resolve the SBE API key. The constructor arg wins (Hummingbot's
+        # standard encrypted-config path); fall back to the env var if
+        # the kwarg is empty. Either route must yield a non-empty string
+        # — fail loud here rather than hitting an opaque WS 401 later.
+        _key_source = "encrypted_config"  # operator-facing label for the log
+        if not binance_sbe_api_key:
+            binance_sbe_api_key = os.environ.get(_SBE_API_KEY_ENV_VAR, "")
+            _key_source = "env" if binance_sbe_api_key else "missing"
+        if not binance_sbe_api_key:
+            raise ValueError(
+                "binance_sbe requires an Ed25519 API key string. "
+                "Provide it either via Hummingbot's encrypted config "
+                "(run `connect binance_sbe` on the CLI) OR by exporting "
+                f"the {_SBE_API_KEY_ENV_VAR} environment variable "
+                "(e.g. via the repo's .env file)."
+            )
+        self._sbe_api_key = binance_sbe_api_key
+
+        # Secondary defense for HMAC: the ConfigMap already declares both
+        # HMAC fields as REQUIRED (Pydantic ``default=...``), so the
+        # framework path can't construct this connector with missing
+        # HMAC. But the constructor can still be invoked directly (tests,
+        # programmatic instantiation, future config refactors) — in that
+        # case fail fast with an actionable message instead of letting
+        # the inherited ``BinanceExchange`` issue signed REST calls with
+        # empty credentials and surface an opaque HTTP 401 minutes later.
+        if trading_required and (not binance_api_key or not binance_api_secret):
+            raise ValueError(
+                "binance_sbe: HMAC credentials are required when "
+                "trading_required=True. The framework always passes "
+                "trading_required=True even for signal-only roles (the "
+                "parent BinanceExchange issues signed REST calls during "
+                "startup regardless). Provide HMAC via `connect binance_sbe` "
+                "or copy them from your existing binance.yml using "
+                "tools/binance_sbe_register.py."
+            )
+        # Boot-time positive signal: which credential path was used and
+        # whether HMAC is configured. Important diagnostic for tickets
+        # like "bot started but SBE never connected" or "trading_required
+        # raised — but we DID provide HMAC?".
+        _logger.info(
+            "[binance_sbe] boot: sbe_api_key resolved via %s (length=%d), "
+            "trading_required=%s, hmac=%s",
+            _key_source,
+            len(self._sbe_api_key),
+            trading_required,
+            "present" if (binance_api_key and binance_api_secret) else "absent",
+        )
+
+        # Pass through the HMAC creds (possibly empty strings, mirroring
+        # how BinanceExchange handles read-only mode). The framework's
+        # `trading_required` flag governs whether those strings are
+        # actually used downstream.
+        super().__init__(
+            binance_api_key=binance_api_key or "",
+            binance_api_secret=binance_api_secret or "",
+            balance_asset_limit=balance_asset_limit,
+            rate_limits_share_pct=rate_limits_share_pct,
+            trading_pairs=trading_pairs,
+            trading_required=trading_required,
+            domain=domain,
+        )
+
+    @property
+    def name(self) -> str:
+        # Distinct from the JSON connector's "binance" so the framework
+        # resolves them as separate instances. The trailing _<domain>
+        # suffix (e.g. binance_sbe_us) keeps non-com regions addressable
+        # if Binance ever expands SBE beyond .com.
+        if self._domain == "com":
+            return "binance_sbe"
+        return f"binance_sbe_{self._domain}"
+
+    def _create_order_book_data_source(self) -> OrderBookTrackerDataSource:
+        # The single line that makes this a different connector.
+        return BinanceSbeAPIOrderBookDataSource(
+            trading_pairs=self._trading_pairs,
+            connector=self,
+            api_factory=self._web_assistants_factory,
+            sbe_api_key=self._sbe_api_key,
+            domain=self.domain,
+        )

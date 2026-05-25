@@ -95,6 +95,14 @@ coverage.xml
 
 .env
 
+# Local runtime data — shadow runs, ad-hoc CSVs, anything the tools
+# produce that doesn't belong in source control.
+/var/
+
+# Phase 0 BitPreco Redis exploration: raw captures contain order_ids,
+# user_ids, balances. NEVER commit. See tools/redis_probe/README.md.
+/tools/redis_probe/captures/
+
 **/.claude/settings.local.json
 
 # Editor/AI tool directories

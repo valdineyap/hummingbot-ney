@@ -16,6 +16,8 @@ class CloseType(Enum):
     FAILED = 8
     COMPLETED = 9
     POSITION_HOLD = 10
+    UNWOUND = 11
+    UNWIND_ABORTED = 12
 
 
 class TrackedOrder:

@@ -1,0 +1,220 @@
+# XEMM Lead-Lag controller — BTC-BRL  (EXAMPLE — copy to conf/controllers/)
+#
+# To use: copy this file to `conf/controllers/xemm_lead_lag_btc_brl_sbe.yml`
+# (the conf/ directory is gitignored — it's where runtime configs live).
+#
+# Maker: Bybit BTC-BRL  |  Taker (hedge): Binance BTC-BRL
+# Signal: Binance BTC-USDT × Binance USDT-BRL (used only as lead-lag indicator)
+#
+# Read first:
+#   * Always start with shadow_mode: true. Collect ≥48h of CSV data and
+#     analyze before flipping to live.
+#   * The XEMMExecutor handles fees automatically via _tx_cost_pct, so
+#     `min/target/max_profitability` are NET edges (after fees).
+#   * Confirm your real fee tier via "My Fee Rate" on each exchange.
+#     Reference (subject to change):
+#       - Binance VIP4 spot:  0.040% maker / 0.052% taker
+#       - Bybit VIP4 spot fiat-crypto: ~0.050% maker / ~0.060% taker
+#     Round-trip cost ≈ 9–11 bps; min_profitability=7 bps NET means the bot
+#     refreshes when the gross edge falls below ~16 bps gross.
+#   * The controller uses XEMMLeadLagExecutor (LIMIT_MAKER), not XEMMExecutor
+#     (LIMIT). This is a hard requirement to avoid maker→taker conversion
+#     under home latency.
+
+id: xemm_lead_lag_btcbrl_v1
+controller_name: xemm_lead_lag
+controller_type: generic
+
+# ============================================================ #
+# Markets                                                      #
+# ============================================================ #
+maker_connector: bybit
+maker_trading_pair: BTC-BRL
+taker_connector: binance
+taker_trading_pair: BTC-BRL
+signal_connector: binance
+signal_base_pair: BTC-USDT
+signal_fx_pair: USDT-BRL
+
+# ============================================================ #
+# Sizing                                                       #
+# ============================================================ #
+# Cap on total budget tracked by the framework (BRL).
+total_amount_quote: "1000"
+# Per-order amount in base asset (BTC). At ~300k BRL/BTC, 0.0002 ≈ 60 BRL.
+# Confirm Bybit min_notional and tick_size before going live.
+order_amount: "0.0002"
+
+# ============================================================ #
+# Snap-to-top dynamic sizing                                   #
+# ============================================================ #
+# When the top of the taker book is thin but cheaper than the VWAP for the
+# full order_amount, shrink the maker order to hedge only that top layer
+# (tighter spread, smaller per-fill PnL). See controller docstring for the
+# full algorithm. Cap is always order_amount — snap only shrinks.
+snap_to_top_enabled: true
+snap_threshold_bps: "0.5"          # min edge gain (bps) to trigger
+min_dynamic_order_amount: "0.00005" # floor — respect exchange min_notional
+snap_safety_fraction: "0.8"        # take 80% of top layer to dodge races
+
+# ============================================================ #
+# Profitability (NET of fees — XEMMExecutor adds tx_cost_pct)  #
+# All values are decimals: 0.001 = 10 bps                      #
+# ============================================================ #
+min_profitability: "0.0007"     # 7 bps net floor (cancel below)
+target_profitability: "0.0012"  # 12 bps net target (= max recommended)
+max_profitability: "0.0012"     # 12 bps net ceiling (refresh above)
+
+# ============================================================ #
+# Lead-lag signal                                              #
+# ============================================================ #
+lead_windows_seconds:
+  - 5
+  - 10
+  - 15
+profitability_adjust_threshold_bps: "5"   # |lead| above → adjust targets
+soft_cancel_threshold_bps: "10"            # |lead| above → DEGRADED state
+fast_cancel_threshold_bps: "15"            # |lead| above → PAUSED + cancel
+w_lead: "0.20"                             # weight applied to lead in target
+ema_alpha_fx: "0.30"                       # USDT-BRL smoothing for fair_slow
+
+# ============================================================ #
+# Feed staleness (seconds)                                     #
+# ============================================================ #
+max_leader_staleness_sec: 5.0
+max_fx_staleness_sec: 10.0    # USDT-BRL is less liquid; allow more
+max_local_staleness_sec: 5.0
+
+# ============================================================ #
+# Risk gates                                                   #
+# ============================================================ #
+basis_hard_threshold_bps: "150"
+max_local_spread_bps: "200"
+
+# ============================================================ #
+# Anti-churn                                                   #
+# ============================================================ #
+min_requote_interval_sec: 2.0   # lower to 1.0 after 24h of healthy OTR
+
+# ============================================================ #
+# Book-aware placement                                         #
+# ============================================================ #
+placement_profitability_buffer: "0.0002"  # 2 bps hysteresis above min_profitability
+
+# ============================================================ #
+# Inventory (per-exchange)                                     #
+# ============================================================ #
+inventory_target_pct: "0.5"
+inventory_skew_strength: "0.001"
+# Taker balance gate as fraction of one hedge size.
+# required_balance = order_amount * taker_mid * (1 + taker_hedge_buffer_pct)
+# 0.01 → 1% buffer over a single hedge; 1.01 → covers two consecutive fills.
+taker_hedge_buffer_pct: "0.01"
+
+# ============================================================ #
+# Warmup                                                       #
+# ============================================================ #
+# Must be >= max(lead_windows_seconds) + 5
+warmup_seconds: 25.0
+
+# ============================================================ #
+# Circuit breakers — layered PnL protection (defense in depth) #
+# ============================================================ #
+# Each gate measures a different failure mode. All values are in BRL (quote).
+# In-process trip → regime=KILLED → cancel all orders → refuse new orders.
+# An EXTERNAL watchdog (tools/watchdog_pnl.sh, cron every 1 min) runs with
+# LOOSER thresholds as a redundancy layer if these gates ever fail.
+#
+# NOTE: the HEDGE_FAILURES_N strike rule was removed 2026-05-12 — the
+# barrier-pattern audit eliminates the false-positive races it tried to
+# detect. Real hedge failures surface via UNREALIZED_LOSS / DAILY_LOSS.
+#
+# 1. Realized loss since UTC midnight.
+max_daily_loss_quote: "100"
+# 3. Peak-to-trough drawdown since process start. Catches "won early, gave
+#    it back" patterns. Resets only on bot restart.
+max_session_drawdown_quote: "50"
+# NOTE (2026-05-18): LOSING_STREAK gate removed (redundant with MINUTE_BURN
+# + mis-fired due to sign bug in XEMMExecutor.get_net_pnl_quote on SELL
+# fills). Per-fill PnL accounting replaced with portfolio-value-derived
+# gates (V_now = balances × mid; gates measure deltas of V).
+#
+# 4a. Rolling 1min burn rate (V_now - V_60s_ago <= -limit). Catches acute
+#     drawdowns before the 1h window has time to accumulate.
+max_minute_burn_quote: "15"
+# 4b. Rolling 1h burn rate (V_now - V_3600s_ago <= -limit). Catches slow
+#     bleeds that wouldn't trip daily_loss for hours.
+max_hourly_burn_quote: "50"
+# 5. Sum across base assets of |drift| * mid_price. Defense-in-depth against
+#    auto_rebalance failing to keep up with growing drift.
+max_unrealized_loss_quote: "100"
+
+# Self-termination on KILLED: when no executors are active and inventory is
+# in tolerance, SIGTERM the process so the supervisor restarts cleanly.
+# Opt-in to avoid surprising shutdowns in shadow_mode.
+auto_terminate_on_kill: false
+auto_terminate_grace_sec: 30
+
+# ============================================================ #
+# Operational modes (independent switches)                     #
+# ============================================================ #
+enable_market_making: true
+enable_pure_arb: false
+
+# ============================================================ #
+# Pure arbitrage (taker:taker)                                 #
+# ============================================================ #
+arb_order_amount: "0.0002"
+# NET threshold (after round-trip taker fees) — same semantics as the MM
+# controller's min/target/max_profitability and the executor's own NET gate.
+arb_min_profitability: "0.0005"     # 5 bps NET
+arb_lead_aggressive_delta: "0.0003"
+arb_lead_conservative_delta: "0.0005"
+arb_lead_signal_threshold_bps: "5"
+arb_max_per_hour: 10
+arb_min_interval_sec: 5.0
+arb_capital_strategy: "skip_if_insufficient"
+arb_max_unwind_slippage_bps: "50"
+arb_unwind_strategy: "abort_and_alert"
+arb_failure_pause_sec: 1800.0
+arb_max_failures_per_day: 3
+arb_daily_loss_limit_quote: "100"
+
+# ============================================================ #
+# Fee assets (top-up unidirecional para pagamento de taxas)    #
+# ============================================================ #
+# Cobertura de assets pra fee discount (BNB no Binance, etc). Separado
+# de inventory_audit.base_targets porque o tratamento é diferente:
+#   * só BUY — saldo drena por fees, não acumula via trading.
+#   * sem subscrição de livro — preço via REST com cache curto.
+#   * top-up neutro no PnL — participa da fórmula drift-target, então
+#     R$60 saindo de BRL viram R$60 em BNB; não trip kill switches.
+fee_assets:
+  enabled: false
+  targets:
+    BNB: "0.05"
+  min_topup_quote: "60"        # min_notional do exchange (Binance BNB-BRL ≈ R$60)
+  check_interval_sec: 300.0
+  price_cache_ttl_sec: 60.0
+  topup_cooldown_sec: 120.0
+
+# ============================================================ #
+# Operational                                                  #
+# ============================================================ #
+shadow_mode: true                          # MUST start as true
+log_dir: "logs/xemm_lead_lag"
+kill_switch_file: "/tmp/xemm_lead_lag_pause"  # touch this file to pause live
+
+# ============================================================ #
+# Dashboard API (bitbots-v1-compat, plugin)                    #
+# ============================================================ #
+# Exposes a bitbots-v1-compatible HTTP API for the internal dashboard
+# (`bp-research/bitbots-dashboard`). The server is strictly passive —
+# trading never depends on the dashboard being connected. To opt out,
+# set `enabled: false`. Documentation: OPERATIONS.md §9.
+dashboard_api:
+  enabled: true
+  host: "127.0.0.1"         # localhost-only by default; use SSH tunnel for remote dashboards
+  port: 7117                # avoid 7017/7018 (bitbots-js defaults)
+  required: false           # if true, controller fails at boot when port is busy
+  auth_token: null          # if set, all endpoints (except /health) require Bearer header

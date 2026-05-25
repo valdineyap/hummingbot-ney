@@ -14,6 +14,9 @@ if TYPE_CHECKING:
     from hummingbot.strategy.strategy_v2_base import StrategyV2Base
 
 from hummingbot.strategy_v2.executors.arbitrage_executor.arbitrage_executor import ArbitrageExecutor
+from hummingbot.strategy_v2.executors.arbitrage_executor.lead_lag_arbitrage_executor import (
+    LeadLagArbitrageExecutor,
+)
 from hummingbot.strategy_v2.executors.data_types import PositionSummary
 from hummingbot.strategy_v2.executors.dca_executor.dca_executor import DCAExecutor
 from hummingbot.strategy_v2.executors.grid_executor.grid_executor import GridExecutor
@@ -21,6 +24,7 @@ from hummingbot.strategy_v2.executors.lp_executor.lp_executor import LPExecutor
 from hummingbot.strategy_v2.executors.order_executor.order_executor import OrderExecutor
 from hummingbot.strategy_v2.executors.position_executor.position_executor import PositionExecutor
 from hummingbot.strategy_v2.executors.twap_executor.twap_executor import TWAPExecutor
+from hummingbot.strategy_v2.executors.xemm_executor.xemm_lead_lag_executor import XEMMLeadLagExecutor
 from hummingbot.strategy_v2.executors.xemm_executor.xemm_executor import XEMMExecutor
 from hummingbot.strategy_v2.models.executor_actions import (
     CreateExecutorAction,
@@ -138,8 +142,10 @@ class ExecutorOrchestrator:
         "grid_executor": GridExecutor,
         "dca_executor": DCAExecutor,
         "arbitrage_executor": ArbitrageExecutor,
+        "lead_lag_arbitrage_executor": LeadLagArbitrageExecutor,
         "twap_executor": TWAPExecutor,
         "xemm_executor": XEMMExecutor,
+        "xemm_lead_lag_executor": XEMMLeadLagExecutor,
         "order_executor": OrderExecutor,
         "lp_executor": LPExecutor,
     }

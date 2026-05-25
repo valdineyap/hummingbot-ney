@@ -100,9 +100,12 @@ async def quick_start(args: argparse.Namespace, secrets_manager: BaseSecretsMana
     init_logging("hummingbot_logs.yml", client_config_map)
     await read_system_configs_from_yml()
 
-    # Automatically enable MQTT autostart for headless mode
-    if args.headless:
-        client_config_map.mqtt_bridge.mqtt_autostart = True
+    # Headless mode no longer auto-enables MQTT.
+    # Reason: when no MQTT broker is reachable (default conf points to localhost:1883),
+    # the commlib retry loop runs as asyncio coroutines and blocks the main event loop
+    # for ~26s every 35s, causing progressive backlog and eventual collapse.
+    # The bot is controlled via the kill switch file (config.kill_switch_file), not MQTT.
+    # To re-enable MQTT, set `mqtt_autostart: true` explicitly in conf/conf_client.yml.
 
     AllConnectorSettings.initialize_paper_trade_settings(client_config_map.paper_trade.paper_trade_exchanges)
 

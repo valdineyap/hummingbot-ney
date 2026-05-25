@@ -1,9 +1,9 @@
 from decimal import Decimal
 from typing import Any, Dict
 
-from pydantic import Field, SecretStr
+from pydantic import ConfigDict, Field, SecretStr
 
-from hummingbot.client.config.config_data_types import BaseConnectorConfigMap, ClientFieldData
+from hummingbot.client.config.config_data_types import BaseConnectorConfigMap
 from hummingbot.core.data_type.trade_fee import TradeFeeSchema
 
 CENTRALIZED = True
@@ -25,28 +25,80 @@ def is_exchange_information_valid(exchange_info: Dict[str, Any]) -> bool:
 
 
 class BitprecoConfigMap(BaseConnectorConfigMap):
-    connector: str = Field(default="bitpreco", const=True, client_data=None)
+    connector: str = "bitpreco"
     bitpreco_api_key: SecretStr = Field(
         default=...,
-        client_data=ClientFieldData(
-            prompt=lambda cm: "Enter your BitPreco API key",
-            is_secure=True,
-            is_connect_key=True,
-            prompt_on_new=True,
-        )
+        json_schema_extra={
+            "prompt": lambda cm: "Enter your BitPreco API key",
+            "is_secure": True,
+            "is_connect_key": True,
+            "prompt_on_new": True,
+        }
     )
     bitpreco_api_secret: SecretStr = Field(
         default=...,
-        client_data=ClientFieldData(
-            prompt=lambda cm: "Enter your BitPreco API secret",
-            is_secure=True,
-            is_connect_key=True,
-            prompt_on_new=True,
-        )
+        json_schema_extra={
+            "prompt": lambda cm: "Enter your BitPreco API secret",
+            "is_secure": True,
+            "is_connect_key": True,
+            "prompt_on_new": True,
+        }
     )
+    # Phase 1A toggle. When True, the connector spawns the
+    # BitprecoRedisUserStreamShadow + BitprecoRedisOrderBookShadow
+    # tasks alongside the legacy Phoenix/REST path. The shadow
+    # observers consume Redis pub/sub, exercise the production
+    # parser/state-machine pipeline and emit [redis_shadow*]
+    # metrics, but do NOT mutate bot state. Default off so existing
+    # deployments are unchanged. Requires BITPRECO_REDIS_* + BITPRECO_USER_ID
+    # env vars (see .env.example); missing env vars → shadow mode
+    # disables itself with a single WARN at startup.
+    bitpreco_redis_shadow_mode: bool = Field(
+        default=False,
+        json_schema_extra={
+            "prompt": lambda cm: (
+                "Run the BitPreco Redis pub/sub observer in shadow mode "
+                "alongside the legacy path? (no impact on trading) (yes/no)"
+            ),
+            # Despite the name, `is_connect_key` is what makes the
+            # framework pass the field through `conn_init_parameters`
+            # into the connector's __init__. Without it, the kwarg
+            # never reaches BitprecoExchange and shadow mode defaults
+            # to False even when the YAML sets it. Discovered when
+            # the first Phase 1A live restart silently did nothing.
+            "is_connect_key": True,
+            "prompt_on_new": False,
+        }
+    )
+    # Phase 2 toggle. Selects which backend drives the connector:
+    #
+    #   "legacy" (default): Phoenix WS + REST poll for both
+    #     user-stream and orderbook (current state). Safe; no
+    #     dependency on the Redis env vars even when present.
+    #
+    #   "redis": Redis pub/sub is the primary source for both
+    #     user-stream events and orderbook snapshots. REST remains
+    #     the authoritative fallback and reconciliation source. The
+    #     ``_get_poll_interval`` override stays put — defense in
+    #     depth if Redis ever goes quiet.
+    #
+    # Flipping to "redis" requires BITPRECO_REDIS_* env vars at boot;
+    # absent vars raise at connector construction rather than
+    # silently fall back to legacy. The shadow-mode field above
+    # stays useful independently for offline Redis-vs-legacy
+    # comparison after promotion.
+    bitpreco_data_backend: str = Field(
+        default="legacy",
+        json_schema_extra={
+            "prompt": lambda cm: (
+                "Which data backend should drive BitPreco "
+                "(user-stream + orderbook)? (legacy/redis)"
+            ),
+            "is_connect_key": True,
+            "prompt_on_new": False,
+        }
+    )
+    model_config = ConfigDict(title="bitpreco")
 
-    class Config:
-        title = "bitpreco"
 
-
-KEYS = BitprecoConfigMap.construct()
+KEYS = BitprecoConfigMap.model_construct()

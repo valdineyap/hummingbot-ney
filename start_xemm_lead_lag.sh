@@ -1,0 +1,163 @@
+#!/bin/bash
+# ============================================================
+# DEPRECATED — XEMM Lead-Lag (BTC-BRL) legacy launcher
+# ============================================================
+# Production is now `start_xemm_lead_lag_sbe.sh`, which reads
+# `conf/controllers/xemm_lead_lag_btc_brl_sbe.yml`.
+#
+# The non-SBE controller YAML (`xemm_lead_lag_btc_brl.yml`) was
+# deleted 2026-05-14 after we discovered config drift between the
+# two: edits to the non-SBE file were silently invisible to the
+# running SBE bot, which caused the AGGRESSIVE_LIMIT feature to
+# never engage in production despite being committed and
+# "configured". See commit history for the consolidation.
+#
+# This script remains for reference / shadow-mode revival. If you
+# need to run it, first restore (or copy) the SBE YAML to the
+# `--controller-config` path below, AND adjust connector names
+# back to non-SBE (this script uses `conf_xemm_lead_lag_shadow.yml`
+# which expects `binance` rather than `binance_sbe`).
+# ============================================================
+
+set -e
+cd "$(dirname "$0")"
+
+if [ -z "$1" ]; then
+    echo "Usage: $0 <password>"
+    exit 1
+fi
+
+# ============================================================
+# Environment file loading
+# ============================================================
+# If a local `.env` exists, source it so all variables defined there
+# become available to the python process. The file is gitignored — see
+# `.env.example` for the supported variables.
+#
+# We use `set -a` / `set +a` so every VAR=VALUE line in `.env` is
+# auto-exported, no need for explicit `export` per line. This means
+# `.env` is just a list of `KEY=VALUE` lines, no `export` prefix.
+# ============================================================
+if [ -f "$(dirname "$0")/.env" ]; then
+    set -a
+    # shellcheck disable=SC1091
+    source "$(dirname "$0")/.env"
+    set +a
+fi
+
+# ============================================================
+# BitPreco fast-path routing (BitPreco-owned operators only)
+# ============================================================
+# Route BitPreco traffic through the internal network instead of the
+# public internet. Two independent toggles with DIFFERENT semantics:
+#
+#   BITPRECO_INTERNAL_BOOKS — HOST for public endpoints (book, ticker,
+#                              trades). Paths are appended by the
+#                              connector.
+#   BITPRECO_INTERNAL_API   — FULL URL for private REST trading
+#                              (place/cancel/balance/etc.). All cmds
+#                              POST to this single endpoint.
+#
+# NO fallback: if set, the internal route must always be reachable.
+# Read by hummingbot/connector/exchange/bitpreco/bitpreco_constants.py
+# at import time, so it MUST be exported here (before python boots).
+#
+# These exports are kept as a fallback / hardcoded baseline; if you
+# prefer per-host configuration, move them into `.env` and remove
+# from here (last assignment wins in bash).
+# ============================================================
+export BITPRECO_INTERNAL_BOOKS="${BITPRECO_INTERNAL_BOOKS:-http://54.232.138.12}"
+export BITPRECO_INTERNAL_API="${BITPRECO_INTERNAL_API:-https://backend.bitpreco.com/exchange/exch_api.php}"
+
+# Kill any running instance gracefully
+if pgrep -f "conf_xemm_lead_lag_shadow" > /dev/null; then
+    echo "Stopping existing bot..."
+    # Step 1: trigger the kill switch so the controller cancels all maker orders
+    touch /tmp/xemm_lead_lag_pause
+
+    # Step 2: wait up to 12s for the bot to process the kill switch and cancel orders.
+    # With 200ms polling, Phase 1 fires within 200ms; exchange round-trip ~300-500ms;
+    # we wait 12s to be safe under slow network conditions.
+    for i in $(seq 1 24); do
+        sleep 0.5
+        # Bot is done when it stops logging "Created maker" lines
+        if ! pgrep -f "conf_xemm_lead_lag_shadow" > /dev/null; then
+            echo "Bot exited cleanly."
+            break
+        fi
+    done
+
+    # Step 3: send SIGTERM (graceful) then SIGKILL if still alive
+    pkill -TERM -f "conf_xemm_lead_lag_shadow" 2>/dev/null || true
+    sleep 3
+    if pgrep -f "conf_xemm_lead_lag_shadow" > /dev/null; then
+        echo "Bot did not exit after SIGTERM, sending SIGKILL..."
+        pkill -KILL -f "conf_xemm_lead_lag_shadow" 2>/dev/null || true
+        sleep 2
+    fi
+fi
+rm -f /tmp/xemm_lead_lag_pause
+
+# Rotate previous log so each run starts with a clean file
+LOG=logs/logs_conf_xemm_lead_lag_shadow.log
+if [ -f "$LOG" ]; then
+    mv "$LOG" "${LOG%.log}_$(date -u +%Y%m%dT%H%M%S).log"
+fi
+
+# ============================================================
+# Pre-cleanup: cancel any orphan orders BEFORE the bot starts.
+#
+# Closes the 5-10s window between process boot and connector.ready=True
+# during which orphan orders from a previous crashed session could fill
+# without a corresponding hedge (producing a directional position).
+#
+# Exit codes from precleanup.py:
+#   0 = clean (or all cancels OK)
+#   1 = auth/config error → ABORT bot startup (would be unsafe)
+#   2 = partial failure → continue (in-bot startup_cleanup retries at boot)
+# ============================================================
+echo "Running pre-cleanup..."
+PRECLEAN_LOG="logs/logs_precleanup_$(date -u +%Y%m%dT%H%M%S).log"
+conda run -n hummingbot python tools/precleanup.py \
+    --controller-config conf/controllers/xemm_lead_lag_btc_brl.yml \
+    --password "$1" 2>&1 | tee "$PRECLEAN_LOG"
+PRECLEAN_RC=${PIPESTATUS[0]}
+
+if [ "$PRECLEAN_RC" = "1" ]; then
+    echo "ERROR: Pre-cleanup failed with auth/config error — refusing to start bot"
+    echo "  See $PRECLEAN_LOG"
+    exit 1
+elif [ "$PRECLEAN_RC" = "2" ]; then
+    echo "WARNING: Pre-cleanup had partial failures — continuing (bot will retry)"
+fi
+
+echo "Starting XEMM Lead-Lag bot..."
+
+conda run -n hummingbot python bin/hummingbot_quickstart.py --headless \
+  --v2 conf_xemm_lead_lag_shadow.yml \
+  --config-password "$1" \
+  2>&1 | tee -a "$LOG" &
+
+BOT_PID=$!
+
+# Wait up to 60s for the first maker order (proof the bot is live and healthy).
+# Prints startup_cleanup lines as they appear, then exits on first "Created maker".
+echo "Waiting for first order (up to 60s)..."
+WAITED=0
+while [ $WAITED -lt 60 ]; do
+    sleep 1
+    WAITED=$((WAITED + 1))
+    # Show any startup_cleanup lines from this second
+    tail -n 20 "$LOG" 2>/dev/null | grep "startup_cleanup" | tail -5
+    # Exit as soon as we see a Created maker line
+    if tail -n 20 "$LOG" 2>/dev/null | grep -q "Created maker order"; then
+        LAST=$(tail -n 40 "$LOG" | grep "Created maker order" | tail -1)
+        echo ""
+        echo "✓ Bot live (${WAITED}s). PID=$(pgrep -f conf_xemm_lead_lag_shadow | head -1)"
+        echo "  $LAST"
+        exit 0
+    fi
+done
+
+echo "WARNING: no maker order seen after 60s — check $LOG"
+pgrep -f "conf_xemm_lead_lag_shadow" && echo "Process is running" || echo "Process is NOT running"

@@ -1,0 +1,31 @@
+{
+  "venvPath": "/home/ubuntu/miniconda3/envs",
+  "venv": "hummingbot",
+  "pythonVersion": "3.13",
+  "typeCheckingMode": "basic",
+
+  "//": "Scoped to the actively-maintained XEMM lead-lag surface only.",
+  "//_": "Expanding this list to the wider repo will surface 1000s of",
+  "//__": "pre-existing errors and drown out signal. Add new paths as",
+  "//___": "their modules get refactored and typed.",
+  "include": [
+    "hummingbot/connector/exchange/bitpreco",
+    "hummingbot/strategy_v2/executors/xemm_executor",
+    "test/hummingbot/connector/exchange/bitpreco",
+    "test/hummingbot/strategy_v2/executors/xemm_executor"
+  ],
+
+  "exclude": [
+    "**/__pycache__",
+    "**/*.pyx",
+    "**/*.pxd"
+  ],
+
+  "//report": "Turn down rules that flood basic mode with low-signal noise.",
+  "reportMissingImports": "warning",
+  "reportMissingTypeStubs": "none",
+  "reportGeneralTypeIssues": "warning",
+  "reportOptionalMemberAccess": "warning",
+  "reportPrivateImportUsage": "none",
+  "reportAttributeAccessIssue": "warning"
+}

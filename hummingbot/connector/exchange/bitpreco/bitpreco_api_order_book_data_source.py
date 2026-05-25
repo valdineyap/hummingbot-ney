@@ -29,6 +29,28 @@ class BitprecoAPIOrderBookDataSource(OrderBookTrackerDataSource):
     _trading_pair_symbol_map: Dict[str, Mapping[str, str]] = {}
     _mapping_initialization_lock = asyncio.Lock()
 
+    async def subscribe_to_trading_pair(self, trading_pair: str) -> bool:
+        """
+        Dynamic subscription is not implemented — BitPreco subscriptions are
+        established at startup via the standard channels for the configured
+        trading pairs. Returning False signals to the framework that callers
+        should rely on the existing static subscription rather than expect a
+        runtime addition.
+        """
+        self.logger().debug(
+            f"bitpreco: dynamic subscribe_to_trading_pair({trading_pair}) is a no-op"
+        )
+        return False
+
+    async def unsubscribe_from_trading_pair(self, trading_pair: str) -> bool:
+        """
+        Counterpart to subscribe_to_trading_pair — same rationale (no-op).
+        """
+        self.logger().debug(
+            f"bitpreco: dynamic unsubscribe_from_trading_pair({trading_pair}) is a no-op"
+        )
+        return False
+
     def __init__(self,
                  trading_pairs: List[str],
                  connector: 'BitprecoExchange',
