@@ -16,6 +16,9 @@ sintético. Branch ativa: `claude/xemm-leadlag`.
 - **Observabilidade de memória** → [`docs/MEMORY_OBSERVABILITY.md`](docs/MEMORY_OBSERVABILITY.md)
   Legenda de `[mem]` / `[sbe_queue]` / memory guard L1-L2, steady-state esperado,
   cheat sheet de diagnóstico, gotchas (tracemalloc bloqueia event loop).
+- **Dashboard API HTTP (plugin)** → [`OPERATIONS.md §9`](OPERATIONS.md#9-dashboard-api-bitbots-v1-compat-plugin)
+  Endpoints expostos (port 7117), comandos curl, instalação do systemd unit,
+  cenários de rede, troubleshoot. Camada reusável em `hummingbot/dashboard_api/`.
 - **Arquitetura e estado do projeto** → [`DEVELOPMENT_STATUS.md`](DEVELOPMENT_STATUS.md)
 - **Histórico do swap Bybit→BitPreco** → [`HANDOFF_BITPRECO_SWAP.md`](HANDOFF_BITPRECO_SWAP.md)
 

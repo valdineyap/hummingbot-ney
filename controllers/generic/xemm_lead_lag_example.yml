@@ -204,3 +204,17 @@ fee_assets:
 shadow_mode: true                          # MUST start as true
 log_dir: "logs/xemm_lead_lag"
 kill_switch_file: "/tmp/xemm_lead_lag_pause"  # touch this file to pause live
+
+# ============================================================ #
+# Dashboard API (bitbots-v1-compat, plugin)                    #
+# ============================================================ #
+# Exposes a bitbots-v1-compatible HTTP API for the internal dashboard
+# (`bp-research/bitbots-dashboard`). The server is strictly passive —
+# trading never depends on the dashboard being connected. To opt out,
+# set `enabled: false`. Documentation: OPERATIONS.md §9.
+dashboard_api:
+  enabled: true
+  host: "127.0.0.1"         # localhost-only by default; use SSH tunnel for remote dashboards
+  port: 7117                # avoid 7017/7018 (bitbots-js defaults)
+  required: false           # if true, controller fails at boot when port is busy
+  auth_token: null          # if set, all endpoints (except /health) require Bearer header

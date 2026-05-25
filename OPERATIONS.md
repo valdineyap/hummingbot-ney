@@ -520,3 +520,235 @@ Esses arquivos sobrevivem mesmo se Claude crashar — o cron OS continua escreve
 - ❌ **`CronCreate` sozinho**: idle-only, perde ticks em conversa longa
 - ❌ **Monitor persistent sem cron OS por trás**: silêncio é ambíguo, usuário perde confiança
 - ✅ **As 3 camadas juntas**: cron OS garante determinismo, Monitor garante visibilidade contínua, CronCreate fornece confirmação visual no painel
+
+
+## 9. Dashboard API (bitbots-v1-compat, plugin)
+
+O Hummingbot expõe um servidor HTTP REST compatível com a interface do
+`bp-research/bitbots-js`, permitindo que o dashboard interno
+(`bp-research/bitbots-dashboard`) monitore e controle este bot **sem
+modificações no lado do dashboard** (basta adicionar uma entrada em
+`config/prod.yml` do dashboard).
+
+**Invariante:** o servidor é **estritamente passivo**. Trading nunca
+depende de o dashboard estar conectado. Se a porta não abrir, se o
+adapter levantar exceção, se o dashboard estiver caído — o tick do
+controller continua normal.
+
+### Habilitação no bot
+
+Bloco `dashboard_api:` no YAML do controller (já presente em
+`conf/controllers/xemm_lead_lag_btc_brl_sbe.yml`):
+
+```yaml
+dashboard_api:
+  enabled: true
+  host: "127.0.0.1"    # bind localhost por default
+  port: 7117            # evita colisão com bitbots-js (default 7017/7018)
+  required: false       # true em prod: controller falha se porta ocupada
+  auth_token: null      # se setado, exige Bearer header (ver "Cenários de rede")
+```
+
+### Endpoints expostos (fase 1)
+
+| Método | Rota | O que faz |
+|---|---|---|
+| `GET` | `/health` | Liveness + versão (sem auth, sempre disponível) |
+| `GET` | `/api/v1/getdata/:botName` | Polling de estado (chamado a cada 15s pelo dashboard) |
+| `POST` | `/api/v1/bot-command/:botName` | pause / stop / resume / kill / reset (settle → 501) |
+| `GET` | `/api/v1/getBooks/:botName/:pair?depth=N&exchanges=1,2` | Order books |
+| `GET` | `/api/v1/specOrders/:botName` | Executors ativos |
+| _(outros)_ | placeOrder, transfers, etc. | **501 Not Implemented** |
+
+`botName` na URL = `config.id` do controller (ex:
+`xemm_lead_lag_btc_brl_sbe`).
+
+### Comandos curl (do mesmo host onde o bot roda)
+
+```bash
+# Liveness
+curl -s http://127.0.0.1:7117/health | jq
+
+# Estado completo
+curl -s http://127.0.0.1:7117/api/v1/getdata/xemm_lead_lag_btc_brl_sbe | jq
+
+# Pausa (touch /tmp/xemm_lead_lag_sbe_pause)
+curl -sX POST http://127.0.0.1:7117/api/v1/bot-command/xemm_lead_lag_btc_brl_sbe \
+  -H 'Content-Type: application/json' \
+  -d '{"botCommand":"pause","user":"valdiney"}'
+
+# Retomar
+curl -sX POST http://127.0.0.1:7117/api/v1/bot-command/xemm_lead_lag_btc_brl_sbe \
+  -H 'Content-Type: application/json' \
+  -d '{"botCommand":"resume","user":"valdiney"}'
+
+# Kill (responde 202 imediatamente; SIGTERM 200ms depois → systemd relança)
+curl -sX POST http://127.0.0.1:7117/api/v1/bot-command/xemm_lead_lag_btc_brl_sbe \
+  -H 'Content-Type: application/json' \
+  -d '{"botCommand":"kill","user":"valdiney"}'
+
+# Books (depth máx 100, pair normalizado para uppercase)
+curl -s 'http://127.0.0.1:7117/api/v1/getBooks/xemm_lead_lag_btc_brl_sbe/BTC-BRL?depth=5' | jq
+```
+
+### `statusMetadata` — persistência entre restarts
+
+Cada comando (pause/kill/resume) persiste `reason`, `requester`,
+`lastUpdated`, `stopped` em
+`data/dashboard_status_xemm_lead_lag_btc_brl_sbe.json` (escrita atômica
+via `tmp + os.replace`). Após `kill` + restart, o dashboard mostra
+quem matou e por quê (não desaparece com o processo).
+
+### Cenários de rede
+
+1. **Mesma máquina** (default). `host=127.0.0.1`, sem auth. Sem ação extra.
+2. **Dashboard em outra máquina via VPN**. Opções:
+   - `host="0.0.0.0"` + `auth_token` setado (obrigatório; servidor recusa
+     bind em 0.0.0.0 sem token). **Atenção**: o dashboard atual NÃO envia
+     `Authorization: Bearer`, então essa rota exige PR no dashboard ou
+     proxy injetando o header.
+   - **SSH tunnel** (recomendado, sem mudar dashboard):
+     ```bash
+     # No host do dashboard:
+     ssh -L 7117:127.0.0.1:7117 ubuntu@<bot-host> -N -f
+     # Aí em config/prod.yml do dashboard: host=127.0.0.1 port=7117
+     ```
+   - Reverse proxy local (nginx/Traefik) injetando header.
+3. **Mais de um bot no mesmo host**. Cada bot usa uma porta distinta
+   (7117, 7118, …). Cada entrada do `config/prod.yml` do dashboard
+   aponta para a porta correta.
+
+### Habilitar o dashboard a ver o bot
+
+PR em `bp-research/bitbots-dashboard/config/prod.yml`:
+
+```yaml
+bots:
+  xemm_lead_lag_btc_brl_sbe:
+    enabled: true
+    botName: xemm_lead_lag_btc_brl_sbe
+    host: 127.0.0.1          # ou IP/hostname do bot
+    port: 7117
+```
+
+Restart do dashboard. O `Watcher` começa a chamar
+`GET /api/v1/getdata/xemm_lead_lag_btc_brl_sbe` a cada 15s.
+
+### Operação via systemd
+
+`ops/xemm-lead-lag.service` está no repo. Para instalar:
+
+```bash
+sudo cp ops/xemm-lead-lag.service /etc/systemd/system/
+sudo systemctl daemon-reload
+sudo systemctl enable --now xemm-lead-lag
+
+# Status / logs
+sudo systemctl status xemm-lead-lag
+sudo journalctl -u xemm-lead-lag -f
+# (ou tail dos arquivos)
+tail -f logs/systemd_xemm.log logs/systemd_xemm.err
+
+# Parar permanentemente
+sudo systemctl stop xemm-lead-lag
+sudo systemctl disable xemm-lead-lag
+
+# Após crash loop (StartLimit), resetar e tentar de novo
+sudo systemctl reset-failed xemm-lead-lag
+sudo systemctl restart xemm-lead-lag
+```
+
+Comportamento de `kill` via API: bot recebe SIGTERM, `Restart=always`
+relança em ~5s, novo PID, statusMetadata persistido sobrevive ao
+restart. `StartLimitBurst=5` em `StartLimitIntervalSec=600` previne
+restart loop infinito.
+
+### Troubleshooting
+
+| Sintoma | Causa provável | Ação |
+|---|---|---|
+| Bot sobe, log diz "Dashboard API failed to start" | Porta 7117 ocupada | `ss -tlnp \| grep 7117` para descobrir o processo; ajuste `port:` ou mate o ocupante |
+| Dashboard mostra "bot not found" | `botName` no `config/prod.yml` do dashboard ≠ `config.id` do bot | Sincronize os nomes |
+| `curl /getdata/...` retorna `404` | mesmo motivo | idem |
+| `curl /getdata/...` retorna `200` mas dashboard mostra "offline" | Watcher do dashboard não consegue conectar (firewall, host errado, port errado) | `tcpdump`/`ss` no host do dashboard; testar `curl` no host do dashboard |
+| `kill` via API responde 202 mas bot não morre | Adapter logou erro no flush do TradeLedger antes de chamar `os.kill` | `grep "kill via API" logs/logs_conf_xemm_lead_lag_sbe.log`; SIGTERM ainda é agendado em qualquer caso |
+| `statusMetadata.reason` mostra "initializing timeout" | `_safety_snapshot` não foi gerado em 120s | Bot está com problema no `update_processed_data`; conferir log principal |
+| `getdata` retorna campos `null` para preços/saldos | Conector ainda inicializando ou WS caiu | Resilência por design — checa o log do conector |
+
+### Cancel + audit em pause / resume / kill
+
+Os comandos `pause`, `stop`, `resume`, `kill` e `reset` **não apenas
+mudam o estado** — eles também:
+
+1. **Cancelam todas as ordens abertas** nas 2 exchanges via REST (chamando
+   `_cancel_all_open_orders_on_startup` do controller, mesmo método
+   usado em shutdown). Paralelo, timeout interno 8s.
+2. **Rodam audit de inventário** (`_run_inventory_audit`) para detectar
+   drift e enfileirar rebalance em direção ao target. A audit é a
+   máquina de estados existente (IDLE → CANCELLING → VALIDATING → IDLE).
+
+**Comportamento por comando:**
+
+| Comando | Cancel | Audit | Flush ledger | Resposta HTTP |
+|---|---|---|---|---|
+| `pause` / `stop` | ✓ síncrono | ✓ síncrono | — | 201 após tudo completar |
+| `resume` | ✓ síncrono | ✓ síncrono | — | 201 após tudo completar |
+| `kill` / `reset` | ✓ pré-SIGTERM | ✓ pré-SIGTERM | ✓ pré-SIGTERM | 202 após cancel+audit+flush |
+
+**Timeouts e garantias:**
+
+- Cada hook (`_before_pause` / `_after_resume` / `_before_kill`) é
+  envolto em `asyncio.wait_for(timeout=45s)`. Pior caso: HTTP responde
+  em ≤45s + alguns ms para persistir.
+- Erro/timeout **não impede** o efeito final: pause file é tocado
+  mesmo que cancel/audit falhem; SIGTERM é agendado mesmo que tudo
+  exploda. Falhas vão para `statusMetadata.reason` com sufixo
+  `"hook incomplete (...)"`.
+- Erros parciais (ex: cancel falha mas audit roda OK) são logados em
+  `logger.exception` mas não bloqueiam o resto.
+
+**Telemetria — uma linha INFO por comando:**
+
+```
+[dashboard_cmd] pause cancel_ms=2143 audit_ms=8470 total_ms=10613
+[dashboard_cmd] resume cancel_ms=12 audit_ms=3210 total_ms=3222
+[dashboard_cmd] kill cancel_ms=2056 audit_ms=4321 flush_ms=18 total_ms=6395
+```
+
+Em timeout: `total_ms=45000 error=timeout after 45.0s`. Em exceção:
+`error=RuntimeError: <msg>`.
+
+**Por que rodar audit no pause?** A intenção do comando é "parar e voltar
+para um estado limpo". Sem audit, o bot fica pausado com drift de
+inventário acumulado da última sessão; quando retomar, a primeira
+audit periódica vai rebalancear. Rodar audit no `pause` torna esse
+saneamento síncrono — você sabe que o estado é bom quando o dashboard
+mostra "paused".
+
+**Atenção operacional**: a audit cria orders MARKET para rebalance se
+houver drift. Isso significa que `pause` pode disparar trades pequenos
+(reconciliação para o target) antes de efetivamente parar. Comportamento
+idêntico ao da audit periódica que já roda durante kill switch ativo.
+O cap `max_order_amount_multiplier` (2.0 × `order_amount`) continua
+valendo — drift maior que isso é **bloqueado** e logado como CRITICAL,
+não silenciosamente truncado.
+
+### Idempotência
+
+- `pause` em bot já pausado: cancel+audit rodam de novo (pode ser caro;
+  considerar checar antes de spammar), mas o file e o estado final
+  ficam corretos.
+- `resume` em bot já rodando: file unlink é no-op; cancel+audit rodam
+  normalmente.
+- 2º `kill` antes do 1º disparar: retorna `{"status":"already_scheduled"}`
+  **sem re-executar cancel+audit**. SIGTERM enviado apenas uma vez.
+
+### Limitações conhecidas (fase 1)
+
+- `specOrders` lê só `executor_orchestrator.get_active_executors()` —
+  pode não pegar ordens órfãs imediatamente após restart. Suficiente
+  para o uso operacional atual.
+- `placeOrder`, `settle`, `transfers`, `genericRequest`: 501.
+- Sem TLS (rede privada/VPN é a defesa).
+- `auth_token` em uso quebra dashboard atual — só habilitar com
+  coordenação ou proxy.

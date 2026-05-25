@@ -111,9 +111,32 @@ fora do escopo abaixo sem motivo explícito.
 
 | Arquivo | Responsabilidade |
 |---|---|
-| `xemm_lead_lag.py` | **Controller principal.** Cria executors, computa sinal lead-lag, audit de inventário, kill-switch, ghost-order registry |
+| `xemm_lead_lag.py` | **Controller principal.** Cria executors, computa sinal lead-lag, audit de inventário, kill-switch, ghost-order registry. Inclui `DashboardAPIConfig` submodel e hooks `on_start`/`on_stop` para o plugin de dashboard. |
+| `xemm_lead_lag_dashboard.py` | Adapter XEMM para a Dashboard API: subclasse de `BaseDashboardAdapter` que adiciona WARN_DRIFT, status com `_safety_snapshot` gate, vocabulário XEMM no `info`, flush do TradeLedger antes do kill. |
 | `xemm_lead_lag_example.yml` | Config-exemplo do controller |
 | `xemm_multiple_levels.py` | Variante multi-níveis (não usada em prod neste fork) |
+
+### `hummingbot/dashboard_api/` (plugin reusável)
+
+Servidor HTTP bitbots-v1-compat. Não conhece nenhuma estratégia
+específica; qualquer `ControllerBase` pode plugar via `dashboard_api`
+config + `maybe_start_dashboard(self)`.
+
+| Arquivo | Responsabilidade |
+|---|---|
+| `server.py` | aiohttp app, rotas `/api/v1/*`, `/health`, middlewares (auth, access log), best-effort `getdata` |
+| `adapter_protocol.py` | `DashboardBotAdapter` Protocol (contrato que adapters devem satisfazer) |
+| `base_adapter.py` | `BaseDashboardAdapter` — implementação default que funciona em qualquer controller (lê `connectors`, `executor_orchestrator`, `market_data_provider`) |
+| `helpers.py` | `maybe_start_dashboard(controller, adapter_cls=None)` — wrapper de conveniência pros 2 hooks |
+| `lifecycle.py` | `start_server` / `stop_server` (graceful AppRunner setup/cleanup) |
+| `payload.py` | Dataclasses do schema bitbots, helpers `to_percent_bps`/`safe_bot_name`/`format_utc_z`/`to_jsonable` |
+| `status_store.py` | Persistência atômica de `statusMetadata` em `data/dashboard_status_<bot>.json` |
+
+### `ops/`
+
+| Arquivo | O que é |
+|---|---|
+| `xemm-lead-lag.service` | systemd unit (Restart=always, StartLimitBurst=5/600s, KillSignal=SIGTERM). Permite kill via API → relaunch automático. Doc em [`OPERATIONS.md §9`](../OPERATIONS.md#9-dashboard-api-bitbots-v1-compat-plugin). |
 
 ### `conf/controllers/`
 
